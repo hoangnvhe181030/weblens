@@ -1,0 +1,87 @@
+spring:
+  application:
+    name: weblens-backend
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  flyway:
+    enabled: true
+    postgresql:
+      # Required by CREATE INDEX CONCURRENTLY migrations. Session-level advisory
+      # locks still serialize Flyway runners without holding an old transaction snapshot.
+      transactional-lock: false
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  mvc:
+    problemdetails:
+      enabled: true
+  jackson:
+    time-zone: UTC
+
+server:
+  error:
+    include-message: never
+    include-stacktrace: never
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+springdoc:
+  api-docs:
+    enabled: ${WEBLENS_OPENAPI_ENABLED:false}
+  swagger-ui:
+    enabled: ${WEBLENS_OPENAPI_ENABLED:false}
+    path: /swagger-ui.html
+    operations-sorter: alpha
+    tags-sorter: alpha
+
+weblens:
+  security:
+    jwt:
+      secret: ${WEBLENS_JWT_SECRET}
+      issuer: ${WEBLENS_JWT_ISSUER:weblens-api}
+      audience: ${WEBLENS_JWT_AUDIENCE:weblens-web}
+      access-ttl: ${WEBLENS_ACCESS_TTL:PT15M}
+      refresh-ttl: ${WEBLENS_REFRESH_TTL:P7D}
+    cors:
+      allowed-origins: ${WEBLENS_CORS_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}
+    cookies:
+      secure: ${WEBLENS_COOKIE_SECURE:true}
+  scan:
+    limits:
+      max-pages: ${WEBLENS_SCAN_MAX_PAGES:25}
+      max-depth: ${WEBLENS_SCAN_MAX_DEPTH:3}
+      max-response-bytes: ${WEBLENS_SCAN_MAX_RESPONSE_BYTES:10485760}
+      max-duration-seconds: ${WEBLENS_SCAN_MAX_DURATION_SECONDS:120}
+      max-redirects: ${WEBLENS_SCAN_MAX_REDIRECTS:5}
+      concurrency: ${WEBLENS_SCAN_CONCURRENCY:3}
+  crawler:
+    command-url: ${WEBLENS_CRAWLER_COMMAND_URL:http://localhost:8081/internal/v1/commands/scans}
+    report-base-url: ${WEBLENS_CRAWLER_REPORT_BASE_URL:http://localhost:8081}
+    service-token: ${WEBLENS_SERVICE_TOKEN}
+    connect-timeout: ${WEBLENS_CRAWLER_CONNECT_TIMEOUT:PT2S}
+    read-timeout: ${WEBLENS_CRAWLER_READ_TIMEOUT:PT10S}
+    outbox-lease: ${WEBLENS_CRAWLER_OUTBOX_LEASE:PT30S}
+    dispatch-enabled: ${WEBLENS_CRAWLER_DISPATCH_ENABLED:true}
+    dispatch-poll-interval: ${WEBLENS_CRAWLER_DISPATCH_POLL_INTERVAL:PT0.5S}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%X{correlationId:-no-correlation}] %logger{36} - %msg%n"
+  level:
+    root: INFO
+    org.springframework.security: INFO

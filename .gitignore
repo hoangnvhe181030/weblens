@@ -1,0 +1,44 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Java / Gradle / Maven
+backend/target/
+backend/build/
+backend/.gradle/
+*.class
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+
+# Logs and runtime artifacts
+*.log
+logs/
+tmp/
+
+# Test and tooling output
+.testcontainers.properties
+*.pid
+
+# Local design references captured from public websites
+.reference/
+
+# Local browser-analysis environments and captured third-party pages
+.venv-pagesource/
+pagesource_evomi/
+
+# Local document review workspace
+.codex-docx-review/
+
+# Locally installed agent skills are development-machine tooling
+.agents/skills/

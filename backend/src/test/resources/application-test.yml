@@ -1,0 +1,40 @@
+spring:
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+weblens:
+  security:
+    jwt:
+      secret: d2VibGVucy10ZXN0LW9ubHktc2VjcmV0LWlzLWF0LWxlYXN0LTMyLWJ5dGVz
+      issuer: weblens-api-test
+      audience: weblens-web-test
+      access-ttl: PT15M
+      refresh-ttl: P7D
+    cors:
+      allowed-origins: http://localhost:5173
+    cookies:
+      secure: false
+  scan:
+    limits:
+      max-pages: 25
+      max-depth: 3
+      max-response-bytes: 10485760
+      max-duration-seconds: 120
+      max-redirects: 5
+      concurrency: 3
+  crawler:
+    command-url: http://localhost:18081/internal/v1/commands/scans
+    report-base-url: http://localhost:18081
+    service-token: weblens-test-service-token-at-least-32-bytes
+    connect-timeout: PT0.5S
+    read-timeout: PT1S
+    outbox-lease: PT30S
+    dispatch-enabled: false
