@@ -130,6 +130,11 @@ export interface CapturedResource {
   contentType: string
   sizeBytes: number
   durationMs: number
+  bodyCaptured: boolean
+  capturedBodyId: string | null
+  capturedBodyBytes: number
+  bodySha256: string | null
+  bodyTruncated: boolean
 }
 
 export interface PageSnapshot {

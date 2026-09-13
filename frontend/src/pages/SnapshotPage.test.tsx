@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { webLensService } from '../api/serviceMode'
@@ -36,5 +36,41 @@ describe('SnapshotPage', () => {
     expect(webLensService.getCaptureScreenshot).toHaveBeenCalledWith('snapshot-1')
     expect(screen.getByText(/không thực thi website/i)).toBeInTheDocument()
     expect(document.querySelector('iframe')).not.toBeInTheDocument()
+  })
+
+  it('hiển thị metadata body và tải resource dưới dạng file qua API có xác thực', async () => {
+    const captured = snapshot.resources.find((resource) => resource.bodyCaptured)
+    expect(captured?.capturedBodyId).toBeTruthy()
+    vi.spyOn(webLensService, 'getSnapshot').mockResolvedValue({
+      ...snapshot,
+      artifacts: { renderedHtmlBytes: 1200, screenshotBytes: 0 },
+      resources: captured ? [captured] : [],
+    })
+    vi.spyOn(webLensService, 'getCapturedResource').mockResolvedValue(new Blob(
+      [new TextEncoder().encode('untrusted resource body')],
+      { type: 'application/octet-stream' },
+    ))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:weblens-resource')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+
+    render(
+      <MemoryRouter initialEntries={['/app/snapshots/snapshot-1']}>
+        <Routes>
+          <Route path="/app/snapshots/:snapshotId" element={<SnapshotPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText('Đã lưu', { selector: 'strong' })).toBeInTheDocument()
+    expect(screen.getByText(/SHA-256/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Tải body/i }))
+
+    await waitFor(() => {
+      expect(webLensService.getCapturedResource).toHaveBeenCalledWith('snapshot-1', captured?.capturedBodyId)
+      expect(click).toHaveBeenCalledOnce()
+    })
+    expect(document.querySelector('iframe')).not.toBeInTheDocument()
+    expect(document.querySelector('script')).not.toBeInTheDocument()
   })
 })

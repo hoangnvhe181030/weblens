@@ -101,6 +101,12 @@ export const backendWebLensService: WebLensService = {
   async getCaptureScreenshot(captureId): Promise<Blob> {
     return apiBlobRequest(`/api/v1/captures/${encodeURIComponent(captureId)}/artifacts/screenshot`)
   },
+
+  async getCapturedResource(captureId, resourceId): Promise<Blob> {
+    return apiBlobRequest(
+      `/api/v1/captures/${encodeURIComponent(captureId)}/resources/${encodeURIComponent(resourceId)}/content`,
+    )
+  },
 }
 
 function mapScanPage(source: ApiScanPage): ScanPageRecord {

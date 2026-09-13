@@ -30,11 +30,11 @@ export const scanPages: ScanPageRecord[] = [
 export const snapshot: PageSnapshot = {
   id: 'snapshot-1', scanPageId: 'page-home', status: 'COMPLETED', createdAt: 'Hôm nay, 20:18', finalUrl: 'https://evomi.com/', viewport: '1440 × 900', resourceCount: 126, totalBytes: 4289412,
   resources: [
-    { id: 'res-1', url: 'https://evomi.com/', method: 'GET', status: 200, type: 'document', contentType: 'text/html', sizeBytes: 341600, durationMs: 684 },
-    { id: 'res-2', url: 'https://evomi.com/_next/static/chunks/app.css', method: 'GET', status: 200, type: 'stylesheet', contentType: 'text/css', sizeBytes: 151295, durationMs: 143 },
-    { id: 'res-3', url: 'https://evomi.com/_next/static/chunks/main.js', method: 'GET', status: 200, type: 'script', contentType: 'application/javascript', sizeBytes: 284112, durationMs: 221 },
-    { id: 'res-4', url: 'https://evomi.com/images/hero.webp', method: 'GET', status: 200, type: 'image', contentType: 'image/webp', sizeBytes: 482310, durationMs: 316 },
-    { id: 'res-5', url: 'https://evomi.com/fonts/hanken.woff2', method: 'GET', status: 200, type: 'font', contentType: 'font/woff2', sizeBytes: 48216, durationMs: 98 },
-    { id: 'res-6', url: 'https://api.trafficguard.ai/check', method: 'POST', status: 204, type: 'fetch', contentType: 'application/json', sizeBytes: 0, durationMs: 267 },
+    { id: 'res-1', url: 'https://evomi.com/', method: 'GET', status: 200, type: 'document', contentType: 'text/html', sizeBytes: 341600, durationMs: 684, bodyCaptured: false, capturedBodyId: null, capturedBodyBytes: 0, bodySha256: null, bodyTruncated: false },
+    { id: 'res-2', url: 'https://evomi.com/_next/static/chunks/app.css', method: 'GET', status: 200, type: 'stylesheet', contentType: 'text/css', sizeBytes: 151295, durationMs: 143, bodyCaptured: true, capturedBodyId: 'body-2', capturedBodyBytes: 151295, bodySha256: '9b16dca927d87a20ce4f10cd87afcd50f018dc0826f77accb07a2e16d4564e8d', bodyTruncated: false },
+    { id: 'res-3', url: 'https://evomi.com/_next/static/chunks/main.js', method: 'GET', status: 200, type: 'script', contentType: 'application/javascript', sizeBytes: 284112, durationMs: 221, bodyCaptured: true, capturedBodyId: 'body-3', capturedBodyBytes: 262144, bodySha256: 'a5bc6acac115f04d649f9f92019a41e5b22e2eeec7dfc4cbbf0532fa14975472', bodyTruncated: true },
+    { id: 'res-4', url: 'https://evomi.com/images/hero.webp', method: 'GET', status: 200, type: 'image', contentType: 'image/webp', sizeBytes: 482310, durationMs: 316, bodyCaptured: true, capturedBodyId: 'body-4', capturedBodyBytes: 482310, bodySha256: '12db844ab1d377b58769c17b8d3b7289e75200fe79a9f6fc62b1f1bb78633027', bodyTruncated: false },
+    { id: 'res-5', url: 'https://evomi.com/fonts/hanken.woff2', method: 'GET', status: 200, type: 'font', contentType: 'font/woff2', sizeBytes: 48216, durationMs: 98, bodyCaptured: true, capturedBodyId: 'body-5', capturedBodyBytes: 48216, bodySha256: '8a8ddfbb82d33f805259854211849ec36c6ec3b332a3a45fe9b7362b8af72f20', bodyTruncated: false },
+    { id: 'res-6', url: 'https://api.trafficguard.ai/check', method: 'POST', status: 204, type: 'fetch', contentType: 'application/json', sizeBytes: 0, durationMs: 267, bodyCaptured: false, capturedBodyId: null, capturedBodyBytes: 0, bodySha256: null, bodyTruncated: false },
   ],
 }

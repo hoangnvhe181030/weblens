@@ -18,6 +18,7 @@ export interface WebLensService {
   getLatestCapture(scanId: string, pageId: string): Promise<Capture | null>
   getSnapshot(id: string): Promise<PageSnapshot>
   getCaptureScreenshot(id: string): Promise<Blob>
+  getCapturedResource(captureId: string, resourceId: string): Promise<Blob>
 }
 
 const demoWebsites = [...websites]
@@ -53,4 +54,5 @@ export const mockWebLensService: WebLensService = {
   async getLatestCapture(scanId, pageId) { await delay(); return scanId === 'scan-103' && pageId === snapshot.scanPageId ? { id: snapshot.id, scanId, pageId, status: 'COMPLETED', targetUrl: snapshot.finalUrl, measurementProfile: 'desktop-lab-v1', analyticsExpectedCount: 1, analyticsPublishedCount: 1, objectCount: 2, totalObjectBytes: snapshot.totalBytes, createdAt: snapshot.createdAt } : null },
   async getSnapshot(id) { await delay(); if (id !== snapshot.id) throw notFound('bản chụp'); return snapshot },
   async getCaptureScreenshot() { throw new Error('Ảnh screenshot không có trong chế độ mock.') },
+  async getCapturedResource() { throw new Error('Resource body không có trong chế độ mock.') },
 }
