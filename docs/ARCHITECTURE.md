@@ -141,7 +141,11 @@ watermark và reconciliation.
 5. Terminal outbox chỉ phát khi analytics watermark đạt capture result cần publish.
 6. Upload hoặc ClickHouse insert thành công nhưng PostgreSQL acknowledgement thất
    bại được retry idempotently; inventory dọn object mồ côi sau grace period.
-7. UI chỉ nhận presigned URL ngắn hạn sau authorization và không thực thi artifact.
+7. Trong V1.5, UI gọi endpoint artifact của Control Plane; Control Plane authorize
+   owner rồi stream byte từ Capture Worker với `no-store`, `nosniff` và
+   `Content-Disposition` an toàn. UI không nhận credential/object-storage URL và
+   không thực thi artifact. Presigned URL chỉ được xem xét lại khi benchmark chứng
+   minh proxy streaming là bottleneck.
 
 ## Giao tiếp và consistency contract
 
