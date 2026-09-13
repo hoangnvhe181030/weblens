@@ -52,7 +52,7 @@ class ScanReportServiceTest {
                 new ScanConfiguration(25, 3, 10_485_760, 120, 5, 3),
                 "crawler-v1", null, null, observedAt.minusSeconds(10)
         )));
-        given(crawler.listPages(ownerId, scanId)).willReturn(new CrawlerScanPagesContract(
+        given(crawler.listPages(ownerId, scanId, 100, null)).willReturn(new CrawlerScanPagesContract(
                 new CrawlerReportStateContract(scanId, ownerId, "COMPLETED", 1, 1, observedAt),
                 List.of(new CrawlerPageContract(
                         pageId, scanId, "https://example.com/docs", "https://example.com/docs",
@@ -64,7 +64,7 @@ class ScanReportServiceTest {
                 ))
         ));
 
-        var response = service.listPages(ownerId, scanId);
+        var response = service.listPages(ownerId, scanId, 100, null);
 
         assertThat(response.fresh()).isTrue();
         assertThat(response.items()).singleElement().satisfies(page -> {

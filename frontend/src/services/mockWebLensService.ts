@@ -1,5 +1,5 @@
 import { scanPages, scans, snapshot, websites } from '../data/mockData'
-import type { PageSnapshot, Scan, ScanPageRecord, ServiceError, Website } from '../domain/types'
+import type { Capture, PageSnapshot, Scan, ScanPageRecord, ScanPagesReport, ServiceError, Website } from '../domain/types'
 
 const delay = (milliseconds = 260) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds))
 
@@ -11,9 +11,13 @@ export interface WebLensService {
   getScan(id: string): Promise<Scan>
   startScan(websiteId: string, idempotencyKey: string): Promise<Scan>
   cancelScan(id: string): Promise<Scan>
-  listScanPages(scanId: string): Promise<ScanPageRecord[]>
+  listScanPages(scanId: string, cursor?: string): Promise<ScanPagesReport>
   getScanPage(id: string): Promise<ScanPageRecord>
+  startCapture(pageId: string, idempotencyKey: string): Promise<Capture>
+  getCapture(id: string): Promise<Capture>
+  getLatestCapture(scanId: string, pageId: string): Promise<Capture | null>
   getSnapshot(id: string): Promise<PageSnapshot>
+  getCaptureScreenshot(id: string): Promise<Blob>
 }
 
 const demoWebsites = [...websites]
@@ -31,7 +35,22 @@ export const mockWebLensService: WebLensService = {
   async getScan(id) { await delay(); const item = demoScans.find((scan) => scan.id === id); if (!item) throw notFound('lần quét'); return item },
   async startScan(websiteId) { await delay(); const scan: Scan = { id: `scan-${crypto.randomUUID()}`, websiteId, status: 'QUEUED', createdAt: 'Vừa xong', duration: '—', progress: { discovered: 0, queued: 0, processed: 0, succeeded: 0, failed: 0, limit: 25 }, findingCount: 0 }; demoScans.unshift(scan); return scan },
   async cancelScan(id) { await delay(); const index = demoScans.findIndex((scan) => scan.id === id); if (index < 0) throw notFound('lần quét'); const cancelled = { ...demoScans[index], status: 'CANCELLED' as const }; demoScans[index] = cancelled; return cancelled },
-  async listScanPages(scanId) { await delay(); return scanId === 'scan-104' ? scanPages : scanPages.filter((page) => page.scanId === scanId) },
+  async listScanPages(scanId) {
+    await delay()
+    const items = scanId === 'scan-104' ? scanPages : scanPages.filter((page) => page.scanId === scanId)
+    return {
+      items,
+      analyticsExpectedCount: items.length,
+      analyticsPublishedCount: items.length,
+      analyticsWatermark: items.length > 0 ? 'Vừa xong' : null,
+      fresh: true,
+      nextCursor: undefined,
+    }
+  },
   async getScanPage(id) { await delay(); const item = scanPages.find((page) => page.id === id); if (!item) throw notFound('trang đã quét'); return item },
+  async startCapture(pageId) { await delay(); return { id: snapshot.id, scanId: 'scan-103', pageId, status: 'COMPLETED', targetUrl: snapshot.finalUrl, measurementProfile: 'desktop-lab-v1', analyticsExpectedCount: 1, analyticsPublishedCount: 1, objectCount: 2, totalObjectBytes: snapshot.totalBytes, createdAt: snapshot.createdAt } },
+  async getCapture(id) { await delay(); if (id !== snapshot.id) throw notFound('capture'); return { id, scanId: 'scan-103', pageId: snapshot.scanPageId, status: 'COMPLETED', targetUrl: snapshot.finalUrl, measurementProfile: 'desktop-lab-v1', analyticsExpectedCount: 1, analyticsPublishedCount: 1, objectCount: 2, totalObjectBytes: snapshot.totalBytes, createdAt: snapshot.createdAt } },
+  async getLatestCapture(scanId, pageId) { await delay(); return scanId === 'scan-103' && pageId === snapshot.scanPageId ? { id: snapshot.id, scanId, pageId, status: 'COMPLETED', targetUrl: snapshot.finalUrl, measurementProfile: 'desktop-lab-v1', analyticsExpectedCount: 1, analyticsPublishedCount: 1, objectCount: 2, totalObjectBytes: snapshot.totalBytes, createdAt: snapshot.createdAt } : null },
   async getSnapshot(id) { await delay(); if (id !== snapshot.id) throw notFound('bản chụp'); return snapshot },
+  async getCaptureScreenshot() { throw new Error('Ảnh screenshot không có trong chế độ mock.') },
 }

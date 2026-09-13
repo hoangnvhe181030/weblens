@@ -8,6 +8,7 @@ public record ScanPagesResponse(
         int analyticsExpectedCount,
         int analyticsPublishedCount,
         Instant analyticsWatermark,
-        boolean fresh
+        boolean fresh,
+        String nextCursor
 ) {
 }

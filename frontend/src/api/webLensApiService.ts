@@ -1,7 +1,7 @@
-import type { PageSnapshot, Scan, ScanPageRecord, Website } from '../domain/types'
+import type { Capture, PageSnapshot, Scan, ScanPageRecord, ScanPagesReport, Website } from '../domain/types'
 import type { WebLensService } from '../services/mockWebLensService'
-import { apiRequest } from './apiClient'
-import type { ApiPage, ApiScan, ApiScanPage, ApiScanPages, ApiWebsite } from './contracts'
+import { apiBlobRequest, apiRequest } from './apiClient'
+import type { ApiCapture, ApiCaptureSnapshot, ApiPage, ApiScan, ApiScanPage, ApiScanPages, ApiWebsite } from './contracts'
 
 export const backendWebLensService: WebLensService = {
   async listWebsites() {
@@ -42,17 +42,64 @@ export const backendWebLensService: WebLensService = {
     }))
   },
 
-  async listScanPages(scanId): Promise<ScanPageRecord[]> {
-    const response = await apiRequest<ApiScanPages>(`/api/v1/scans/${encodeURIComponent(scanId)}/pages`)
-    return response.items.map(mapScanPage)
+  async listScanPages(scanId, cursor): Promise<ScanPagesReport> {
+		const query = new URLSearchParams({ limit: '200' })
+		if (cursor) query.set('cursor', cursor)
+		const response = await apiRequest<ApiScanPages>(`/api/v1/scans/${encodeURIComponent(scanId)}/pages?${query}`)
+    return {
+      items: response.items.map(mapScanPage),
+      analyticsExpectedCount: response.analyticsExpectedCount,
+      analyticsPublishedCount: response.analyticsPublishedCount,
+      analyticsWatermark: response.analyticsWatermark ? formatInstant(response.analyticsWatermark) : null,
+      fresh: response.fresh,
+			nextCursor: response.nextCursor ?? undefined,
+    }
   },
 
   async getScanPage(pageId): Promise<ScanPageRecord> {
     return mapScanPage(await apiRequest<ApiScanPage>(`/api/v1/scan-pages/${encodeURIComponent(pageId)}`))
   },
 
-  getSnapshot(): Promise<PageSnapshot> {
-    return unsupported('Browser capture')
+  async startCapture(pageId, idempotencyKey): Promise<Capture> {
+    return mapCapture(await apiRequest<ApiCapture>(`/api/v1/scan-pages/${encodeURIComponent(pageId)}/captures`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }))
+  },
+
+  async getCapture(captureId): Promise<Capture> {
+    return mapCapture(await apiRequest<ApiCapture>(`/api/v1/captures/${encodeURIComponent(captureId)}`))
+  },
+
+  async getLatestCapture(scanId, pageId): Promise<Capture | null> {
+    const source = await apiRequest<ApiCapture | undefined>(`/api/v1/scans/${encodeURIComponent(scanId)}/scan-pages/${encodeURIComponent(pageId)}/captures/latest-ready`)
+    return source ? mapCapture(source) : null
+  },
+
+  async getSnapshot(captureId): Promise<PageSnapshot> {
+    const source = await apiRequest<ApiCaptureSnapshot>(`/api/v1/captures/${encodeURIComponent(captureId)}/snapshot`)
+    return {
+      id: source.id,
+      scanPageId: source.scanPageId,
+      status: source.status,
+      createdAt: formatInstant(source.createdAt),
+      finalUrl: source.finalUrl,
+      viewport: source.viewport,
+      resourceCount: source.resourceCount,
+      capturedResourceCount: source.capturedResourceCount,
+      totalBytes: source.totalBytes,
+      measurementProfile: source.measurementProfile,
+      browserVersion: source.browserVersion,
+      rendered: source.rendered,
+      diff: source.diff,
+      performance: source.performance,
+      artifacts: source.artifacts,
+      resources: source.resources,
+    }
+  },
+
+  async getCaptureScreenshot(captureId): Promise<Blob> {
+    return apiBlobRequest(`/api/v1/captures/${encodeURIComponent(captureId)}/artifacts/screenshot`)
   },
 }
 
@@ -62,17 +109,47 @@ function mapScanPage(source: ApiScanPage): ScanPageRecord {
     scanId: source.scanId,
     path: source.path,
     url: source.url,
-    statusCode: source.statusCode,
+    statusCode: source.statusCode ?? undefined,
     outcome: source.outcome,
-    responseTimeMs: source.responseTimeMs,
-    responseBytes: source.responseBytes,
-    title: source.title,
-    h1: source.h1,
+    responseTimeMs: source.responseTimeMs ?? undefined,
+    responseBytes: source.responseBytes ?? undefined,
+    title: source.title ?? undefined,
+		description: source.description ?? undefined,
+		metaKeywords: source.metaKeywords ?? undefined,
+		canonicalUrl: source.canonicalUrl ?? undefined,
+		canonicalRelation: source.canonicalRelation,
+		metaRobots: source.metaRobots ?? undefined,
+		xRobotsTag: source.xRobotsTag ?? undefined,
+		htmlLang: source.htmlLang ?? undefined,
+		indexable: source.indexable,
+		indexabilityReason: source.indexabilityReason,
+    h1: source.h1 ?? undefined,
+		h1Values: source.h1Values,
+		h2: source.h2,
+		h3: source.h3,
+		h4: source.h4,
+		h5: source.h5,
+		h6: source.h6,
+		hreflang: source.hreflang,
+		openGraph: {
+			title: source.openGraph.title ?? undefined,
+			description: source.openGraph.description ?? undefined,
+			imageUrl: source.openGraph.imageUrl ?? undefined,
+		},
+		structuredData: source.structuredData,
     links: source.links,
     images: source.images,
     scripts: source.scripts,
     stylesheets: source.stylesheets,
+		timing: {
+			dnsMillis: source.timing.dnsMillis ?? undefined,
+			connectMillis: source.timing.connectMillis ?? undefined,
+			tlsMillis: source.timing.tlsMillis ?? undefined,
+			ttfbMillis: source.timing.ttfbMillis ?? undefined,
+			totalMillis: source.timing.totalMillis ?? undefined,
+		},
     findings: source.findings,
+    observedAt: formatInstant(source.observedAt),
   }
 }
 
@@ -96,9 +173,14 @@ function mapScan(source: ApiScan): Scan {
     websiteId: source.websiteId,
     status: source.status,
     createdAt: formatInstant(source.createdAt),
+    startedAt: source.startedAt ? formatInstant(source.startedAt) : undefined,
+    finishedAt: source.finishedAt ? formatInstant(source.finishedAt) : undefined,
     duration: formatDuration(source.durationMs),
     progress: source.progress,
     findingCount: source.findingCount,
+    collectorVersion: source.collectorVersion,
+    effectiveConfig: source.effectiveConfig,
+    terminalReason: source.terminalReason ?? undefined,
   }
 }
 
@@ -117,6 +199,20 @@ function formatDuration(milliseconds: number | null): string {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
-function unsupported<T>(feature: string): Promise<T> {
-  return Promise.reject(new Error(`${feature} chưa có API trong backend foundation V1.`))
+function mapCapture(source: ApiCapture): Capture {
+  return {
+    id: source.id,
+    scanId: source.scanId,
+    pageId: source.pageId,
+    status: source.status,
+    targetUrl: source.targetUrl,
+    measurementProfile: source.measurementProfile,
+    analyticsExpectedCount: source.analyticsExpectedCount,
+    analyticsPublishedCount: source.analyticsPublishedCount,
+    objectCount: source.objectCount,
+    totalObjectBytes: source.totalObjectBytes,
+    terminalCode: source.terminalCode ?? undefined,
+    terminalMessage: source.terminalMessage ?? undefined,
+    createdAt: formatInstant(source.createdAt),
+  }
 }

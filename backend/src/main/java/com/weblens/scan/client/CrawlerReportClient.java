@@ -26,10 +26,12 @@ public class CrawlerReportClient {
                 .build();
     }
 
-    public CrawlerScanPagesContract listPages(UUID ownerId, UUID scanId) {
+    public CrawlerScanPagesContract listPages(UUID ownerId, UUID scanId, int limit, String cursor) {
         return client.get()
                 .uri(uri -> uri.path("/internal/v1/reports/scans/{scanId}/pages")
                         .queryParam("ownerId", ownerId)
+                        .queryParam("limit", limit)
+                        .queryParamIfPresent("cursor", java.util.Optional.ofNullable(cursor))
                         .build(scanId))
                 .header("X-WebLens-Service-Token", properties.serviceToken())
                 .retrieve()

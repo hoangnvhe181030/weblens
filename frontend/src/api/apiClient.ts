@@ -29,11 +29,23 @@ export function setAccessToken(token: string | null) {
 }
 
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await authenticatedResponse(path, init)
+  return decode<T>(response)
+}
+
+export async function apiBlobRequest(path: string, init: RequestInit = {}): Promise<Blob> {
+  const response = await authenticatedResponse(path, init)
+  if (response.ok) return response.blob()
+  await decode<never>(response)
+  throw new Error('Không thể tải artifact.')
+}
+
+async function authenticatedResponse(path: string, init: RequestInit): Promise<Response> {
   let response = await execute(path, init)
   if (response.status === 401 && canAttemptRefresh(path) && await refreshAccessToken()) {
     response = await execute(path, init)
   }
-  return decode<T>(response)
+  return response
 }
 
 async function execute(path: string, init: RequestInit): Promise<Response> {

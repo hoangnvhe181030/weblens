@@ -10,8 +10,12 @@ import com.weblens.scan.client.CrawlerPageContract;
 import com.weblens.scan.client.CrawlerReportClient;
 import com.weblens.scan.client.CrawlerScanPagesContract;
 import com.weblens.scan.dto.FindingResponse;
+import com.weblens.scan.dto.HreflangResponse;
+import com.weblens.scan.dto.HttpTimingResponse;
+import com.weblens.scan.dto.OpenGraphResponse;
 import com.weblens.scan.dto.ScanPageResponse;
 import com.weblens.scan.dto.ScanPagesResponse;
+import com.weblens.scan.dto.StructuredDataSummaryResponse;
 import com.weblens.scan.repository.ScanRepository;
 import java.net.URI;
 import java.util.List;
@@ -44,12 +48,12 @@ public class ScanReportService {
         this.objectMapper = objectMapper;
     }
 
-    public ScanPagesResponse listPages(UUID userId, UUID scanId) {
+    public ScanPagesResponse listPages(UUID userId, UUID scanId, int limit, String cursor) {
         currentUsers.requireActive(userId);
         scans.findByIdAndRequestedByUserId(scanId, userId)
                 .orElseThrow(ScanReportService::notFound);
         try {
-            CrawlerScanPagesContract report = crawler.listPages(userId, scanId);
+            CrawlerScanPagesContract report = crawler.listPages(userId, scanId, limit, cursor);
             if (report == null || report.state() == null || report.items() == null) {
                 throw unavailable(null);
             }
@@ -59,7 +63,8 @@ public class ScanReportService {
                     report.state().analyticsExpectedCount(),
                     report.state().analyticsPublishedCount(),
                     report.state().analyticsWatermark(),
-                    fresh
+                    fresh,
+                    report.nextCursor()
             );
         } catch (HttpClientErrorException.NotFound exception) {
             throw notFound();
@@ -87,13 +92,39 @@ public class ScanReportService {
         return new ScanPageResponse(
                 page.id(), page.scanId(), path(page.url()), page.url(), page.statusCode(),
                 pageOutcome(page.outcome()), page.responseTimeMs(), page.responseBytes(), page.title(),
+                page.description(), page.metaKeywords(), page.canonicalUrl(), page.canonicalRelation(),
+                page.metaRobots(), page.xRobotsTag(), page.htmlLang(), page.indexable(), page.indexabilityReason(),
                 page.h1() == null || page.h1().isEmpty() ? null : page.h1().getFirst(),
-                page.links(), page.images(), 0, 0,
+                safeList(page.h1()), safeList(page.h2()), safeList(page.h3()), safeList(page.h4()),
+                safeList(page.h5()), safeList(page.h6()),
+                page.hreflang() == null ? List.of() : page.hreflang().stream()
+                        .map(entry -> new HreflangResponse(entry.language(), entry.url())).toList(),
+                new OpenGraphResponse(page.openGraphTitle(), page.openGraphDescription(), page.openGraphImageUrl()),
+                new StructuredDataSummaryResponse(
+                        safeList(page.schemaOrgTypes()), page.schemaOrgItemCount(), page.schemaOrgValidCount(),
+                        page.schemaOrgErrorCount(), page.schemaOrgWarningCount(), safeList(page.schemaOrgIssueCodes())
+                ),
+                page.links(), page.images(), page.scripts(), page.stylesheets(),
+                new HttpTimingResponse(
+                        observed(page.dnsObserved(), page.dnsMillis()),
+                        observed(page.connectObserved(), page.connectMillis()),
+                        observed(page.tlsObserved(), page.tlsMillis()),
+                        observed(page.ttfbObserved(), page.ttfbMillis()),
+                        page.responseTimeMs()
+                ),
                 page.findings() == null
                         ? List.of()
                         : page.findings().stream().map(this::toResponse).toList(),
                 page.observedAt()
         );
+    }
+
+    private static <T> List<T> safeList(List<T> values) {
+        return values == null ? List.of() : List.copyOf(values);
+    }
+
+    private static Long observed(boolean observed, Long value) {
+        return observed ? value : null;
     }
 
     private FindingResponse toResponse(CrawlerFindingContract finding) {

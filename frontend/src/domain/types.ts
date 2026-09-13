@@ -7,7 +7,7 @@ export type ScanStatus =
   | 'FAILED'
   | 'CANCELLED'
 
-export type CaptureStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED'
+export type CaptureStatus = 'QUEUED' | 'DISPATCHED' | 'RUNNING' | 'INDEXING' | 'COMPLETED' | 'PARTIAL_SUCCESS' | 'FAILED' | 'CANCELLED'
 export type FindingSeverity = 'critical' | 'warning' | 'info'
 
 export interface Website {
@@ -36,9 +36,21 @@ export interface Scan {
   websiteId: string
   status: ScanStatus
   createdAt: string
+  startedAt?: string
+  finishedAt?: string
   duration: string
   progress: ScanProgress
   findingCount: number
+  collectorVersion?: string
+  effectiveConfig?: {
+    maxPages: number
+    maxDepth: number
+    maxResponseBytes: number
+    maxDurationSeconds: number
+    maxRedirects: number
+    concurrency: number
+  }
+  terminalReason?: { code: string; message: string }
 }
 
 export interface Finding {
@@ -59,20 +71,62 @@ export interface ScanPageRecord {
   responseTimeMs?: number
   responseBytes?: number
   title?: string
+  description?: string
+  metaKeywords?: string
+  canonicalUrl?: string
+  canonicalRelation?: 'MISSING' | 'SELF' | 'NON_SELF'
+  metaRobots?: string
+  xRobotsTag?: string
+  htmlLang?: string
+  indexable?: boolean
+  indexabilityReason?: string
   h1?: string
+  h1Values?: string[]
+  h2?: string[]
+  h3?: string[]
+  h4?: string[]
+  h5?: string[]
+  h6?: string[]
+  hreflang?: Array<{ language: string; url: string }>
+  openGraph?: { title?: string; description?: string; imageUrl?: string }
+  structuredData?: {
+    types: string[]
+    itemCount: number
+    validCount: number
+    errorCount: number
+    warningCount: number
+    issueCodes: string[]
+  }
   links: number
   images: number
   scripts: number
   stylesheets: number
+  timing?: {
+    dnsMillis?: number
+    connectMillis?: number
+    tlsMillis?: number
+    ttfbMillis?: number
+    totalMillis?: number
+  }
   findings: Finding[]
+  observedAt?: string
+}
+
+export interface ScanPagesReport {
+  items: ScanPageRecord[]
+  analyticsExpectedCount: number
+  analyticsPublishedCount: number
+  analyticsWatermark: string | null
+  fresh: boolean
+  nextCursor?: string
 }
 
 export interface CapturedResource {
   id: string
   url: string
-  method: 'GET' | 'POST'
+  method: string
   status: number
-  type: 'document' | 'stylesheet' | 'script' | 'image' | 'font' | 'fetch'
+  type: string
   contentType: string
   sizeBytes: number
   durationMs: number
@@ -87,7 +141,57 @@ export interface PageSnapshot {
   viewport: string
   resourceCount: number
   totalBytes: number
+  measurementProfile?: string
+  browserVersion?: string
+  capturedResourceCount?: number
+  rendered?: {
+    title: string
+    description: string
+    canonicalUrl: string
+    metaRobots: string
+    h1: string[]
+    wordCount: number
+    linkCount: number
+    imageCount: number
+    openGraph: { title: string; description: string; imageUrl: string }
+    schemaOrgTypes: string[]
+  }
+  diff?: {
+    titleChanged: boolean
+    descriptionChanged: boolean
+    canonicalChanged: boolean
+    h1Changed: boolean
+    contentChanged: boolean
+    linkCountDelta: number
+    imageCountDelta: number
+    schemaTypesChanged: boolean
+  }
+  performance?: Record<'lcp' | 'cls' | 'ttfb', {
+    status: 'AVAILABLE' | 'UNAVAILABLE'
+    value: number | null
+    unit: 'ms' | 'score'
+    source: string
+    profileVersion: string
+    unavailableReason: string | null
+  }>
+  artifacts?: { renderedHtmlBytes: number; screenshotBytes: number }
   resources: CapturedResource[]
+}
+
+export interface Capture {
+  id: string
+  scanId: string
+  pageId: string
+  status: CaptureStatus
+  targetUrl: string
+  measurementProfile: string
+  analyticsExpectedCount: number
+  analyticsPublishedCount: number
+  objectCount: number
+  totalObjectBytes: number
+  terminalCode?: string
+  terminalMessage?: string
+  createdAt: string
 }
 
 export interface ServiceError {
