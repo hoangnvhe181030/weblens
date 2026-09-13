@@ -20,6 +20,7 @@ type Config struct {
 	ServiceToken          string
 	ControlEventsURL      string
 	WorkerConcurrency     int
+	HostConcurrency       int
 	WorkerPollInterval    time.Duration
 	LeaseDuration         time.Duration
 	HostDelay             time.Duration
@@ -27,11 +28,12 @@ type Config struct {
 	AnalyticsPollInterval time.Duration
 	AnalyticsBacklogAge   time.Duration
 	MigrateOnStart        bool
-	AllowPrivateIPs       bool
-	Environment           string
+	LocalTargetsOnly      bool
 }
 
 func Load() (Config, error) {
+	migrateOnStart, migrateOnStartError := boolValue("CRAWLER_MIGRATE_ON_START", false)
+	localTargetsOnly, localTargetsOnlyError := boolValue("CRAWLER_LOCAL_TARGETS_ONLY", false)
 	cfg := Config{
 		HTTPAddress:           value("CRAWLER_HTTP_ADDRESS", ":8081"),
 		PostgresURL:           strings.TrimSpace(os.Getenv("CRAWLER_POSTGRES_URL")),
@@ -41,18 +43,22 @@ func Load() (Config, error) {
 		ClickHousePassword:    os.Getenv("CRAWLER_CLICKHOUSE_PASSWORD"),
 		ServiceToken:          strings.TrimSpace(os.Getenv("CRAWLER_SERVICE_TOKEN")),
 		ControlEventsURL:      value("CRAWLER_CONTROL_EVENTS_URL", "http://localhost:8080/internal/v1/events/scans"),
-		WorkerConcurrency:     intValue("CRAWLER_WORKER_CONCURRENCY", 3),
+		WorkerConcurrency:     intValue("CRAWLER_WORKER_CONCURRENCY", 10_000),
+		HostConcurrency:       intValue("CRAWLER_HOST_CONCURRENCY", 2),
 		WorkerPollInterval:    durationValue("CRAWLER_WORKER_POLL_INTERVAL", 250*time.Millisecond),
 		LeaseDuration:         durationValue("CRAWLER_LEASE_DURATION", 30*time.Second),
 		HostDelay:             durationValue("CRAWLER_HOST_DELAY", time.Second),
 		PublisherPollInterval: durationValue("CRAWLER_PUBLISHER_POLL_INTERVAL", 500*time.Millisecond),
 		AnalyticsPollInterval: durationValue("CRAWLER_ANALYTICS_POLL_INTERVAL", 500*time.Millisecond),
 		AnalyticsBacklogAge:   durationValue("CRAWLER_ANALYTICS_BACKPRESSURE_AGE", 15*time.Minute),
-		MigrateOnStart:        boolValue("CRAWLER_MIGRATE_ON_START", false),
-		AllowPrivateIPs:       boolValue("CRAWLER_ALLOW_PRIVATE_IPS", false),
-		Environment:           strings.ToLower(value("CRAWLER_ENV", "development")),
+		MigrateOnStart:        migrateOnStart,
+		LocalTargetsOnly:      localTargetsOnly,
 	}
-	return cfg, cfg.Validate()
+	return cfg, errors.Join(
+		migrateOnStartError,
+		localTargetsOnlyError,
+		cfg.Validate(),
+	)
 }
 
 func (c Config) Validate() error {
@@ -66,8 +72,11 @@ func (c Config) Validate() error {
 	if len(c.ServiceToken) < 32 {
 		problems = append(problems, errors.New("CRAWLER_SERVICE_TOKEN must contain at least 32 bytes"))
 	}
-	if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 10 {
-		problems = append(problems, errors.New("CRAWLER_WORKER_CONCURRENCY must be between 1 and 10"))
+	if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 10_000 {
+		problems = append(problems, errors.New("CRAWLER_WORKER_CONCURRENCY must be between 1 and 10000"))
+	}
+	if c.HostConcurrency < 1 || c.HostConcurrency > 10_000 {
+		problems = append(problems, errors.New("CRAWLER_HOST_CONCURRENCY must be between 1 and 10000"))
 	}
 	if c.LeaseDuration < 5*time.Second || c.LeaseDuration > 5*time.Minute {
 		problems = append(problems, errors.New("CRAWLER_LEASE_DURATION must be between 5s and 5m"))
@@ -81,8 +90,8 @@ func (c Config) Validate() error {
 	if err := validateHTTPURL(c.ControlEventsURL); err != nil {
 		problems = append(problems, fmt.Errorf("CRAWLER_CONTROL_EVENTS_URL: %w", err))
 	}
-	if c.AllowPrivateIPs && c.Environment != "development" && c.Environment != "test" {
-		problems = append(problems, errors.New("private IP access is only allowed in development or test"))
+	if c.HostConcurrency > 2 && !c.LocalTargetsOnly {
+		problems = append(problems, errors.New("host concurrency above 2 requires CRAWLER_LOCAL_TARGETS_ONLY=true"))
 	}
 	return errors.Join(problems...)
 }
@@ -129,14 +138,14 @@ func durationValue(name string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
-func boolValue(name string, fallback bool) bool {
+func boolValue(name string, fallback bool) (bool, error) {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
-		return fallback
+		return fallback, nil
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		return fallback
+		return fallback, fmt.Errorf("%s must be true or false", name)
 	}
-	return parsed
+	return parsed, nil
 }

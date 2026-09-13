@@ -90,7 +90,7 @@ func run(logger *slog.Logger) error {
 		}
 	}
 
-	store, err := postgres.Open(startupContext, cfg.PostgresURL)
+	store, err := postgres.OpenWithHostConcurrency(startupContext, cfg.PostgresURL, cfg.HostConcurrency)
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,10 @@ func run(logger *slog.Logger) error {
 	}
 	defer analyticsSink.Close()
 
-	fetcher := crawl.NewFetcher("WebLensCrawler/1.0", 30*time.Second, cfg.AllowPrivateIPs)
+	fetcher := crawl.NewFetcher(
+		"WebLensCrawler/1.0", 30*time.Second, cfg.HostConcurrency,
+		cfg.LocalTargetsOnly,
+	)
 	engine := crawl.NewEngine(
 		store, fetcher, cfg.WorkerConcurrency, cfg.WorkerPollInterval,
 		cfg.LeaseDuration, cfg.HostDelay, cfg.AnalyticsBacklogAge, logger,

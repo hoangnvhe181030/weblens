@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +31,7 @@ type commandStore interface {
 }
 
 type reportReader interface {
-	ListPages(context.Context, uuid.UUID, uuid.UUID) ([]model.ReportPage, error)
+	ListPages(context.Context, uuid.UUID, uuid.UUID, int, string, uuid.UUID) ([]model.ReportPage, bool, error)
 	GetPage(context.Context, uuid.UUID, uuid.UUID) (model.ReportPage, error)
 }
 
@@ -72,13 +74,57 @@ func (s *Server) listPages(response http.ResponseWriter, request *http.Request) 
 		writeProblem(response, http.StatusServiceUnavailable, "REPORT_UNAVAILABLE", "The scan report is temporarily unavailable.")
 		return
 	}
-	pages, err := s.reports.ListPages(request.Context(), ownerID, scanID)
+	limit, cursor, err := pageQuery(request)
+	if err != nil {
+		writeProblem(response, http.StatusBadRequest, "INVALID_PAGE_CURSOR", err.Error())
+		return
+	}
+	pages, hasMore, err := s.reports.ListPages(request.Context(), ownerID, scanID, limit, cursor.URL, cursor.ID)
 	if err != nil {
 		s.logger.Error("read page report failed", "scanId", scanID, "error", err)
 		writeProblem(response, http.StatusServiceUnavailable, "REPORT_UNAVAILABLE", "The scan report is temporarily unavailable.")
 		return
 	}
-	writeJSON(response, http.StatusOK, model.ScanPagesReport{State: state, Items: pages})
+	nextCursor := ""
+	if hasMore && len(pages) > 0 {
+		last := pages[len(pages)-1]
+		nextCursor = encodePageCursor(pageCursor{URL: last.URL, ID: last.ID})
+	}
+	writeJSON(response, http.StatusOK, model.ScanPagesReport{State: state, Items: pages, NextCursor: nextCursor})
+}
+
+type pageCursor struct {
+	URL string    `json:"url"`
+	ID  uuid.UUID `json:"id"`
+}
+
+func pageQuery(request *http.Request) (int, pageCursor, error) {
+	limit := 100
+	if raw := strings.TrimSpace(request.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 500 {
+			return 0, pageCursor{}, errors.New("limit must be between 1 and 500")
+		}
+		limit = parsed
+	}
+	rawCursor := strings.TrimSpace(request.URL.Query().Get("cursor"))
+	if rawCursor == "" {
+		return limit, pageCursor{}, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(rawCursor)
+	if err != nil {
+		return 0, pageCursor{}, errors.New("cursor is invalid")
+	}
+	var cursor pageCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.URL == "" || cursor.ID == uuid.Nil {
+		return 0, pageCursor{}, errors.New("cursor is invalid")
+	}
+	return limit, cursor, nil
+}
+
+func encodePageCursor(cursor pageCursor) string {
+	encoded, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 func (s *Server) getPage(response http.ResponseWriter, request *http.Request) {

@@ -1,12 +1,17 @@
 package analytics
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -49,13 +54,23 @@ func Migrate(ctx context.Context, options Options) error {
 	if err := connection.Ping(ctx); err != nil {
 		return fmt.Errorf("ping ClickHouse for migration: %w", err)
 	}
-	body, err := migrations.Files.ReadFile("clickhouse/001_create_crawl_analytics.sql")
+	entries, err := fs.ReadDir(migrations.Files, "clickhouse")
 	if err != nil {
-		return fmt.Errorf("read ClickHouse migration: %w", err)
+		return fmt.Errorf("list ClickHouse migrations: %w", err)
 	}
-	for _, statement := range splitStatements(string(body)) {
-		if err := connection.Exec(ctx, statement); err != nil {
-			return fmt.Errorf("apply ClickHouse migration: %w", err)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		body, readErr := migrations.Files.ReadFile("clickhouse/" + entry.Name())
+		if readErr != nil {
+			return fmt.Errorf("read ClickHouse migration %s: %w", entry.Name(), readErr)
+		}
+		for _, statement := range splitStatements(string(body)) {
+			if applyErr := connection.Exec(ctx, statement); applyErr != nil && !isObjectAlreadyExists(applyErr) {
+				return fmt.Errorf("apply ClickHouse migration %s: %w", entry.Name(), applyErr)
+			}
 		}
 	}
 	return nil
@@ -153,13 +168,23 @@ func (s *Sink) WriteBatch(ctx context.Context, batches []model.AnalyticsBatch) m
 
 func decodeAnalyticsBatch(batch model.AnalyticsBatch) (model.AnalyticsPayload, error) {
 	var payload model.AnalyticsPayload
-	if err := json.Unmarshal(batch.Payload, &payload); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(batch.Payload))
+	decoder.DisallowUnknownFields()
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
 		return model.AnalyticsPayload{}, fmt.Errorf("decode analytics payload: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return model.AnalyticsPayload{}, errors.New("decode analytics payload: trailing JSON data")
 	}
 	if payload.OwnerID != batch.OwnerID || payload.PageID != batch.PageID || int64(payload.RecordVersion) != batch.ResultVersion {
 		return model.AnalyticsPayload{}, errors.New("analytics payload identifiers do not match outbox metadata")
 	}
-	if !equalHash(batch.PayloadSHA256, batch.Payload) {
+	canonicalPayload, err := json.Marshal(payload)
+	if err != nil {
+		return model.AnalyticsPayload{}, fmt.Errorf("canonicalize analytics payload: %w", err)
+	}
+	if !equalHash(batch.PayloadSHA256, canonicalPayload) {
 		return model.AnalyticsPayload{}, errors.New("analytics payload checksum mismatch")
 	}
 	return payload, nil
@@ -187,13 +212,34 @@ func sharedFailure(results map[uuid.UUID]error, pending []preparedAnalytics, err
 }
 
 func (s *Sink) insertPageMetrics(ctx context.Context, items []preparedAnalytics) error {
-	batch, err := s.connection.PrepareBatch(ctx, fmt.Sprintf(`INSERT INTO %s.page_metrics`, quoteIdentifier(s.database)))
+	batch, err := s.connection.PrepareBatch(ctx, fmt.Sprintf(`INSERT INTO %s.page_metrics (
+		owner_id, scan_id, retention_month, page_id, record_version, is_deleted, schema_version,
+		requested_url, normalized_url, normalized_url_sha256, final_url, hostname, discovery_depth,
+		fetch_outcome, error_code, error_message, status_code, content_type, content_encoding,
+		redirect_count, redirect_urls, redirect_status_codes, response_bytes, decoded_body_bytes,
+		dns_ms, dns_observed, connect_ms, connect_observed, tls_ms, tls_observed, ttfb_ms, ttfb_observed,
+		total_ms, title, title_length, meta_description, meta_description_length, meta_keywords,
+		canonical_url, canonical_relation, meta_robots, x_robots_tag, html_lang,
+		h1, h2, h3, h4, h5, h6, hreflang_languages, hreflang_urls,
+		open_graph_title, open_graph_description, open_graph_image_url,
+		schema_org_types, schema_org_item_count, schema_org_valid_count, schema_org_error_count,
+		schema_org_warning_count, schema_org_issue_codes, word_count, internal_link_count,
+		external_link_count, image_count, image_missing_alt_count, script_count, stylesheet_count,
+		is_indexable, indexability_reason, pagerank_score, collector_version, parser_version,
+		observed_at, ingested_at
+	)`, quoteIdentifier(s.database)))
 	if err != nil {
 		return fmt.Errorf("prepare ClickHouse page metric: %w", err)
 	}
 	for _, item := range items {
 		payload, result := item.payload, item.payload.Result
 		normalizedHash := crawl.URLHash(payload.NormalizedURL)
+		hreflangLanguages := make([]string, 0, len(result.Hreflang))
+		hreflangURLs := make([]string, 0, len(result.Hreflang))
+		for _, entry := range result.Hreflang {
+			hreflangLanguages = append(hreflangLanguages, entry.Language)
+			hreflangURLs = append(hreflangURLs, entry.URL)
+		}
 		if err := batch.Append(
 			payload.OwnerID, payload.ScanID, payload.RetentionMonth, payload.PageID,
 			payload.RecordVersion, uint8(0), payload.SchemaVersion,
@@ -202,11 +248,19 @@ func (s *Sink) insertPageMetrics(ctx context.Context, items []preparedAnalytics)
 			result.ErrorMessage, uint16(max(result.StatusCode, 0)), result.ContentType, "",
 			uint8(len(result.RedirectURLs)), result.RedirectURLs, result.RedirectCodes,
 			result.ResponseBytes, result.ResponseBytes,
-			uint32(0), uint32(0), uint32(0), uint32(0), result.TotalMillis,
+			result.DNSMillis, boolByte(result.DNSObserved), result.ConnectMillis, boolByte(result.ConnectObserved),
+			result.TLSMillis, boolByte(result.TLSObserved), result.TTFBMillis, boolByte(result.TTFBObserved),
+			result.TotalMillis,
 			result.Title, uint16(min(len(result.Title), 65535)), result.Description,
-			uint16(min(len(result.Description), 65535)), result.CanonicalURL, result.MetaRobots,
-			result.HTMLLang, result.H1, result.H2, result.WordCount, result.InternalLinks,
-			result.ExternalLinks, result.ImageCount, result.MissingAlt, boolByte(result.IsIndexable),
+			uint16(min(len(result.Description), 65535)), result.MetaKeywords,
+			result.CanonicalURL, result.CanonicalRelation, result.MetaRobots, result.XRobotsTag,
+			result.HTMLLang, result.H1, result.H2, result.H3, result.H4, result.H5, result.H6,
+			hreflangLanguages, hreflangURLs, result.OpenGraphTitle, result.OpenGraphDescription,
+			result.OpenGraphImageURL, result.SchemaOrgTypes, result.SchemaOrgItemCount,
+			result.SchemaOrgValidCount, result.SchemaOrgErrorCount, result.SchemaOrgWarningCount,
+			result.SchemaOrgIssueCodes, result.WordCount, result.InternalLinks,
+			result.ExternalLinks, result.ImageCount, result.MissingAlt, result.ScriptCount,
+			result.StylesheetCount, boolByte(result.IsIndexable), result.IndexabilityReason,
 			float32(0), payload.CollectorVersion, payload.ParserVersion,
 			result.ObservedAt, time.Now().UTC(),
 		); err != nil {
@@ -314,7 +368,12 @@ func (s *Sink) insertReceipts(ctx context.Context, items []preparedAnalytics) er
 
 func equalHash(expected, payload []byte) bool {
 	actual := sha256.Sum256(payload)
-	return string(expected) == string(actual[:])
+	return hmac.Equal(expected, actual[:])
+}
+
+func isObjectAlreadyExists(err error) bool {
+	var exception *clickhouseDriver.Exception
+	return errors.As(err, &exception) && exception.Code == 57
 }
 
 func quoteIdentifier(value string) string {

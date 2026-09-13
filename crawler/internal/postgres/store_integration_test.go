@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/weblens-project/weblens-crawler/internal/contracts"
+	"github.com/weblens-project/weblens-crawler/internal/crawl"
 	"github.com/weblens-project/weblens-crawler/internal/model"
 )
 
@@ -222,6 +223,66 @@ func TestStoreWorkflowIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("configured host slots allow concurrent leases with exact fencing", func(t *testing.T) {
+		command := newTestScanCommand("https://parallel.example.com/")
+		command.Payload.MaxPages = 3
+		command.Payload.MaxConcurrency = 2
+		if _, err := store.AcceptCommand(ctx, command); err != nil {
+			t.Fatalf("accept parallel command: %v", err)
+		}
+
+		var slotCount int
+		hostHash := crawl.URLHash(command.Payload.TargetHostname)
+		if err := store.pool.QueryRow(ctx, `
+			SELECT count(*)::integer
+			FROM host_leases
+			WHERE hostname_sha256 = $1 AND hostname = $2`,
+			hostHash[:], command.Payload.TargetHostname).Scan(&slotCount); err != nil {
+			t.Fatalf("count host slots: %v", err)
+		}
+		if slotCount != 2 {
+			t.Fatalf("host slot count = %d, want 2", slotCount)
+		}
+
+		seedLease, err := store.ClaimPage(ctx, uuid.New(), time.Minute, 0)
+		if err != nil || seedLease == nil || seedLease.ScanID != command.Payload.ScanID {
+			t.Fatalf("claim parallel seed: lease=%+v err=%v", seedLease, err)
+		}
+		result := successfulPageResult(command.Payload.TargetURL)
+		result.Links = []model.DiscoveredLink{
+			{TargetURL: "https://parallel.example.com/a", IsInternal: true, IsFollowable: true},
+			{TargetURL: "https://parallel.example.com/b", IsInternal: true, IsFollowable: true},
+		}
+		if err := store.CommitPageResult(ctx, *seedLease, result); err != nil {
+			t.Fatalf("commit parallel seed: %v", err)
+		}
+
+		first, err := store.ClaimPage(ctx, uuid.New(), time.Minute, 0)
+		if err != nil || first == nil || first.ScanID != command.Payload.ScanID {
+			t.Fatalf("claim first parallel page: lease=%+v err=%v", first, err)
+		}
+		second, err := store.ClaimPage(ctx, uuid.New(), time.Minute, 0)
+		if err != nil || second == nil || second.ScanID != command.Payload.ScanID {
+			t.Fatalf("claim second parallel page: lease=%+v err=%v", second, err)
+		}
+		if first.HostSlotNo == second.HostSlotNo || first.HostGeneration < 1 || second.HostGeneration < 1 {
+			t.Fatalf("host slots were not independently fenced: first=%+v second=%+v", first, second)
+		}
+
+		stale := *first
+		stale.HostGeneration--
+		if err := store.ExtendPageLease(ctx, stale, time.Minute); !errors.Is(err, ErrStaleLease) {
+			t.Fatalf("expected stale host generation to be fenced, got %v", err)
+		}
+		if err := store.ExtendPageLease(ctx, *first, time.Minute); err != nil {
+			t.Fatalf("valid host generation was rejected after rollback: %v", err)
+		}
+
+		if _, err := store.AcceptCancellation(ctx, newTestCancelCommand(command, 2)); err != nil {
+			t.Fatalf("cancel parallel command: %v", err)
+		}
+	})
+
 	t.Run("old analytics backlog activates load shedding", func(t *testing.T) {
 		command := newTestScanCommand("https://backpressure.example.com/")
 		if _, err := store.AcceptCommand(ctx, command); err != nil {
@@ -244,6 +305,38 @@ func TestStoreWorkflowIntegration(t *testing.T) {
 		blocked, err := store.AnalyticsBackpressured(ctx, 15*time.Minute)
 		if err != nil || !blocked {
 			t.Fatalf("expected old backlog to activate backpressure: blocked=%v err=%v", blocked, err)
+		}
+	})
+
+	t.Run("migration and store accept structural extreme caps", func(t *testing.T) {
+		originalHostConcurrency := store.hostConcurrency
+		store.hostConcurrency = 10_000
+		defer func() { store.hostConcurrency = originalHostConcurrency }()
+
+		command := newTestScanCommand("https://extreme.example.com/")
+		command.Payload.MaxPages = contracts.MaxScanPages
+		command.Payload.MaxDurationSeconds = contracts.MaxScanDurationSeconds
+		command.Payload.MaxConcurrency = contracts.MaxScanConcurrency
+		if _, err := store.AcceptCommand(ctx, command); err != nil {
+			t.Fatalf("accept structural extreme command: %v", err)
+		}
+
+		var slotCount int
+		if err := store.pool.QueryRow(ctx,
+			"SELECT count(*)::integer FROM host_leases WHERE hostname = $1",
+			command.Payload.TargetHostname,
+		).Scan(&slotCount); err != nil {
+			t.Fatalf("count extreme host slots: %v", err)
+		}
+		if slotCount != 10_000 {
+			t.Fatalf("extreme host slot count = %d, want 10000", slotCount)
+		}
+		lease, err := store.ClaimPage(ctx, uuid.New(), time.Minute, 0)
+		if err != nil || lease == nil || lease.ScanID != command.Payload.ScanID {
+			t.Fatalf("claim with 10000 host slots: lease=%+v err=%v", lease, err)
+		}
+		if lease.HostSlotNo < 1 || lease.HostSlotNo > 10_000 {
+			t.Fatalf("claimed host slot %d is outside the configured range", lease.HostSlotNo)
 		}
 	})
 }

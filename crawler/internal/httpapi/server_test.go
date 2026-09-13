@@ -36,8 +36,8 @@ func (*fakeCommandStore) GetReportState(_ context.Context, ownerID, scanID uuid.
 	return model.ReportState{OwnerID: ownerID, ScanID: scanID}, nil
 }
 
-func (*fakeCommandStore) ListPages(context.Context, uuid.UUID, uuid.UUID) ([]model.ReportPage, error) {
-	return []model.ReportPage{}, nil
+func (*fakeCommandStore) ListPages(context.Context, uuid.UUID, uuid.UUID, int, string, uuid.UUID) ([]model.ReportPage, bool, error) {
+	return []model.ReportPage{}, false, nil
 }
 
 func (*fakeCommandStore) GetPage(context.Context, uuid.UUID, uuid.UUID) (model.ReportPage, error) {

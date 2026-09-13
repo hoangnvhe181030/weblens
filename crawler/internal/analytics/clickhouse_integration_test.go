@@ -27,6 +27,9 @@ func TestClickHouseBatchIntegration(t *testing.T) {
 	if err := Migrate(ctx, options); err != nil {
 		t.Fatalf("migrate ClickHouse test database: %v", err)
 	}
+	if err := Migrate(ctx, options); err != nil {
+		t.Fatalf("repeat ClickHouse migration: %v", err)
+	}
 	sink, err := Open(ctx, options)
 	if err != nil {
 		t.Fatalf("open ClickHouse test database: %v", err)
@@ -61,6 +64,23 @@ func TestClickHouseBatchIntegration(t *testing.T) {
 	}
 	if receipts != 2 {
 		t.Fatalf("expected 2 receipts after replay, got %d", receipts)
+	}
+	pages, hasMore, err := sink.ListPages(ctx, ownerID, scanID, 100, "", uuid.Nil)
+	if err != nil {
+		t.Fatalf("list ClickHouse page report: %v", err)
+	}
+	if len(pages) != 2 {
+		t.Fatalf("expected 2 report pages, got %d", len(pages))
+	}
+	if hasMore {
+		t.Fatal("did not expect another page of integration results")
+	}
+	page, err := sink.GetPage(ctx, ownerID, batches[0].PageID)
+	if err != nil {
+		t.Fatalf("get ClickHouse page report: %v", err)
+	}
+	if page.ID != batches[0].PageID {
+		t.Fatalf("expected report page %s, got %s", batches[0].PageID, page.ID)
 	}
 }
 

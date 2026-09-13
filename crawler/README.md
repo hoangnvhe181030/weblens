@@ -25,6 +25,20 @@ chưa được xác nhận vượt ngưỡng này, crawler ngừng claim page m�
 degraded; accepted work vẫn nằm bền vững trong PostgreSQL. Sink gom tối đa 100
 page bundle mỗi nhịp trước khi insert theo từng loại fact để hạn chế small parts.
 
+Runtime duy nhất dùng trần `CRAWLER_WORKER_CONCURRENCY=10000`, nhưng đây là số
+page fetch tối đa đang hoạt động chứ không phải 10.000 vòng polling PostgreSQL.
+Dispatcher chỉ claim công việc khi còn slot và giảm về một nhịp polling khi
+frontier rỗng. `CRAWLER_HOST_CONCURRENCY=2` cùng `CRAWLER_HOST_DELAY=1s` tiếp tục
+bảo vệ từng website công cộng; không được tăng host concurrency chỉ vì trần worker
+toàn hệ thống cao. Command có hard cap cấu trúc 1.000.000 page, 10.000 concurrency
+và bảy ngày. Các con số này là trần cấu hình, không phải bằng chứng capacity.
+
+`CRAWLER_LOCAL_TARGETS_ONLY=true` là network policy fail-closed cho fixture hoặc
+website nội bộ do người vận hành sở hữu. Chế độ này chỉ cho kết nối tới loopback
+và dải private RFC 1918/IPv6 ULA, đồng thời từ chối public IP, link-local và
+metadata address ở mỗi lần DNS/dial/redirect. Crawler không còn cờ cho phép đồng
+thời mọi public/private target và không phụ thuộc biến môi trường `CRAWLER_ENV`.
+
 `CRAWLER_MIGRATE_ON_START=true` chỉ dành cho local/CI. Production dùng migration
 job với owner role riêng rồi chạy service bằng runtime role không có quyền DDL.
 

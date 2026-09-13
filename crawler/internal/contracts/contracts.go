@@ -17,6 +17,10 @@ const (
 	ScanRequestedV1   = "SCAN_REQUESTED"
 	ScanCancelV1      = "SCAN_CANCEL_REQUESTED"
 	ScanProgressV1    = "SCAN_PROGRESS"
+
+	MaxScanPages           = 1_000_000
+	MaxScanDurationSeconds = 7 * 24 * 60 * 60
+	MaxScanConcurrency     = 10_000
 )
 
 type ScanCommandEnvelope struct {
@@ -111,13 +115,13 @@ func (e ScanCommandEnvelope) Validate() error {
 	} else if !strings.EqualFold(u.Hostname(), e.Payload.TargetHostname) {
 		problems = append(problems, errors.New("targetHostname must match targetUrl"))
 	}
-	if e.Payload.MaxPages < 1 || e.Payload.MaxPages > 100 || e.Payload.MaxDepth < 0 || e.Payload.MaxDepth > 10 {
+	if e.Payload.MaxPages < 1 || e.Payload.MaxPages > MaxScanPages || e.Payload.MaxDepth < 0 || e.Payload.MaxDepth > 10 {
 		problems = append(problems, errors.New("page or depth limit is outside the V1 policy"))
 	}
 	if e.Payload.MaxResponseBytes < 1024 || e.Payload.MaxResponseBytes > 52_428_800 {
 		problems = append(problems, errors.New("response byte limit is outside the V1 policy"))
 	}
-	if e.Payload.MaxDurationSeconds < 1 || e.Payload.MaxDurationSeconds > 3600 || e.Payload.MaxRedirects < 0 || e.Payload.MaxRedirects > 10 || e.Payload.MaxConcurrency < 1 || e.Payload.MaxConcurrency > 10 {
+	if e.Payload.MaxDurationSeconds < 1 || e.Payload.MaxDurationSeconds > MaxScanDurationSeconds || e.Payload.MaxRedirects < 0 || e.Payload.MaxRedirects > 10 || e.Payload.MaxConcurrency < 1 || e.Payload.MaxConcurrency > MaxScanConcurrency {
 		problems = append(problems, errors.New("execution limits are outside the V1 policy"))
 	}
 	if strings.TrimSpace(e.Payload.CollectorVersion) == "" || len(e.Payload.CollectorVersion) > 64 {

@@ -23,6 +23,8 @@ type PageLease struct {
 	DiscoveryDepth   int
 	LeaseOwner       uuid.UUID
 	LeaseGeneration  int64
+	HostSlotNo       int
+	HostGeneration   int64
 	MaxPages         int
 	MaxDepth         int
 	MaxResponseBytes int64
@@ -33,32 +35,65 @@ type PageLease struct {
 }
 
 type PageResult struct {
-	FinalURL      string
-	FetchOutcome  string
-	ErrorCode     string
-	ErrorMessage  string
-	StatusCode    int
-	ContentType   string
-	RedirectURLs  []string
-	RedirectCodes []uint16
-	ResponseBytes uint64
-	TotalMillis   uint32
-	Title         string
-	Description   string
-	CanonicalURL  string
-	MetaRobots    string
-	HTMLLang      string
-	H1            []string
-	H2            []string
-	WordCount     uint32
-	InternalLinks uint32
-	ExternalLinks uint32
-	ImageCount    uint32
-	MissingAlt    uint32
-	IsIndexable   bool
-	Links         []DiscoveredLink
-	Findings      []Finding
-	ObservedAt    time.Time
+	FinalURL              string
+	FetchOutcome          string
+	ErrorCode             string
+	ErrorMessage          string
+	StatusCode            int
+	ContentType           string
+	RedirectURLs          []string
+	RedirectCodes         []uint16
+	ResponseBytes         uint64
+	DNSMillis             uint32
+	ConnectMillis         uint32
+	TLSMillis             uint32
+	TTFBMillis            uint32
+	DNSObserved           bool
+	ConnectObserved       bool
+	TLSObserved           bool
+	TTFBObserved          bool
+	TotalMillis           uint32
+	Title                 string
+	Description           string
+	MetaKeywords          string
+	CanonicalURL          string
+	CanonicalRelation     string
+	MetaRobots            string
+	XRobotsTag            string
+	IndexabilityReason    string
+	HTMLLang              string
+	H1                    []string
+	H2                    []string
+	H3                    []string
+	H4                    []string
+	H5                    []string
+	H6                    []string
+	Hreflang              []Hreflang
+	OpenGraphTitle        string
+	OpenGraphDescription  string
+	OpenGraphImageURL     string
+	SchemaOrgTypes        []string
+	SchemaOrgItemCount    uint16
+	SchemaOrgValidCount   uint16
+	SchemaOrgErrorCount   uint16
+	SchemaOrgWarningCount uint16
+	SchemaOrgIssueCodes   []string
+	WordCount             uint32
+	InternalLinks         uint32
+	ExternalLinks         uint32
+	ImageCount            uint32
+	MissingAlt            uint32
+	ScriptCount           uint32
+	StylesheetCount       uint32
+	IsIndexable           bool
+	Links                 []DiscoveredLink
+	Findings              []Finding
+	ObservedAt            time.Time
+}
+
+type Hreflang struct {
+	Language string `json:"language"`
+	URL      string `json:"url"`
 }
 
 type DiscoveredLink struct {
@@ -144,23 +179,58 @@ type ReportFinding struct {
 }
 
 type ReportPage struct {
-	ID             uuid.UUID       `json:"id"`
-	ScanID         uuid.UUID       `json:"scanId"`
-	URL            string          `json:"url"`
-	FinalURL       string          `json:"finalUrl"`
-	StatusCode     int             `json:"statusCode,omitempty"`
-	Outcome        string          `json:"outcome"`
-	ResponseTimeMS uint32          `json:"responseTimeMs,omitempty"`
-	ResponseBytes  uint64          `json:"responseBytes,omitempty"`
-	Title          string          `json:"title,omitempty"`
-	H1             []string        `json:"h1"`
-	Links          uint32          `json:"links"`
-	Images         uint32          `json:"images"`
-	Findings       []ReportFinding `json:"findings"`
-	ObservedAt     time.Time       `json:"observedAt"`
+	ID                    uuid.UUID       `json:"id"`
+	ScanID                uuid.UUID       `json:"scanId"`
+	URL                   string          `json:"url"`
+	FinalURL              string          `json:"finalUrl"`
+	StatusCode            int             `json:"statusCode,omitempty"`
+	Outcome               string          `json:"outcome"`
+	ResponseTimeMS        uint32          `json:"responseTimeMs,omitempty"`
+	ResponseBytes         uint64          `json:"responseBytes,omitempty"`
+	Title                 string          `json:"title,omitempty"`
+	Description           string          `json:"description,omitempty"`
+	MetaKeywords          string          `json:"metaKeywords,omitempty"`
+	CanonicalURL          string          `json:"canonicalUrl,omitempty"`
+	CanonicalRelation     string          `json:"canonicalRelation"`
+	MetaRobots            string          `json:"metaRobots,omitempty"`
+	XRobotsTag            string          `json:"xRobotsTag,omitempty"`
+	HTMLLang              string          `json:"htmlLang,omitempty"`
+	IsIndexable           bool            `json:"indexable"`
+	IndexabilityReason    string          `json:"indexabilityReason"`
+	H1                    []string        `json:"h1"`
+	H2                    []string        `json:"h2"`
+	H3                    []string        `json:"h3"`
+	H4                    []string        `json:"h4"`
+	H5                    []string        `json:"h5"`
+	H6                    []string        `json:"h6"`
+	Hreflang              []Hreflang      `json:"hreflang"`
+	OpenGraphTitle        string          `json:"openGraphTitle,omitempty"`
+	OpenGraphDescription  string          `json:"openGraphDescription,omitempty"`
+	OpenGraphImageURL     string          `json:"openGraphImageUrl,omitempty"`
+	SchemaOrgTypes        []string        `json:"schemaOrgTypes"`
+	SchemaOrgItemCount    uint16          `json:"schemaOrgItemCount"`
+	SchemaOrgValidCount   uint16          `json:"schemaOrgValidCount"`
+	SchemaOrgErrorCount   uint16          `json:"schemaOrgErrorCount"`
+	SchemaOrgWarningCount uint16          `json:"schemaOrgWarningCount"`
+	SchemaOrgIssueCodes   []string        `json:"schemaOrgIssueCodes"`
+	Links                 uint32          `json:"links"`
+	Images                uint32          `json:"images"`
+	Scripts               uint32          `json:"scripts"`
+	Stylesheets           uint32          `json:"stylesheets"`
+	DNSMillis             uint32          `json:"dnsMillis,omitempty"`
+	ConnectMillis         uint32          `json:"connectMillis,omitempty"`
+	TLSMillis             uint32          `json:"tlsMillis,omitempty"`
+	TTFBMillis            uint32          `json:"ttfbMillis,omitempty"`
+	DNSObserved           bool            `json:"dnsObserved"`
+	ConnectObserved       bool            `json:"connectObserved"`
+	TLSObserved           bool            `json:"tlsObserved"`
+	TTFBObserved          bool            `json:"ttfbObserved"`
+	Findings              []ReportFinding `json:"findings"`
+	ObservedAt            time.Time       `json:"observedAt"`
 }
 
 type ScanPagesReport struct {
-	State ReportState  `json:"state"`
-	Items []ReportPage `json:"items"`
+	State      ReportState  `json:"state"`
+	Items      []ReportPage `json:"items"`
+	NextCursor string       `json:"nextCursor,omitempty"`
 }

@@ -50,43 +50,75 @@ func NewEngine(
 
 func (e *Engine) Run(ctx context.Context) {
 	e.refreshBackpressure(ctx)
-	var workers sync.WaitGroup
-	for range e.workers {
-		workers.Add(1)
-		go func(workerID uuid.UUID) {
-			defer workers.Done()
-			e.runWorker(ctx, workerID)
-		}(uuid.New())
-	}
-	workers.Add(1)
+	var components sync.WaitGroup
+	components.Add(1)
 	go func() {
-		defer workers.Done()
+		defer components.Done()
 		e.runReclaimer(ctx)
 	}()
-	workers.Wait()
+	e.runDispatcher(ctx)
+	components.Wait()
 }
 
-func (e *Engine) runWorker(ctx context.Context, workerID uuid.UUID) {
-	ticker := time.NewTicker(e.pollInterval)
-	defer ticker.Stop()
+func (e *Engine) runDispatcher(ctx context.Context) {
+	// workers là trần số page fetch đồng thời, không phải số vòng polling.
+	// Một dispatcher claim tuần tự để 10.000 slot không tạo connection storm khi
+	// frontier đang rỗng; slot chỉ giữ chỗ trong lúc page thật sự được xử lý.
+	slots := make(chan struct{}, e.workers)
+	var active sync.WaitGroup
+	defer active.Wait()
+
 	for {
+		if e.backpressured.Load() {
+			if !waitForContext(ctx, e.pollInterval) {
+				return
+			}
+			continue
+		}
+
 		select {
+		case slots <- struct{}{}:
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if e.backpressured.Load() {
-				continue
-			}
-			lease, err := e.store.ClaimPage(ctx, workerID, e.leaseDuration, e.hostDelay)
-			if err != nil {
-				e.logger.Error("claim page failed", "error", err)
-				continue
-			}
-			if lease == nil {
-				continue
-			}
-			e.process(ctx, *lease)
 		}
+
+		lease, err := e.store.ClaimPage(ctx, uuid.New(), e.leaseDuration, e.hostDelay)
+		if err != nil {
+			<-slots
+			if ctx.Err() != nil {
+				return
+			}
+			e.logger.Error("claim page failed", "error", err)
+			if !waitForContext(ctx, e.pollInterval) {
+				return
+			}
+			continue
+		}
+		if lease == nil {
+			<-slots
+			if !waitForContext(ctx, e.pollInterval) {
+				return
+			}
+			continue
+		}
+
+		active.Add(1)
+		go func(pageLease model.PageLease) {
+			defer active.Done()
+			defer func() { <-slots }()
+			e.process(ctx, pageLease)
+		}(*lease)
+	}
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -133,8 +165,13 @@ func buildResult(lease model.PageLease, fetched FetchResult) model.PageResult {
 	result := model.PageResult{
 		FinalURL: fetched.FinalURL, ErrorCode: fetched.ErrorCode,
 		ErrorMessage: fetched.ErrorMessage, StatusCode: fetched.StatusCode,
-		ContentType: fetched.ContentType, ResponseBytes: uint64(max(fetched.BodyBytes, 0)),
-		TotalMillis: uint32(min(fetched.TotalDuration.Milliseconds(), int64(^uint32(0)))),
+		ContentType: fetched.ContentType, XRobotsTag: fetched.XRobotsTag,
+		ResponseBytes: uint64(max(fetched.BodyBytes, 0)),
+		DNSMillis:     durationMillis(fetched.DNSDuration), ConnectMillis: durationMillis(fetched.ConnectDuration),
+		TLSMillis: durationMillis(fetched.TLSDuration), TTFBMillis: durationMillis(fetched.TTFBDuration),
+		DNSObserved: fetched.DNSObserved, ConnectObserved: fetched.ConnectObserved,
+		TLSObserved: fetched.TLSObserved, TTFBObserved: fetched.TTFBObserved,
+		TotalMillis: durationMillis(fetched.TotalDuration),
 		ObservedAt:  time.Now().UTC(),
 	}
 	if result.FinalURL == "" {
@@ -165,11 +202,27 @@ func buildResult(lease model.PageLease, fetched FetchResult) model.PageResult {
 		result.ErrorMessage = "HTML could not be parsed."
 		return result
 	}
-	result.Title, result.Description, result.CanonicalURL = data.Title, data.MetaDescription, data.CanonicalURL
-	result.MetaRobots, result.HTMLLang, result.H1, result.H2 = data.MetaRobots, data.HTMLLang, data.H1, data.H2
+	result.Title, result.Description, result.MetaKeywords = data.Title, data.MetaDescription, data.MetaKeywords
+	result.CanonicalURL, result.CanonicalRelation = data.CanonicalURL, data.CanonicalRelation
+	result.MetaRobots, result.HTMLLang = data.MetaRobots, data.HTMLLang
+	result.H1, result.H2, result.H3 = data.H1, data.H2, data.H3
+	result.H4, result.H5, result.H6 = data.H4, data.H5, data.H6
+	for _, entry := range data.Hreflang {
+		result.Hreflang = append(result.Hreflang, model.Hreflang{Language: entry.Language, URL: entry.URL})
+	}
+	result.OpenGraphTitle = data.OpenGraphTitle
+	result.OpenGraphDescription = data.OpenGraphDescription
+	result.OpenGraphImageURL = data.OpenGraphImageURL
+	result.SchemaOrgTypes = data.SchemaOrgTypes
+	result.SchemaOrgItemCount = uint16(data.SchemaOrgItemCount)
+	result.SchemaOrgValidCount = uint16(data.SchemaOrgValidCount)
+	result.SchemaOrgErrorCount = uint16(data.SchemaOrgErrorCount)
+	result.SchemaOrgWarningCount = uint16(data.SchemaOrgWarningCount)
+	result.SchemaOrgIssueCodes = data.SchemaOrgIssueCodes
 	result.WordCount = uint32(data.WordCount)
 	result.ImageCount, result.MissingAlt = uint32(data.ImageCount), uint32(data.ImageMissingAltCount)
-	result.IsIndexable = fetched.StatusCode >= 200 && fetched.StatusCode < 400 && !strings.Contains(strings.ToLower(data.MetaRobots), "noindex")
+	result.ScriptCount, result.StylesheetCount = uint32(data.ScriptCount), uint32(data.StylesheetCount)
+	result.IsIndexable, result.IndexabilityReason = indexability(fetched.StatusCode, data.MetaRobots, fetched.XRobotsTag)
 	for index, link := range data.Links {
 		converted := model.DiscoveredLink{
 			TargetURL: link.TargetURL, AnchorText: link.AnchorText, Tag: link.Tag,
@@ -196,6 +249,31 @@ func buildResult(lease model.PageLease, fetched FetchResult) model.PageResult {
 		result.Findings = append(result.Findings, finding(lease.PageID, "image.alt.missing", "CONTENT", "INFO", "IMAGE_ALT_MISSING", "One or more images have no alternative text.", map[string]any{"count": data.ImageMissingAltCount}))
 	}
 	return result
+}
+
+func indexability(statusCode int, metaRobots, xRobotsTag string) (bool, string) {
+	if statusCode < 200 || statusCode >= 400 {
+		return false, "HTTP_STATUS_NOT_INDEXABLE"
+	}
+	metaNoindex := strings.Contains(strings.ToLower(metaRobots), "noindex")
+	headerNoindex := strings.Contains(strings.ToLower(xRobotsTag), "noindex")
+	if metaNoindex && headerNoindex {
+		return false, "META_AND_X_ROBOTS_NOINDEX"
+	}
+	if headerNoindex {
+		return false, "X_ROBOTS_TAG_NOINDEX"
+	}
+	if metaNoindex {
+		return false, "META_ROBOTS_NOINDEX"
+	}
+	return true, "INDEXABLE"
+}
+
+func durationMillis(value time.Duration) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	return uint32(min(value.Milliseconds(), int64(^uint32(0))))
 }
 
 func finding(pageID uuid.UUID, ruleID, category, severity, code, message string, evidence map[string]any) model.Finding {

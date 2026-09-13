@@ -27,7 +27,8 @@ var (
 )
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool            *pgxpool.Pool
+	hostConcurrency int
 }
 
 func (s *Store) AcceptCancellation(ctx context.Context, envelope contracts.ScanCancelCommandEnvelope) (bool, error) {
@@ -182,6 +183,13 @@ func insertCancellationInbox(
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
+	return OpenWithHostConcurrency(ctx, databaseURL, 2)
+}
+
+func OpenWithHostConcurrency(ctx context.Context, databaseURL string, hostConcurrency int) (*Store, error) {
+	if hostConcurrency < 1 || hostConcurrency > 10_000 {
+		return nil, errors.New("host concurrency must be between 1 and 10000")
+	}
 	configuration, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse PostgreSQL URL: %w", err)
@@ -194,7 +202,7 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open PostgreSQL pool: %w", err)
 	}
-	store := &Store{pool: pool}
+	store := &Store{pool: pool, hostConcurrency: hostConcurrency}
 	if err := store.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -341,8 +349,10 @@ func (s *Store) AcceptCommand(ctx context.Context, envelope contracts.ScanComman
 	if _, err := tx.Exec(ctx, `
         INSERT INTO host_leases (
             hostname_sha256, hostname, slot_no, next_allowed_at, updated_at
-		) VALUES ($1, $2, 1, $3, $3)
-		ON CONFLICT DO NOTHING`, hostHash[:], strings.ToLower(envelope.Payload.TargetHostname), now); err != nil {
+		)
+		SELECT $1, $2, slot_no, $3, $3
+		FROM generate_series(1, $4::integer) AS slot_no
+		ON CONFLICT DO NOTHING`, hostHash[:], strings.ToLower(envelope.Payload.TargetHostname), now, s.hostConcurrency); err != nil {
 		return false, fmt.Errorf("insert seed host lease: %w", err)
 	}
 	if err := insertInbox(ctx, tx, envelope, payloadHash[:], "APPLIED"); err != nil {
@@ -380,8 +390,9 @@ func (s *Store) ClaimPage(ctx context.Context, workerID uuid.UUID, leaseDuration
 	defer tx.Rollback(ctx)
 	now, leaseUntil := time.Now().UTC(), time.Now().UTC().Add(leaseDuration)
 	var executionID uuid.UUID
+	var targetHostname string
 	err = tx.QueryRow(ctx, `
-		SELECT execution.id
+		SELECT execution.id, execution.target_hostname
 		FROM crawl_executions execution
 		WHERE execution.status IN ('QUEUED', 'RUNNING')
 		  AND execution.leased_count < execution.max_concurrency
@@ -390,19 +401,22 @@ func (s *Store) ClaimPage(ctx context.Context, workerID uuid.UUID, leaseDuration
 		  AND EXISTS (
 			SELECT 1
 			FROM scan_pages page
-			JOIN host_leases host
-			  ON host.hostname_sha256 = page.hostname_sha256
-			 AND host.hostname = page.hostname AND host.slot_no = 1
 			WHERE page.execution_id = execution.id
 			  AND page.owner_id = execution.owner_id
 			  AND page.retention_month = execution.retention_month
 			  AND page.status = 'QUEUED' AND page.available_at <= $1
-			  AND host.next_allowed_at <= $1
-			  AND (host.lease_owner IS NULL OR host.lease_expires_at <= $1)
+			  AND EXISTS (
+				SELECT 1
+				FROM host_leases host
+				WHERE host.hostname_sha256 = page.hostname_sha256
+				  AND host.hostname = page.hostname AND host.slot_no <= $2
+				  AND host.next_allowed_at <= $1
+				  AND (host.lease_owner IS NULL OR host.lease_expires_at <= $1)
+			  )
 		  )
 		ORDER BY execution.accepted_at, execution.id
 		FOR UPDATE OF execution SKIP LOCKED
-		LIMIT 1`, now).Scan(&executionID)
+		LIMIT 1`, now, s.hostConcurrency).Scan(&executionID, &targetHostname)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -411,20 +425,36 @@ func (s *Store) ClaimPage(ctx context.Context, workerID uuid.UUID, leaseDuration
 	}
 
 	lease := &model.PageLease{LeaseOwner: workerID}
+	hostnameHash := crawl.URLHash(targetHostname)
+	err = tx.QueryRow(ctx, `
+		SELECT slot_no, lease_generation + 1
+		FROM host_leases
+		WHERE hostname_sha256 = $1 AND hostname = $2 AND slot_no <= $3
+		  AND next_allowed_at <= $4
+		  AND (lease_owner IS NULL OR lease_expires_at <= $4)
+		ORDER BY slot_no
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1`, hostnameHash[:], targetHostname, s.hostConcurrency, now).Scan(
+		&lease.HostSlotNo, &lease.HostGeneration,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock host lease slot: %w", err)
+	}
+
 	var maxDurationSeconds int
 	err = tx.QueryRow(ctx, `
         SELECT sp.retention_month, sp.id, sp.execution_id, ce.scan_id, sp.owner_id,
                ce.website_id, command.correlation_id, sp.normalized_url, sp.hostname,
-               sp.discovery_depth, sp.lease_generation + 1, ce.max_pages,
+			   sp.discovery_depth, sp.lease_generation + 1, ce.max_pages,
                ce.max_depth, ce.max_response_bytes, ce.max_duration_seconds,
                ce.max_redirects, ce.collector_version, ce.accepted_at
         FROM scan_pages sp
         JOIN crawl_executions ce
           ON ce.id = sp.execution_id AND ce.owner_id = sp.owner_id
          AND ce.retention_month = sp.retention_month
-        JOIN host_leases hl
-          ON hl.hostname_sha256 = sp.hostname_sha256 AND hl.hostname = sp.hostname
-         AND hl.slot_no = 1
         JOIN LATERAL (
             SELECT correlation_id
             FROM inbox_messages
@@ -434,10 +464,8 @@ func (s *Store) ClaimPage(ctx context.Context, workerID uuid.UUID, leaseDuration
         ) command ON true
 		WHERE ce.id = $2
 		  AND sp.status = 'QUEUED' AND sp.available_at <= $1
-		  AND hl.next_allowed_at <= $1
-		  AND (hl.lease_owner IS NULL OR hl.lease_expires_at <= $1)
 		ORDER BY sp.priority, sp.discovered_at, sp.id
-		FOR UPDATE OF sp, hl SKIP LOCKED
+		FOR UPDATE OF sp SKIP LOCKED
 		LIMIT 1`, now, executionID).Scan(
 		&lease.RetentionMonth, &lease.PageID, &lease.ExecutionID, &lease.ScanID,
 		&lease.OwnerID, &lease.WebsiteID, &lease.CorrelationID, &lease.NormalizedURL,
@@ -452,17 +480,19 @@ func (s *Store) ClaimPage(ctx context.Context, workerID uuid.UUID, leaseDuration
 		return nil, fmt.Errorf("select page claim: %w", err)
 	}
 	lease.MaxDuration = time.Duration(maxDurationSeconds) * time.Second
-	hostnameHash := crawl.URLHash(lease.Hostname)
-
-	if _, err := tx.Exec(ctx, `
+	commandTag, err := tx.Exec(ctx, `
         UPDATE host_leases
-        SET lease_owner = $1, lease_generation = lease_generation + 1,
-            lease_expires_at = $2, next_allowed_at = $3, updated_at = $4
-        WHERE hostname_sha256 = $5 AND hostname = $6 AND slot_no = 1`,
-		workerID, leaseUntil, now.Add(hostDelay), now,
-		hostnameHash[:], lease.Hostname,
-	); err != nil {
+		SET lease_owner = $1, lease_generation = $2,
+			lease_expires_at = $3, next_allowed_at = $4, updated_at = $5
+		WHERE hostname_sha256 = $6 AND hostname = $7 AND slot_no = $8`,
+		workerID, lease.HostGeneration, leaseUntil, now.Add(hostDelay), now,
+		hostnameHash[:], lease.Hostname, lease.HostSlotNo,
+	)
+	if err != nil {
 		return nil, fmt.Errorf("claim host lease: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return nil, errors.New("selected host lease slot was not claimed")
 	}
 	if _, err := tx.Exec(ctx, `
         UPDATE scan_pages
@@ -515,8 +545,10 @@ func (s *Store) ExtendPageLease(ctx context.Context, lease model.PageLease, leas
 	commandTag, err = tx.Exec(ctx, `
 		UPDATE host_leases
 		SET lease_expires_at = $1, updated_at = clock_timestamp()
-		WHERE hostname_sha256 = $2 AND hostname = $3 AND slot_no = 1
-		  AND lease_owner = $4`, leaseUntil, hostnameHash[:], lease.Hostname, lease.LeaseOwner)
+		WHERE hostname_sha256 = $2 AND hostname = $3 AND slot_no = $4
+		  AND lease_owner = $5 AND lease_generation = $6`,
+		leaseUntil, hostnameHash[:], lease.Hostname, lease.HostSlotNo,
+		lease.LeaseOwner, lease.HostGeneration)
 	if err != nil {
 		return fmt.Errorf("extend host lease: %w", err)
 	}
@@ -643,12 +675,17 @@ func (s *Store) CommitPageResult(ctx context.Context, lease model.PageLease, res
 			return fmt.Errorf("requeue transient page failure: %w", err)
 		}
 		hostnameHash := crawl.URLHash(lease.Hostname)
-		if _, err := tx.Exec(ctx, `
+		hostRelease, err := tx.Exec(ctx, `
 			UPDATE host_leases
 			SET lease_owner = NULL, lease_expires_at = NULL, updated_at = $1
-			WHERE hostname_sha256 = $2 AND hostname = $3 AND slot_no = 1
-			  AND lease_owner = $4`, now, hostnameHash[:], lease.Hostname, lease.LeaseOwner); err != nil {
+			WHERE hostname_sha256 = $2 AND hostname = $3 AND slot_no = $4
+			  AND lease_owner = $5 AND lease_generation = $6`, now, hostnameHash[:],
+			lease.Hostname, lease.HostSlotNo, lease.LeaseOwner, lease.HostGeneration)
+		if err != nil {
 			return fmt.Errorf("release host lease after transient failure: %w", err)
+		}
+		if hostRelease.RowsAffected() != 1 {
+			return ErrStaleLease
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE crawl_executions
@@ -685,13 +722,18 @@ func (s *Store) CommitPageResult(ctx context.Context, lease model.PageLease, res
 		return fmt.Errorf("stage page terminal result: %w", err)
 	}
 	hostnameHash := crawl.URLHash(lease.Hostname)
-	if _, err := tx.Exec(ctx, `
+	hostRelease, err := tx.Exec(ctx, `
         UPDATE host_leases
         SET lease_owner = NULL, lease_expires_at = NULL, updated_at = $1
-        WHERE hostname_sha256 = $2 AND hostname = $3 AND slot_no = 1
-          AND lease_owner = $4`, now, hostnameHash[:], lease.Hostname, lease.LeaseOwner,
-	); err != nil {
+		WHERE hostname_sha256 = $2 AND hostname = $3 AND slot_no = $4
+		  AND lease_owner = $5 AND lease_generation = $6`, now, hostnameHash[:],
+		lease.Hostname, lease.HostSlotNo, lease.LeaseOwner, lease.HostGeneration,
+	)
+	if err != nil {
 		return fmt.Errorf("release host lease: %w", err)
+	}
+	if hostRelease.RowsAffected() != 1 {
+		return ErrStaleLease
 	}
 
 	discovered, err := s.insertDiscoveredPages(ctx, tx, lease, result.Links, now)
@@ -699,12 +741,12 @@ func (s *Store) CommitPageResult(ctx context.Context, lease model.PageLease, res
 		return err
 	}
 	payload := model.AnalyticsPayload{
-		SchemaVersion: 1, OwnerID: lease.OwnerID, ScanID: lease.ScanID,
+		SchemaVersion: 2, OwnerID: lease.OwnerID, ScanID: lease.ScanID,
 		RetentionMonth: lease.RetentionMonth, PageID: lease.PageID, RecordVersion: uint64(resultVersion),
 		RequestedURL: lease.NormalizedURL, NormalizedURL: lease.NormalizedURL,
 		FinalURL: result.FinalURL, Hostname: lease.Hostname,
 		DiscoveryDepth: uint16(lease.DiscoveryDepth), Result: result,
-		CollectorVersion: lease.CollectorVersion, ParserVersion: "weblens-parser-v1",
+		CollectorVersion: lease.CollectorVersion, ParserVersion: "weblens-parser-v2",
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -721,7 +763,7 @@ func (s *Store) CommitPageResult(ctx context.Context, lease model.PageLease, res
             payload_sha256, payload_size_bytes, page_metric_count, finding_count,
             link_count, links_truncated, available_at, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, 'PENDING', 1, $7, $8, $9, 1, $10,
+			$1, $2, $3, $4, $5, $6, 'PENDING', 2, $7, $8, $9, 1, $10,
             $11, false, $12, $12, $12
         )`, uuid.New(), lease.RetentionMonth, lease.ExecutionID, lease.OwnerID,
 		lease.PageID, resultVersion, encoded, payloadHash, len(encoded),
