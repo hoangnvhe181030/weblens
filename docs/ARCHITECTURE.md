@@ -1,14 +1,15 @@
 # Kiến trúc WebLens V1 và V1.5
 
-Trạng thái: cập nhật theo ADR-005 và ADR-006 ngày 2026-09-11.
+Trạng thái: cập nhật theo ADR-005, ADR-006 và E2E TASK-011 ngày 2026-09-13.
 
 ## Trạng thái hiện tại
 
-Repository hiện có React frontend và Java 21/Spring Boot backend foundation với
-authentication, Website CRUD và Scan lifecycle trong PostgreSQL. Scan mới dừng ở
-`QUEUED`; Go Crawler Service, report data path, Playwright Capture Worker và object
-storage chưa được triển khai. Code Spring Boot hiện hữu là điểm xuất phát của
-Control Plane, không phải bằng chứng rằng kiến trúc microservice đã hoàn tất.
+Repository hiện có React frontend, Java 21/Spring Boot Control Plane, Go Crawler
+Service và Playwright Capture Worker. Scan command/progress đi qua outbox/inbox;
+crawler lưu workflow trong PostgreSQL và analytical fact trong ClickHouse. Capture
+Worker lưu workflow trong PostgreSQL, rendered/network fact trong ClickHouse và
+artifact lớn trong MinIO. E2E đăng ký → website → scan → page evidence → capture →
+snapshot đã đạt; capacity production vẫn cần benchmark trên phần cứng triển khai.
 
 PostgreSQL production được tự triển khai theo
 [ADR-004](adr/ADR-004-self-hosted-postgresql.md). Kiến trúc ba deployable và cách

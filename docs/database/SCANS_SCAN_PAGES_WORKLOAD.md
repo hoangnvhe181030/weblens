@@ -51,9 +51,11 @@ Nguồn: SCAN-001, SCAN-002, SCAN-003 và REPORT-001 trong REQUIREMENTS.md.
 - 100.000 tài khoản, 10.000 DAU, 1.000 client đồng thời.
 - API: 300 request/giây duy trì; burst 1.000 request/giây trong 5 phút.
 - 200 page result commit/giây.
-- 100–300 crawl worker đồng thời.
-- Giới hạn hiện tại trong foundation: tối đa 100 page mỗi scan; đây là cấu hình
-  hiện có, chưa phải bằng chứng rằng giới hạn thị trường cuối cùng là tối ưu.
+- 100–300 crawl worker hữu dụng trong benchmark chuẩn; runtime cho phép tối đa
+  10.000 active page-fetch slot để kiểm tra tải cực đại.
+- Cấu hình production hiện tại snapshot tối đa 100.000 page mỗi scan, depth 4,
+  24 giờ và 10.000 concurrency. Đây là capacity envelope, chưa phải bằng chứng
+  phần cứng triển khai đã xử lý thành công tải đó.
 
 Còn thiếu trước khi tính cardinality/capacity:
 
@@ -172,7 +174,7 @@ số liệu production sau khi phát hành.
 | Chủ đề | Giá trị đề xuất | Lý do |
 | --- | --- | --- |
 | Scan mỗi active user/ngày | Trung bình 2, p95 10, safety limit 50 | Tạo tải đáng kể nhưng vẫn giới hạn abuse/noisy tenant |
-| Page mỗi scan | Trung bình 30, p95 80, tối đa 100 | Phù hợp bounded crawl và giới hạn foundation hiện tại |
+| Page mỗi scan | Trung bình 30, p95 80, tối đa cấu hình 100.000 | Giữ workload thị trường dự kiến nhỏ nhưng cho phép một scan cực lớn có giới hạn hữu hạn |
 | Tổng khối lượng | Khoảng 20.000 scan/ngày và 600.000 scan page/ngày ở mức trung bình | Suy ra từ 10.000 DAU × 2 scan × 30 page |
 | Scan đang chạy mỗi user | Tối đa 3 | Bảo vệ fairness giữa owner |
 | Scan đồng thời cùng website | Một scan active | Tránh tự cạnh tranh và gây tải quá mức lên website đích |

@@ -24,10 +24,12 @@ backpressure, website đích chậm hoặc object storage bị lỗi.
 | Tổng tài khoản | 100.000 |
 | Daily active users | 10.000 |
 | Client đồng thời | 1.000 |
+| Trần stress test của load runner | 100.000 virtual user hữu hạn |
 | API traffic duy trì | 300 request/giây |
 | API burst | 1.000 request/giây trong 5 phút |
 | Page result được commit vào Crawler persistence ở mức đỉnh | 200 page/giây |
-| Crawl worker đồng thời | 100–300 |
+| Crawl worker hữu dụng trong benchmark chuẩn | 100–300 |
+| Trần active page-fetch slot cấu hình | 10.000 |
 | Browser worker đồng thời | 10 |
 | Capture duy trì | 0,2 capture/giây |
 | Capture burst | 2 capture/giây |
@@ -38,6 +40,8 @@ backpressure, website đích chậm hoặc object storage bị lỗi.
 
 Các mục tiêu trên phải được kiểm tra bằng workload có phân bố dữ liệu thực tế,
 không chỉ benchmark một truy vấn trên database rỗng hoặc cache đã nóng hoàn toàn.
+Runtime capacity cao và cách phân biệt connection/thread/worker/virtual user được
+ghi tại [PRODUCTION_HIGH_CAPACITY_WORKLOAD.md](PRODUCTION_HIGH_CAPACITY_WORKLOAD.md).
 
 ## Hành vi bắt buộc khi quá tải
 

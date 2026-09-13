@@ -2,32 +2,40 @@
 
 ## Current implementation state
 
-Repository có Control Plane Java 21/Spring Boot, Crawler Go, frontend React/TypeScript,
-hai database PostgreSQL local và ClickHouse. Control Plane đã dispatch scan qua
+Repository có Control Plane Java 21/Spring Boot, Crawler Go, Playwright Capture
+Worker và frontend React/TypeScript, ba database PostgreSQL local, ClickHouse và
+MinIO. Control Plane đã dispatch scan qua
 outbox/inbox bền vững; Crawler đã thực thi bounded HTTP crawl, analytical
-ingestion và page-report query có owner scope. Capture Worker chưa hoàn thành.
+ingestion và page-report query có owner scope. Capture Worker đã thực thi browser
+capture, staging analytics và lưu artifact lớn trong MinIO.
 
 Theo ADR-005, backend hiện hữu là WebLens Control Plane. Go Crawler Service dựa
 trên bản fork CrawlObserver nằm trong `crawler/`, có boundary và license AGPL
-riêng. Playwright Capture Worker chưa được bootstrap. Không chuyển source AGPL
-vào `backend/`.
+riêng. Playwright Capture Worker nằm trong `capture-worker/` và giữ database,
+migration cùng runtime boundary riêng. Không chuyển source AGPL vào `backend/`.
 
-## Local development
+## Chạy runtime duy nhất trên máy local
 
 1. Copy `.env.example` to `.env` and replace all example credentials.
-2. Khởi động Control PostgreSQL, Crawler PostgreSQL và ClickHouse:
+2. Khởi động ba PostgreSQL, ClickHouse, MinIO và Capture Worker:
    `docker compose --env-file .env -f infra/compose.yml up -d`.
-3. From `backend/`, run `.\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=dev` with Java 21.
+3. Từ `backend/`, chạy `.\mvnw.cmd spring-boot:run` bằng Java 21, không chọn profile.
 4. Từ `crawler/`, nạp các biến `CRAWLER_*` rồi chạy `go run ./cmd/weblens-crawler`.
-5. Có thể cấu hình frontend backend mode, sau đó chạy `npm ci` và `npm run dev`.
+5. Cấu hình frontend backend mode, chạy `npm ci`, `npm run build`, rồi phục vụ
+   artifact bằng `npm run preview -- --host 127.0.0.1 --port 5173`.
 
 Frontend mode is selected at build/start time:
 
 - `VITE_API_MODE=mock` (default): complete deterministic UI demo.
-- `VITE_API_MODE=backend`: auth, website, scan và page-report API thật tại
-  `VITE_API_BASE_URL`; browser capture vẫn chưa có runtime V1.5.
+- `VITE_API_MODE=backend`: auth, website, scan, page-report và browser-capture API
+  thật tại `VITE_API_BASE_URL`.
 
-The backend profile `dev` enables Swagger and uses explicit localhost defaults. Production startup has no default database password or JWT secret and therefore fails fast when required environment values are absent.
+Backend không còn profile `dev` hoặc `loadtest`. `application.yml` là cấu hình
+runtime duy nhất và dùng mức 100.000 trang/scan, depth 4, 24 giờ, 10.000 scan
+concurrency cùng trần Tomcat 100.000 connection. Database password, JWT secret và
+service token không có default nên startup sẽ fail-fast nếu thiếu. Khi chạy local,
+`.env` có thể đặt `WEBLENS_OPENAPI_ENABLED=true` và `WEBLENS_COOKIE_SECURE=false`;
+deployment có TLS phải giữ cookie secure.
 
 ## Verification commands
 
@@ -45,7 +53,7 @@ The backend profile `dev` enables Swagger and uses explicit localhost defaults. 
   26.3 cho hai integration suite này.
 - Frontend: `npm run lint`, `npm test`, and `npm run build`.
 - Health: `GET http://localhost:8080/actuator/health`.
-- OpenAPI in dev: `GET http://localhost:8080/v3/api-docs`.
+- OpenAPI khi `WEBLENS_OPENAPI_ENABLED=true`: `GET http://localhost:8080/v3/api-docs`.
 
 ## Task workflow
 
