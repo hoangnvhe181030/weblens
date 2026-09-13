@@ -1,8 +1,8 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import type { CaptureAnalytics } from './analytics.js'
+import type { CaptureAnalytics, CaptureResourceRecord } from './analytics.js'
 import type { Config } from './config.js'
-import type { CaptureDatabase } from './database.js'
+import type { CaptureDatabase, ScreenshotReference } from './database.js'
 import type { ObjectStorage } from './storage.js'
 import type { CaptureCommandEnvelope } from './types.js'
 
@@ -10,7 +10,7 @@ const maxCommandBytes = 64 * 1024
 
 type CaptureServerDatabase = Pick<
   CaptureDatabase,
-  'ping' | 'acceptCommand' | 'getSnapshot' | 'getScreenshotReference'
+  'ping' | 'acceptCommand' | 'getSnapshot' | 'getScreenshotReference' | 'getResourceReference'
 >
 type CaptureServerAnalytics = Pick<CaptureAnalytics, 'ping' | 'listResources'>
 
@@ -40,9 +40,25 @@ export function startServer(
         const ownerId = url.searchParams.get('ownerId') ?? ''
         const reference = await database.getScreenshotReference(ownerId, screenshotMatch[1])
         if (!reference) return problem(response, 404, 'CAPTURE_ARTIFACT_NOT_FOUND')
-        const artifact = await storage.get(reference.bucket, reference.key)
-        if (artifact.length !== reference.bytes) throw new Error('ARTIFACT_SIZE_MISMATCH')
-        return binary(response, 200, artifact, reference.sha256Hex)
+        ensureNotExpired(reference)
+        const artifact = verifyArtifact(await storage.get(reference.bucket, reference.key), reference)
+        return binary(response, 200, artifact, reference.sha256Hex, 'image/jpeg', 'inline; filename="capture.jpg"')
+      }
+      const resourceMatch = /^\/internal\/v1\/reports\/captures\/([0-9a-f-]+)\/resources\/([0-9a-f-]+)\/content$/u.exec(url.pathname)
+      if (request.method === 'GET' && resourceMatch?.[1] && resourceMatch[2]) {
+        const ownerId = url.searchParams.get('ownerId') ?? ''
+        const reference = await database.getResourceReference(ownerId, resourceMatch[1], resourceMatch[2])
+        if (!reference) return problem(response, 404, 'CAPTURE_RESOURCE_NOT_FOUND')
+        ensureNotExpired(reference)
+        const artifact = verifyArtifact(await storage.get(reference.bucket, reference.key), reference)
+        return binary(
+          response,
+          200,
+          artifact,
+          reference.sha256Hex,
+          'application/octet-stream',
+          'attachment; filename="captured-resource.bin"',
+        )
       }
       const match = /^\/internal\/v1\/reports\/captures\/([0-9a-f-]+)$/u.exec(url.pathname)
       if (request.method === 'GET' && match?.[1]) {
@@ -57,12 +73,21 @@ export function startServer(
       const code = error instanceof Error ? error.message : 'INTERNAL_ERROR'
       if (code === 'MESSAGE_ID_COLLISION') return problem(response, 409, code)
       if (code.startsWith('INVALID_')) return problem(response, 400, code)
+      if (code === 'ARTIFACT_EXPIRED' || code === 'ARTIFACT_OBJECT_MISSING') {
+        return problem(response, 410, 'CAPTURE_ARTIFACT_GONE')
+      }
+      if (code === 'ARTIFACT_SIZE_MISMATCH' || code === 'ARTIFACT_HASH_MISMATCH') {
+        return problem(response, 503, 'CAPTURE_ARTIFACT_INTEGRITY_FAILED')
+      }
       return problem(response, 503, 'SERVICE_UNAVAILABLE')
     }
   }).listen(config.port)
 }
 
-function snapshotResponse(snapshot: Record<string, unknown>, resources: Record<string, unknown>[]): Record<string, unknown> {
+function snapshotResponse(
+  snapshot: Record<string, unknown>,
+  resources: CaptureResourceRecord[],
+): Record<string, unknown> {
   const width = Number(snapshot['viewport_width'] ?? 0)
   const height = Number(snapshot['viewport_height'] ?? 0)
   return {
@@ -144,10 +169,32 @@ function json(response: ServerResponse, status: number, value: unknown): void {
   response.end(JSON.stringify(value))
 }
 
-function binary(response: ServerResponse, status: number, value: Buffer, sha256Hex: string): void {
-  response.setHeader('Content-Type', 'image/jpeg')
+function ensureNotExpired(reference: ScreenshotReference): void {
+  if (reference.expiresAt.getTime() <= Date.now()) throw new Error('ARTIFACT_EXPIRED')
+}
+
+function verifyArtifact(value: Buffer, reference: ScreenshotReference): Buffer {
+  if (value.length !== reference.bytes) throw new Error('ARTIFACT_SIZE_MISMATCH')
+  if (!/^[0-9a-f]{64}$/u.test(reference.sha256Hex)) throw new Error('ARTIFACT_HASH_MISMATCH')
+  const actual = createHash('sha256').update(value).digest()
+  const expected = Buffer.from(reference.sha256Hex, 'hex')
+  if (!timingSafeEqual(actual, expected)) throw new Error('ARTIFACT_HASH_MISMATCH')
+  return value
+}
+
+function binary(
+  response: ServerResponse,
+  status: number,
+  value: Buffer,
+  sha256Hex: string,
+  contentType: string,
+  contentDisposition: string,
+): void {
+  response.setHeader('Content-Type', contentType)
   response.setHeader('Content-Length', value.length)
-  response.setHeader('Content-Disposition', 'inline; filename="capture.jpg"')
+  response.setHeader('Content-Disposition', contentDisposition)
+  response.setHeader('Cache-Control', 'no-store')
+  response.setHeader('X-Content-Type-Options', 'nosniff')
   response.setHeader('ETag', `"sha256-${sha256Hex}"`)
   response.writeHead(status)
   response.end(value)

@@ -27,6 +27,22 @@ interface AnalyticsPayload {
   }
 }
 
+export interface CaptureResourceRecord {
+  id: string
+  url: string
+  method: string
+  status: number
+  type: string
+  contentType: string
+  sizeBytes: number
+  durationMs: number
+  bodyCaptured: boolean
+  capturedBodyId: string | null
+  capturedBodyBytes: number
+  bodySha256: string | null
+  bodyTruncated: boolean
+}
+
 export class CaptureAnalytics {
   private readonly client: ClickHouseClient
   private readonly defaultClient: ClickHouseClient
@@ -178,9 +194,10 @@ export class CaptureAnalytics {
     })
   }
 
-  async listResources(ownerId: string, captureId: string): Promise<Record<string, unknown>[]> {
-    const result = await this.client.query({
-      query: `select request_id as id,url,method,status_code as status,resource_type as type,
+  async listResources(ownerId: string, captureId: string): Promise<CaptureResourceRecord[]> {
+    const networkResult = await this.client.query({
+      query: `select request_id as id,request_sequence as requestSequence,url,method,
+        status_code as status,resource_type as type,
         mime_type as contentType,response_bytes as sizeBytes,duration_ms as durationMs
         from network_requests final
         where owner_id={owner:UUID} and capture_request_id={capture:UUID}
@@ -188,12 +205,57 @@ export class CaptureAnalytics {
       query_params: { owner: ownerId, capture: captureId },
       format: 'JSONEachRow',
     })
-    return await result.json<Record<string, unknown>>()
+    const capturedResult = await this.client.query({
+      query: `select resource_id as capturedBodyId,request_sequence as requestSequence,
+        body_bytes as capturedBodyBytes,body_sha256 as bodySha256,was_truncated as bodyTruncated
+        from captured_resources final
+        where owner_id={owner:UUID} and capture_request_id={capture:UUID}
+        order by request_sequence,resource_id limit 100`,
+      query_params: { owner: ownerId, capture: captureId },
+      format: 'JSONEachRow',
+    })
+    const [network, captured] = await Promise.all([
+      networkResult.json<Record<string, unknown>>(),
+      capturedResult.json<Record<string, unknown>>(),
+    ])
+    return mergeResourceMetadata(network, captured)
   }
 
   async close(): Promise<void> {
     await Promise.all([this.client.close(), this.defaultClient.close()])
   }
+}
+
+export function mergeResourceMetadata(
+  network: Record<string, unknown>[],
+  captured: Record<string, unknown>[],
+): CaptureResourceRecord[] {
+  const bodiesBySequence = new Map<number, Record<string, unknown>>()
+  for (const body of captured) {
+    const sequence = Number(body['requestSequence'])
+    if (Number.isSafeInteger(sequence) && sequence >= 0 && !bodiesBySequence.has(sequence)) {
+      bodiesBySequence.set(sequence, body)
+    }
+  }
+  return network.map((request) => {
+    const sequence = Number(request['requestSequence'])
+    const body = bodiesBySequence.get(sequence)
+    return {
+      id: String(request['id'] ?? ''),
+      url: String(request['url'] ?? ''),
+      method: String(request['method'] ?? ''),
+      status: Number(request['status'] ?? 0),
+      type: String(request['type'] ?? ''),
+      contentType: String(request['contentType'] ?? ''),
+      sizeBytes: Number(request['sizeBytes'] ?? 0),
+      durationMs: Number(request['durationMs'] ?? 0),
+      bodyCaptured: Boolean(body),
+      capturedBodyId: body ? String(body['capturedBodyId'] ?? '') : null,
+      capturedBodyBytes: body ? Number(body['capturedBodyBytes'] ?? 0) : 0,
+      bodySha256: body ? String(body['bodySha256'] ?? '') : null,
+      bodyTruncated: body ? Number(body['bodyTruncated'] ?? 0) === 1 : false,
+    }
+  })
 }
 
 function splitStatements(script: string): string[] {

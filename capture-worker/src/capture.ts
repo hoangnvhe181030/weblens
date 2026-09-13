@@ -328,12 +328,13 @@ function boundedNumber(value: string | undefined): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, 52_428_800) : 0
 }
 
-function sanitizeUrl(rawUrl: string): string {
+export function sanitizeUrl(rawUrl: string): string {
   try {
     const parsed = new URL(rawUrl)
-    for (const key of [...parsed.searchParams.keys()]) {
-      if (/(token|auth|key|secret|signature|credential|password)/i.test(key)) parsed.searchParams.set(key, '[REDACTED]')
-    }
+    parsed.username = ''
+    parsed.password = ''
+    parsed.hash = ''
+    for (const key of new Set(parsed.searchParams.keys())) parsed.searchParams.set(key, '[REDACTED]')
     return capText(parsed.toString(), 8192)
   } catch {
     return ''

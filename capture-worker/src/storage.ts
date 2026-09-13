@@ -37,8 +37,17 @@ export class ObjectStorage {
 
   async get(bucket: string, key: string): Promise<Buffer> {
     if (bucket !== this.config.s3Bucket) throw new Error('INVALID_STORAGE_BUCKET')
-    const result = await this.client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
-    if (!result.Body) throw new Error('ARTIFACT_BODY_MISSING')
-    return Buffer.from(await result.Body.transformToByteArray())
+    try {
+      const result = await this.client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+      if (!result.Body) throw new Error('ARTIFACT_OBJECT_MISSING')
+      return Buffer.from(await result.Body.transformToByteArray())
+    } catch (error) {
+      const awsError = error as { name?: string; $metadata?: { httpStatusCode?: number } }
+      if (awsError.name === 'NoSuchKey' || awsError.name === 'NotFound'
+        || awsError.$metadata?.httpStatusCode === 404) {
+        throw new Error('ARTIFACT_OBJECT_MISSING')
+      }
+      throw error
+    }
   }
 }

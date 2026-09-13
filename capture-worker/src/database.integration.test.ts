@@ -38,13 +38,20 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
     assert.ok(secondLease.leaseGeneration > firstLease.leaseGeneration)
 
     const result = captureResult()
+    const resource = {
+      resourceId: randomUUID(), sequence: 1, url: 'https://example.com/app.js',
+      resourceType: 'script', mimeType: 'application/javascript',
+      body: Buffer.from('console.log("evidence")', 'utf8'), wasTruncated: false,
+    }
+    result.resourceBodies = [resource]
     const htmlObject = storedObject('html', result.html)
     const screenshotObject = storedObject('screenshot', result.screenshot)
+    const resourceObject = storedObject('resource', resource.body)
     await assert.rejects(
       database.stageResult(firstLease, result, htmlObject, screenshotObject, []),
       /STALE_CAPTURE_LEASE/u,
     )
-    await database.stageResult(secondLease, result, htmlObject, screenshotObject, [])
+    await database.stageResult(secondLease, result, htmlObject, screenshotObject, [{ resource, object: resourceObject }])
 
     const claims = await Promise.all([
       database.claimAnalytics(randomUUID()),
@@ -59,6 +66,15 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
     assert.equal(snapshot?.['final_url'], 'https://example.com/')
     assert.equal(await database.getScreenshotReference(randomUUID(), command.aggregateId), null)
     assert.equal((await database.getScreenshotReference(command.payload.ownerId, command.aggregateId))?.bytes, 4)
+    assert.equal(await database.getResourceReference(randomUUID(), command.aggregateId, resource.resourceId), null)
+    assert.equal(await database.getResourceReference(command.payload.ownerId, randomUUID(), resource.resourceId), null)
+    const reference = await database.getResourceReference(
+      command.payload.ownerId,
+      command.aggregateId,
+      resource.resourceId,
+    )
+    assert.equal(reference?.bytes, resource.body.length)
+    assert.equal(reference?.key, resourceObject.key)
   } finally {
     await database.close()
     await admin.query(`drop schema "${schemaName}" cascade`)

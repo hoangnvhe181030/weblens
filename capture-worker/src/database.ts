@@ -36,6 +36,11 @@ export interface ScreenshotReference {
   key: string
   bytes: number
   sha256Hex: string
+  expiresAt: Date
+}
+
+export interface ResourceReference extends ScreenshotReference {
+  contentType: string
 }
 
 export class CaptureDatabase {
@@ -392,8 +397,9 @@ export class CaptureDatabase {
       screenshot_storage_key: string
       screenshot_bytes: string
       screenshot_sha256_hex: string
+      expires_at: Date
     }>(`select storage_bucket,screenshot_storage_key,screenshot_bytes,
-          encode(screenshot_sha256,'hex') as screenshot_sha256_hex
+          encode(screenshot_sha256,'hex') as screenshot_sha256_hex,expires_at
         from page_snapshots where capture_job_id=$1 and owner_id=$2`, [captureId, ownerId])
     const row = result.rows[0]
     return row ? {
@@ -401,6 +407,36 @@ export class CaptureDatabase {
       key: row.screenshot_storage_key,
       bytes: Number(row.screenshot_bytes),
       sha256Hex: row.screenshot_sha256_hex,
+      expiresAt: row.expires_at,
+    } : null
+  }
+
+  async getResourceReference(
+    ownerId: string,
+    captureId: string,
+    resourceId: string,
+  ): Promise<ResourceReference | null> {
+    const result = await this.pool.query<{
+      storage_bucket: string
+      storage_key: string
+      content_type: string
+      byte_size: string
+      sha256_hex: string
+      delete_after: Date
+    }>(`select reference.storage_bucket,reference.storage_key,reference.content_type,
+          reference.byte_size,encode(reference.sha256,'hex') as sha256_hex,reference.delete_after
+        from capture_object_references reference
+        join capture_jobs job on job.id=reference.capture_job_id
+        where reference.capture_job_id=$1 and reference.resource_id=$2 and job.owner_id=$3`,
+    [captureId, resourceId, ownerId])
+    const row = result.rows[0]
+    return row ? {
+      bucket: row.storage_bucket,
+      key: row.storage_key,
+      contentType: row.content_type,
+      bytes: Number(row.byte_size),
+      sha256Hex: row.sha256_hex,
+      expiresAt: row.delete_after,
     } : null
   }
 
