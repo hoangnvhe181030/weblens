@@ -9,8 +9,9 @@ durable command outbox và event inbox. Go Crawler Service nhận command idempo
 duy trì frontier/lease trong PostgreSQL, crawl HTTP(S) có SSRF guard, stage kết quả
 bền vững và đưa metrics/findings/links vào ClickHouse trước khi công bố progress.
 Page-report query đi qua Control Plane với owner scope và ingestion watermark.
-Browser capture V1.5 vẫn chưa hoàn thành. Frontend tiếp tục
-mặc định chạy mock để demo có thể xem độc lập.
+Browser capture V1.5 đã có Playwright Worker cô lập, PostgreSQL workflow,
+ClickHouse analytics, MinIO artifact và snapshot viewer có owner scope. Frontend
+tiếp tục mặc định chạy mock để demo có thể xem độc lập.
 
 ## V1 goal
 
@@ -25,41 +26,48 @@ Kiến trúc được duyệt trong [ADR-005](docs/adr/ADR-005-tach-crawler-than
 - `backend/`: Spring Boot foundation đang được chuyển thành Control Plane và migration Flyway thuộc ownership của service này
 - `frontend/`: React/TypeScript frontend demo
 - `crawler/`: deployable Go mang giấy phép AGPL-3.0, provenance CrawlObserver và migration thuộc Crawler
-- `infra/`: Control PostgreSQL, Crawler PostgreSQL và ClickHouse local bằng Compose
-- Capture Worker vẫn là deployable boundary riêng của V1.5 và chưa được triển khai
+- `capture-worker/`: Playwright/TypeScript deployable, migration PostgreSQL và ClickHouse thuộc ownership của Capture Worker
+- `infra/`: ba PostgreSQL workflow database, ClickHouse, MinIO và Capture Worker local bằng Compose
 - `docs/`: product and engineering sources of truth
 - `docs/adr/`: architecture decision records
 - `tasks/`: scoped implementation specifications
 
 Start with [PRODUCT.md](docs/PRODUCT.md), [REQUIREMENTS.md](docs/REQUIREMENTS.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), and [DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
-## Chạy frontend cục bộ
+## Chạy production build của frontend trên máy local
 
 Yêu cầu Node.js tương thích với Vite 8. Từ thư mục `frontend`:
 
 ```powershell
 npm install
-npm run dev
+npm run build
+npm run preview -- --host 127.0.0.1 --port 5173
 ```
 
 Các lệnh kiểm tra: `npm run lint`, `npm test`, `npm run build`.
 
-Mặc định frontend dùng mock service. Để dùng auth, website, scan và page report thật,
-sao chép `frontend/.env.example` thành `frontend/.env.local`, đặt
-`VITE_API_MODE=backend` và giữ `VITE_API_BASE_URL=http://localhost:8080`. Browser
-capture V1.5 vẫn chỉ là dữ liệu minh họa cho đến khi Capture Worker được triển khai.
+Mặc định frontend dùng mock service. Để production build dùng auth, website, scan
+và page report thật, sao chép `frontend/.env.example` thành
+`frontend/.env.production.local`, đặt
+`VITE_API_MODE=backend` và giữ `VITE_API_BASE_URL=http://localhost:8080`. Chế độ
+này dùng API thật cho auth, website, scan, page report và browser capture V1.5.
 
-## Chạy Control Plane và Crawler cục bộ
+## Chạy runtime production cục bộ
 
 Yêu cầu Java 21 và Docker. Sao chép `.env.example` thành `.env`, thay JWT secret/credential, rồi chạy:
 
 ```powershell
 docker compose --env-file .env -f infra/compose.yml up -d
 cd backend
-.\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=dev
+.\mvnw.cmd spring-boot:run
 ```
 
-Health ở `http://localhost:8080/actuator/health`; Swagger ở `http://localhost:8080/swagger-ui.html` trong profile `dev`.
+Không còn profile `dev` hoặc `loadtest`: `application.yml` là cấu hình runtime duy
+nhất. Mặc định mỗi scan được snapshot tối đa 100.000 trang, depth 4, 24 giờ và
+10.000 concurrency; Tomcat nhận trần 100.000 connection. Các giá trị đều có thể
+điều chỉnh bằng biến môi trường trong `.env`. Health ở
+`http://localhost:8080/actuator/health`; Swagger chỉ bật khi
+`WEBLENS_OPENAPI_ENABLED=true`.
 
 Trong terminal thứ hai, nạp các biến `CRAWLER_*`/`CLICKHOUSE_*` từ `.env`, rồi chạy:
 
@@ -71,6 +79,11 @@ go run ./cmd/weblens-crawler
 Crawler liveness/readiness ở `http://localhost:8081/health/live` và
 `http://localhost:8081/health/ready`. `CRAWLER_MIGRATE_ON_START=true` chỉ dành
 cho local/CI; production phải chạy migration bằng role DDL riêng.
+
+Crawler mặc định cho tối đa 10.000 page fetch toàn hệ thống nhưng giữ giới hạn
+hai request đồng thời trên mỗi hostname. Dispatcher không tạo 10.000 polling loop
+khi hàng đợi rỗng. Scan đã tạo trước thay đổi vẫn hiển thị snapshot cấu hình cũ;
+chỉ scan mới nhận mức 100.000 trang.
 
 ## Development workflow
 

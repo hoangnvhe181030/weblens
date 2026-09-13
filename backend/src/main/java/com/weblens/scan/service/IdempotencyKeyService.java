@@ -9,11 +9,11 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
 @Component
-class IdempotencyKeyService {
+public class IdempotencyKeyService {
 
     private static final int MAX_KEY_LENGTH = 128;
 
-    String hashOptional(String rawKey) {
+    public String hashOptional(String rawKey) {
         if (rawKey == null) {
             return null;
         }
@@ -29,7 +29,7 @@ class IdempotencyKeyService {
         return hash(key);
     }
 
-    String fingerprint(String operation, String resourceId) {
+    public String fingerprint(String operation, String resourceId) {
         return hash(operation + ":" + resourceId);
     }
 

@@ -159,7 +159,7 @@ public class ScanEntity {
         }
         if (status == ScanStatus.RUNNING) {
             transitionTo(ScanStatus.CANCEL_REQUESTED, now);
-			cancellationRequestedAt = now;
+            cancellationRequestedAt = now;
             return true;
         }
         throw new ScanNotCancellableException();
@@ -209,6 +209,8 @@ public class ScanEntity {
             transitionTo(ScanStatus.RUNNING, now);
         } else if (remoteStatus == ScanStatus.CANCEL_REQUESTED && status == ScanStatus.RUNNING) {
             transitionTo(ScanStatus.CANCEL_REQUESTED, now);
+        } else if (remoteStatus == status) {
+            // A newer crawler event may advance counters without changing lifecycle state.
         } else if (remoteStatus.isTerminal()) {
             transitionTo(remoteStatus, now);
         } else if (status != ScanStatus.CANCEL_REQUESTED) {

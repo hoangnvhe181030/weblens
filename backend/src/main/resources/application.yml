@@ -5,6 +5,15 @@ spring:
     url: ${DB_URL}
     username: ${DB_USERNAME}
     password: ${DB_PASSWORD}
+    hikari:
+      # Đây là ngân sách connection hữu hạn cho một Control Plane instance.
+      # Khi scale ngang phải chia lại ngân sách theo max_connections/PgBouncer.
+      maximum-pool-size: ${WEBLENS_HIKARI_MAX_POOL_SIZE:64}
+      minimum-idle: ${WEBLENS_HIKARI_MIN_IDLE:16}
+      connection-timeout: ${WEBLENS_HIKARI_CONNECTION_TIMEOUT_MS:5000}
+      validation-timeout: ${WEBLENS_HIKARI_VALIDATION_TIMEOUT_MS:1000}
+      idle-timeout: ${WEBLENS_HIKARI_IDLE_TIMEOUT_MS:300000}
+      max-lifetime: ${WEBLENS_HIKARI_MAX_LIFETIME_MS:1800000}
   flyway:
     enabled: true
     postgresql:
@@ -30,6 +39,15 @@ server:
     include-message: never
     include-stacktrace: never
   shutdown: graceful
+  tomcat:
+    # NIO có thể giữ nhiều connection hơn số thread xử lý. Đây là trần cấu hình,
+    # không phải tuyên bố một máy đã benchmark thành công 100.000 client.
+    max-connections: ${WEBLENS_TOMCAT_MAX_CONNECTIONS:100000}
+    accept-count: ${WEBLENS_TOMCAT_ACCEPT_COUNT:20000}
+    connection-timeout: ${WEBLENS_TOMCAT_CONNECTION_TIMEOUT:5s}
+    threads:
+      max: ${WEBLENS_TOMCAT_MAX_THREADS:512}
+      min-spare: ${WEBLENS_TOMCAT_MIN_SPARE_THREADS:32}
 
 management:
   endpoints:
@@ -63,12 +81,12 @@ weblens:
       secure: ${WEBLENS_COOKIE_SECURE:true}
   scan:
     limits:
-      max-pages: ${WEBLENS_SCAN_MAX_PAGES:25}
-      max-depth: ${WEBLENS_SCAN_MAX_DEPTH:3}
+      max-pages: ${WEBLENS_SCAN_MAX_PAGES:100000}
+      max-depth: ${WEBLENS_SCAN_MAX_DEPTH:4}
       max-response-bytes: ${WEBLENS_SCAN_MAX_RESPONSE_BYTES:10485760}
-      max-duration-seconds: ${WEBLENS_SCAN_MAX_DURATION_SECONDS:120}
+      max-duration-seconds: ${WEBLENS_SCAN_MAX_DURATION_SECONDS:86400}
       max-redirects: ${WEBLENS_SCAN_MAX_REDIRECTS:5}
-      concurrency: ${WEBLENS_SCAN_CONCURRENCY:3}
+      concurrency: ${WEBLENS_SCAN_CONCURRENCY:10000}
   crawler:
     command-url: ${WEBLENS_CRAWLER_COMMAND_URL:http://localhost:8081/internal/v1/commands/scans}
     report-base-url: ${WEBLENS_CRAWLER_REPORT_BASE_URL:http://localhost:8081}
@@ -78,6 +96,15 @@ weblens:
     outbox-lease: ${WEBLENS_CRAWLER_OUTBOX_LEASE:PT30S}
     dispatch-enabled: ${WEBLENS_CRAWLER_DISPATCH_ENABLED:true}
     dispatch-poll-interval: ${WEBLENS_CRAWLER_DISPATCH_POLL_INTERVAL:PT0.5S}
+  capture:
+    command-url: ${WEBLENS_CAPTURE_COMMAND_URL:http://localhost:8082/internal/v1/commands/captures}
+    report-base-url: ${WEBLENS_CAPTURE_REPORT_BASE_URL:http://localhost:8082}
+    service-token: ${WEBLENS_SERVICE_TOKEN}
+    connect-timeout: ${WEBLENS_CAPTURE_CONNECT_TIMEOUT:PT2S}
+    read-timeout: ${WEBLENS_CAPTURE_READ_TIMEOUT:PT10S}
+    outbox-lease: ${WEBLENS_CAPTURE_OUTBOX_LEASE:PT30S}
+    dispatch-enabled: ${WEBLENS_CAPTURE_DISPATCH_ENABLED:true}
+    dispatch-poll-interval: ${WEBLENS_CAPTURE_DISPATCH_POLL_INTERVAL:PT0.5S}
 
 logging:
   pattern:
