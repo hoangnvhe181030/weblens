@@ -97,4 +97,28 @@ public class CaptureController {
         }
         return response.body(bytes);
     }
+
+    @GetMapping(value = "/captures/{captureId}/resources/{resourceId}/content",
+            produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    @Operation(summary = "Download one owner-authorized captured resource as an attachment")
+    ResponseEntity<byte[]> getResourceBody(
+            @AuthenticationPrincipal Jwt jwt,
+            @PathVariable UUID captureId,
+            @PathVariable UUID resourceId
+    ) {
+        CaptureArtifactContent artifact = captures.getResourceBody(
+                AuthenticatedUserId.from(jwt), captureId, resourceId
+        );
+        byte[] bytes = artifact.bytes();
+        ResponseEntity.BodyBuilder response = ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .contentLength(bytes.length)
+                .cacheControl(CacheControl.noStore())
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        ContentDisposition.attachment().filename("captured-resource.bin").build().toString());
+        if (artifact.etag() != null && !artifact.etag().isBlank()) {
+            response.eTag(artifact.etag());
+        }
+        return response.body(bytes);
+    }
 }

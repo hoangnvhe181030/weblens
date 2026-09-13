@@ -148,6 +148,11 @@ public class CaptureService {
         return captureReports.getScreenshot(ownerId, captureId);
     }
 
+    public CaptureArtifactContent getResourceBody(UUID ownerId, UUID captureId, UUID resourceId) {
+        requireReady(ownerId, captureId);
+        return captureReports.getResourceBody(ownerId, captureId, resourceId);
+    }
+
     private void requireReady(UUID ownerId, UUID captureId) {
         CaptureResponse capture = get(ownerId, captureId);
         if (capture.status() != CaptureStatus.COMPLETED && capture.status() != CaptureStatus.PARTIAL_SUCCESS) {

@@ -10,6 +10,11 @@ public record CapturedResourceResponse(
         String type,
         String contentType,
         long sizeBytes,
-        long durationMs
+        long durationMs,
+        boolean bodyCaptured,
+        UUID capturedBodyId,
+        long capturedBodyBytes,
+        String bodySha256,
+        boolean bodyTruncated
 ) {
 }

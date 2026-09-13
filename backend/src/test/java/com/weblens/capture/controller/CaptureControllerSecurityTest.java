@@ -86,6 +86,46 @@ class CaptureControllerSecurityTest {
     }
 
     @Test
+    void capturedResourceRequiresUserAuthentication() throws Exception {
+        mvc.perform(get(
+                        "/api/v1/captures/{captureId}/resources/{resourceId}/content",
+                        UUID.randomUUID(),
+                        UUID.randomUUID()
+                ))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void capturedResourceIsAlwaysReturnedAsAttachment() throws Exception {
+        UUID userId = UUID.randomUUID();
+        UUID captureId = UUID.randomUUID();
+        UUID resourceId = UUID.randomUUID();
+        byte[] untrustedScript = "alert('untrusted')".getBytes(StandardCharsets.UTF_8);
+        given(captures.getResourceBody(userId, captureId, resourceId))
+                .willReturn(new CaptureArtifactContent(
+                        untrustedScript,
+                        MediaType.APPLICATION_OCTET_STREAM_VALUE,
+                        "\"sha256-test-resource\""
+                ));
+
+        mvc.perform(get(
+                        "/api/v1/captures/{captureId}/resources/{resourceId}/content",
+                        captureId,
+                        resourceId
+                ).with(jwt().jwt(token -> token.subject(userId.toString()))))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_OCTET_STREAM))
+                .andExpect(content().bytes(untrustedScript))
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(header().string(
+                        HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"captured-resource.bin\""
+                ))
+                .andExpect(header().string("X-Content-Type-Options", "nosniff"))
+                .andExpect(header().doesNotExist("X-WebLens-Service-Token"));
+    }
+
+    @Test
     void latestReadyCaptureRequiresUserAuthentication() throws Exception {
         mvc.perform(get(
                         "/api/v1/scans/{scanId}/scan-pages/{pageId}/captures/latest-ready",
