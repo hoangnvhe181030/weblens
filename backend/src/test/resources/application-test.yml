@@ -38,3 +38,11 @@ weblens:
     read-timeout: PT1S
     outbox-lease: PT30S
     dispatch-enabled: false
+  capture:
+    command-url: http://localhost:18082/internal/v1/commands/captures
+    report-base-url: http://localhost:18082
+    service-token: weblens-test-service-token-at-least-32-bytes
+    connect-timeout: PT0.5S
+    read-timeout: PT1S
+    outbox-lease: PT30S
+    dispatch-enabled: false

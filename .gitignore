@@ -20,6 +20,9 @@ backend/.gradle/
 frontend/node_modules/
 frontend/dist/
 frontend/coverage/
+capture-worker/node_modules/
+capture-worker/dist/
+capture-worker/coverage/
 
 # Logs and runtime artifacts
 *.log
