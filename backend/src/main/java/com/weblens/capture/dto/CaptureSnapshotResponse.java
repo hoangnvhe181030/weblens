@@ -25,6 +25,7 @@ public record CaptureSnapshotResponse(
         Map<String, Object> diff,
         Map<String, Object> performance,
         CaptureArtifactsResponse artifacts,
+        ReconstructionResponse reconstruction,
         List<CapturedResourceResponse> resources
 ) {
 }

@@ -102,6 +102,32 @@ export interface ResourceBody {
   wasTruncated: boolean
 }
 
+export interface CloneInputResource {
+  sequence: number
+  sourceUrl: string
+  publicUrl: string
+  resourceType: string
+  mimeType: string
+  body: Buffer | null
+  wasTruncated: boolean
+  skipReason: string | null
+}
+
+export interface ReconstructionBuild {
+  status: 'PUBLISHED' | 'PARTIAL' | 'FAILED'
+  engineVersion: string
+  discoveredCount: number
+  packagedCount: number
+  skippedCount: number
+  inputBytes: number
+  archiveBytes: number | null
+  completenessCode: string | null
+  failureCode: string | null
+  archivePath: string | null
+  temporaryDirectory: string | null
+  manifest: Buffer | null
+}
+
 export interface CaptureResult {
   finalUrl: string
   html: Buffer
@@ -114,6 +140,7 @@ export interface CaptureResult {
   browserVersion: string
   observedAt: string
   totalTransferBytes: number
+  reconstruction: ReconstructionBuild
 }
 
 export interface StoredObject {

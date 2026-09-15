@@ -10,8 +10,10 @@ duy trì frontier/lease trong PostgreSQL, crawl HTTP(S) có SSRF guard, stage k�
 bền vững và đưa metrics/findings/links vào ClickHouse trước khi công bố progress.
 Page-report query đi qua Control Plane với owner scope và ingestion watermark.
 Browser capture V1.5 đã có Playwright Worker cô lập, PostgreSQL workflow,
-ClickHouse analytics, MinIO artifact và snapshot viewer có owner scope. Frontend
-tiếp tục mặc định chạy mock để demo có thể xem độc lập.
+ClickHouse analytics, MinIO artifact và snapshot viewer có owner scope. Mỗi
+capture mới còn tạo best-effort một ZIP clone tĩnh một trang theo Pagesource
+adapter, kèm manifest và thời hạn tải 7 ngày. Frontend tiếp tục mặc định chạy mock
+để demo có thể xem độc lập.
 
 ## V1 goal
 
@@ -52,6 +54,11 @@ và page report thật, sao chép `frontend/.env.example` thành
 `VITE_API_MODE=backend` và giữ `VITE_API_BASE_URL=http://localhost:8080`. Chế độ
 này dùng API thật cho auth, website, scan, page report và browser capture V1.5.
 
+Clone tĩnh chỉ đóng gói HTML sau render cùng CSS, JavaScript, image và font
+same-origin thực sự đã capture. Đây không phải source project gốc và không khôi
+phục backend/API riêng của website. ZIP chỉ được tải xuống; WebLens không preview
+hoặc chạy HTML/JavaScript trong archive trên origin của ứng dụng.
+
 ## Chạy runtime production cục bộ
 
 Yêu cầu Java 21 và Docker. Sao chép `.env.example` thành `.env`, thay JWT secret/credential, rồi chạy:
@@ -84,6 +91,23 @@ Crawler mặc định cho tối đa 10.000 page fetch toàn hệ thống nhưng 
 hai request đồng thời trên mỗi hostname. Dispatcher không tạo 10.000 polling loop
 khi hàng đợi rỗng. Scan đã tạo trước thay đổi vẫn hiển thị snapshot cấu hình cũ;
 chỉ scan mới nhận mức 100.000 trang.
+
+Capture Worker tự áp dụng migration thuộc database của nó khi khởi động. Bộ dọn
+clone chạy theo `CAPTURE_RECONSTRUCTION_GC_POLL_MS`: artifact upload đã stage
+nhưng không publish được sẽ được dọn sau một giờ; archive đã publish hết hạn sau
+7 ngày sẽ bị xóa khỏi MinIO và chuyển lifecycle sang `EXPIRED`/`DELETED`.
+
+Các lệnh kiểm tra Capture Worker:
+
+```powershell
+cd capture-worker
+npm test
+npm run typecheck
+npm run build
+```
+
+Integration test PostgreSQL cần `CAPTURE_TEST_DATABASE_URL` trỏ vào một database
+test; suite tự tạo và xóa schema cô lập.
 
 ## Development workflow
 

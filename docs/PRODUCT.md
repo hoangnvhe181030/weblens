@@ -42,6 +42,9 @@ screenshot, eligible resource và network-metadata capture, S3-compatible object
 storage, content hashing và snapshot inspection. Capture Worker là deployable
 riêng và không chạy mã trang web trong Control Plane hoặc Crawler Service.
 Network/resource analytics đã redaction được truy vấn từ ClickHouse.
+Mỗi browser capture mới cũng tạo best-effort một archive clone tĩnh của đúng một
+trang theo ADR-007: same-origin, có manifest, giới hạn 100 file/50 MiB input/64
+MiB archive, lưu private trong object storage và chỉ cho tải xuống trong 7 ngày.
 
 ## Explicitly not V1
 

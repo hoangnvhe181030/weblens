@@ -39,8 +39,24 @@ export interface ScreenshotReference {
   expiresAt: Date
 }
 
+export interface ReconstructionArtifactReference extends ScreenshotReference {
+  state: 'STAGED' | 'PUBLISHED' | 'DELETE_PENDING' | 'DELETED'
+}
+
 export interface ResourceReference extends ScreenshotReference {
   contentType: string
+}
+
+export interface ReconstructionObjects {
+  archive: StoredObject
+  manifest: StoredObject
+}
+
+export interface ClaimedReconstructionArtifact {
+  id: string
+  reconstructionId: string
+  kind: 'STATIC_ARCHIVE' | 'MANIFEST'
+  object: StoredObject
 }
 
 export class CaptureDatabase {
@@ -110,6 +126,12 @@ export class CaptureDatabase {
         payload.pageId, envelope.correlationId, envelope.aggregateVersion, payload.targetUrl,
         JSON.stringify(payload),
       ])
+      await client.query(`insert into reconstruction_jobs (
+          id,owner_id,capture_job_id,engine_version,status,created_at,updated_at
+        ) values ($1,$2,$3,$4,'QUEUED',now(),now())`, [
+        randomUUID(), payload.ownerId, payload.captureRequestId,
+        'weblens-1/pagesource-0.1.2@f59ed61',
+      ])
       await client.query('commit')
       return false
     } catch (error) {
@@ -147,6 +169,10 @@ export class CaptureDatabase {
         return null
       }
       await this.enqueueEvent(client, row.id, row.owner_id, row.correlation_id, 'RUNNING', 0, 0, 0, 0, null, null)
+      await client.query(`update reconstruction_jobs
+        set status='RUNNING',source_lease_generation=$2,started_at=coalesce(started_at,now()),
+            finished_at=null,failure_code=null,updated_at=now(),version=version+1
+        where capture_job_id=$1 and status in ('QUEUED','RUNNING')`, [row.id, row.lease_generation])
       await client.query('commit')
       return {
         id: row.id, ownerId: row.owner_id, scanId: row.scan_id, pageId: row.page_id,
@@ -169,12 +195,43 @@ export class CaptureDatabase {
     return result.rowCount === 1
   }
 
+  async stageReconstructionArtifacts(job: ClaimedJob, objects: ReconstructionObjects): Promise<void> {
+    const client = await this.pool.connect()
+    try {
+      await client.query('begin')
+      const capture = await client.query(`select id from capture_jobs
+        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3 for update`,
+      [job.id, job.leaseOwner, job.leaseGeneration])
+      if (!capture.rowCount) throw new Error('STALE_CAPTURE_LEASE')
+      const reconstruction = await client.query<{ id: string }>(`select id from reconstruction_jobs
+        where capture_job_id=$1 and owner_id=$2 and status='RUNNING'
+          and source_lease_generation=$3 for update`, [job.id, job.ownerId, job.leaseGeneration])
+      const reconstructionId = reconstruction.rows[0]?.id
+      if (!reconstructionId) throw new Error('STALE_RECONSTRUCTION_LEASE')
+      await insertStagedReconstructionArtifact(
+        client, reconstructionId, job.ownerId, job.leaseGeneration, 'STATIC_ARCHIVE',
+        'weblens-static-clone.zip', objects.archive,
+      )
+      await insertStagedReconstructionArtifact(
+        client, reconstructionId, job.ownerId, job.leaseGeneration, 'MANIFEST',
+        'manifest.json', objects.manifest,
+      )
+      await client.query('commit')
+    } catch (error) {
+      await client.query('rollback')
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
   async stageResult(
     job: ClaimedJob,
     result: CaptureResult,
     htmlObject: StoredObject,
     screenshotObject: StoredObject,
     resourceObjects: Array<{ resource: CaptureResult['resourceBodies'][number]; object: StoredObject }>,
+    reconstructionObjects: ReconstructionObjects | null,
   ): Promise<void> {
     const analyticsPayload = {
       schemaVersion: 1,
@@ -188,6 +245,7 @@ export class CaptureDatabase {
         ...result,
         html: undefined,
         screenshot: undefined,
+        reconstruction: undefined,
         resourceBodies: resourceObjects.map(({ resource }) => ({
           resourceId: resource.resourceId,
           sequence: resource.sequence,
@@ -204,9 +262,11 @@ export class CaptureDatabase {
     if (encoded.length > 8_388_608) throw new Error('ANALYTICS_PAYLOAD_TOO_LARGE')
     const hash = createHash('sha256').update(encoded).digest()
     const expected = 1 + result.network.length + resourceObjects.length
-    const objectCount = 2 + resourceObjects.length
+    const objectCount = 2 + resourceObjects.length + (reconstructionObjects ? 2 : 0)
     const objectBytes = htmlObject.bytes + screenshotObject.bytes
       + resourceObjects.reduce((total, item) => total + item.object.bytes, 0)
+      + (reconstructionObjects?.archive.bytes ?? 0)
+      + (reconstructionObjects?.manifest.bytes ?? 0)
     const client = await this.pool.connect()
     try {
       await client.query('begin')
@@ -242,6 +302,60 @@ export class CaptureDatabase {
           item.object.key, item.object.contentType || 'application/octet-stream', item.object.bytes,
           item.object.sha256,
         ])
+      }
+      const reconstruction = await client.query<{ id: string }>(
+        `select id from reconstruction_jobs where capture_job_id=$1 and owner_id=$2
+          and status='RUNNING' and source_lease_generation=$3 for update`,
+        [job.id, job.ownerId, job.leaseGeneration],
+      )
+      const reconstructionId = reconstruction.rows[0]?.id
+      if (reconstructionId) {
+        const build = result.reconstruction
+        let artifactsPublished = false
+        if (reconstructionObjects && build.status !== 'FAILED' && build.archiveBytes) {
+          const staged = await client.query<{ id: string }>(`select id
+            from reconstruction_artifacts
+            where reconstruction_job_id=$1 and owner_id=$2 and generation=$3 and state='STAGED'
+              and delete_after>now()+interval '5 minutes'
+              and ((kind='STATIC_ARCHIVE' and storage_bucket=$4 and storage_key=$5
+                and content_type=$6 and byte_size=$7 and sha256=$8)
+              or (kind='MANIFEST' and storage_bucket=$9 and storage_key=$10
+                and content_type=$11 and byte_size=$12 and sha256=$13))
+            for update`, [
+            reconstructionId, job.ownerId, job.leaseGeneration,
+            reconstructionObjects.archive.bucket, reconstructionObjects.archive.key,
+            reconstructionObjects.archive.contentType, reconstructionObjects.archive.bytes,
+            reconstructionObjects.archive.sha256,
+            reconstructionObjects.manifest.bucket, reconstructionObjects.manifest.key,
+            reconstructionObjects.manifest.contentType, reconstructionObjects.manifest.bytes,
+            reconstructionObjects.manifest.sha256,
+          ])
+          if (staged.rowCount === 2) {
+            const published = await client.query(`update reconstruction_artifacts
+              set state='PUBLISHED',published_at=now(),delete_after=now()+interval '7 days'
+              where reconstruction_job_id=$1 and owner_id=$2 and generation=$3 and state='STAGED'`,
+            [reconstructionId, job.ownerId, job.leaseGeneration])
+            artifactsPublished = published.rowCount === 2
+          }
+        }
+        const terminalStatus = artifactsPublished && build.status !== 'FAILED' ? build.status : 'FAILED'
+        const failureCode = terminalStatus === 'FAILED'
+          ? (build.failureCode ?? (reconstructionObjects
+              ? 'CLONE_ARTIFACT_STAGE_INCOMPLETE'
+              : 'CLONE_ARTIFACT_UPLOAD_FAILED'))
+          : null
+        const updated = await client.query(`update reconstruction_jobs set
+            source_snapshot_id=$2,status=$3,discovered_count=$4,packaged_count=$5,
+            skipped_count=$6,input_bytes=$7,archive_bytes=$8,completeness_code=$9,
+            failure_code=$10,finished_at=now(),updated_at=now(),version=version+1
+          where id=$1 and status='RUNNING' and source_lease_generation=$11`, [
+          reconstructionId, snapshotId, terminalStatus, build.discoveredCount,
+          build.packagedCount, build.skippedCount, build.inputBytes,
+          terminalStatus === 'FAILED' ? null : reconstructionObjects?.archive.bytes,
+          terminalStatus === 'FAILED' ? null : build.completenessCode,
+          failureCode, job.leaseGeneration,
+        ])
+        if (!updated.rowCount) throw new Error('STALE_RECONSTRUCTION_LEASE')
       }
       await client.query(`insert into analytics_outbox (
           id,capture_job_id,owner_id,result_version,status,payload,payload_sha256,
@@ -283,6 +397,9 @@ export class CaptureDatabase {
         await client.query(`update capture_jobs set status='FAILED',lease_owner=null,lease_expires_at=null,
           terminal_code=$2,terminal_message='Capture failed after bounded retries',finished_at=now(),updated_at=now()
           where id=$1`, [job.id, errorCode])
+        await client.query(`update reconstruction_jobs set status='FAILED',
+            failure_code='CAPTURE_FAILED_BEFORE_CLONE',finished_at=now(),updated_at=now(),version=version+1
+          where capture_job_id=$1 and status in ('QUEUED','RUNNING')`, [job.id])
         await this.enqueueEvent(client, job.id, job.ownerId, job.correlationId, 'FAILED', 0, 0, 0, 0,
           errorCode, 'Capture failed after bounded retries')
       }
@@ -385,10 +502,128 @@ export class CaptureDatabase {
         snapshot.diff_summary,snapshot.performance_summary,snapshot.network_request_count,
         snapshot.captured_resource_count,snapshot.total_transfer_bytes,snapshot.captured_at,
         snapshot.storage_bucket,snapshot.html_storage_key,snapshot.html_bytes,
-        snapshot.screenshot_storage_key,snapshot.screenshot_bytes
-      from capture_jobs job left join page_snapshots snapshot on snapshot.capture_job_id=job.id
+        snapshot.screenshot_storage_key,snapshot.screenshot_bytes,
+        reconstruction.id as reconstruction_id,
+        case when reconstruction.status in ('PUBLISHED','PARTIAL')
+          and archive.id is not null
+          and (archive.state in ('DELETE_PENDING','DELETED') or archive.delete_after<=now())
+          then 'EXPIRED' else reconstruction.status end as reconstruction_status,
+        reconstruction.kind as reconstruction_kind,reconstruction.engine_version,
+        reconstruction.packaged_count,reconstruction.skipped_count,reconstruction.archive_bytes,
+        reconstruction.completeness_code,reconstruction.failure_code,
+        archive.delete_after as reconstruction_expires_at,
+        (archive.id is not null and archive.state='PUBLISHED' and archive.delete_after>now())
+          as reconstruction_download_available
+      from capture_jobs job
+      left join page_snapshots snapshot on snapshot.capture_job_id=job.id
+      left join reconstruction_jobs reconstruction on reconstruction.capture_job_id=job.id
+      left join reconstruction_artifacts archive on archive.reconstruction_job_id=reconstruction.id
+        and archive.kind='STATIC_ARCHIVE' and archive.generation=reconstruction.source_lease_generation
       where job.id=$1 and job.owner_id=$2`, [captureId, ownerId])
     return result.rows[0] ?? null
+  }
+
+  async getReconstruction(ownerId: string, captureId: string): Promise<Record<string, unknown> | null> {
+    const result = await this.pool.query(`select reconstruction.id as reconstruction_id,
+        case when reconstruction.status in ('PUBLISHED','PARTIAL')
+          and archive.id is not null
+          and (archive.state in ('DELETE_PENDING','DELETED') or archive.delete_after<=now())
+          then 'EXPIRED' else reconstruction.status end as reconstruction_status,
+        reconstruction.kind as reconstruction_kind,
+        reconstruction.engine_version,reconstruction.packaged_count,reconstruction.skipped_count,
+        reconstruction.archive_bytes,reconstruction.completeness_code,reconstruction.failure_code,
+        archive.delete_after as reconstruction_expires_at,
+        (archive.id is not null and archive.state='PUBLISHED' and archive.delete_after>now())
+          as reconstruction_download_available
+      from reconstruction_jobs reconstruction
+      left join reconstruction_artifacts archive on archive.reconstruction_job_id=reconstruction.id
+        and archive.kind='STATIC_ARCHIVE' and archive.generation=reconstruction.source_lease_generation
+      where reconstruction.capture_job_id=$1 and reconstruction.owner_id=$2`, [captureId, ownerId])
+    return result.rows[0] ?? null
+  }
+
+  async getReconstructionArchiveReference(
+    ownerId: string,
+    reconstructionId: string,
+  ): Promise<ReconstructionArtifactReference | null> {
+    const result = await this.pool.query<{
+      storage_bucket: string; storage_key: string; byte_size: string; sha256_hex: string
+      delete_after: Date; state: ReconstructionArtifactReference['state']
+    }>(`select artifact.storage_bucket,artifact.storage_key,artifact.byte_size,
+          encode(artifact.sha256,'hex') as sha256_hex,artifact.delete_after,artifact.state
+      from reconstruction_artifacts artifact
+      join reconstruction_jobs job on job.id=artifact.reconstruction_job_id
+        and job.owner_id=artifact.owner_id
+      where artifact.reconstruction_job_id=$1 and artifact.owner_id=$2
+        and artifact.kind='STATIC_ARCHIVE'
+        and artifact.generation=job.source_lease_generation
+        and job.status in ('PUBLISHED','PARTIAL','EXPIRED')
+      limit 1`, [reconstructionId, ownerId])
+    const row = result.rows[0]
+    return row ? {
+      bucket: row.storage_bucket, key: row.storage_key, bytes: Number(row.byte_size),
+      sha256Hex: row.sha256_hex, expiresAt: row.delete_after, state: row.state,
+    } : null
+  }
+
+  async claimReconstructionArtifactForDeletion(): Promise<ClaimedReconstructionArtifact | null> {
+    const result = await this.pool.query<{
+      id: string; reconstruction_job_id: string; kind: ClaimedReconstructionArtifact['kind']
+      storage_bucket: string; storage_key: string; content_type: string; byte_size: string; sha256: Buffer
+    }>(`with candidate as (
+        select id from reconstruction_artifacts
+        where state in ('STAGED','PUBLISHED','DELETE_PENDING') and delete_after<=now()
+        order by delete_after,id for update skip locked limit 1
+      ) update reconstruction_artifacts artifact
+        set state=case when artifact.state='STAGED' then 'STAGED' else 'DELETE_PENDING' end,
+            delete_after=now()+interval '30 seconds'
+      from candidate where artifact.id=candidate.id
+      returning artifact.id,artifact.reconstruction_job_id,artifact.kind,
+        artifact.storage_bucket,artifact.storage_key,artifact.content_type,
+        artifact.byte_size,artifact.sha256`)
+    const row = result.rows[0]
+    return row ? {
+      id: row.id,
+      reconstructionId: row.reconstruction_job_id,
+      kind: row.kind,
+      object: {
+        bucket: row.storage_bucket,
+        key: row.storage_key,
+        contentType: row.content_type,
+        bytes: Number(row.byte_size),
+        sha256: row.sha256,
+      },
+    } : null
+  }
+
+  async completeReconstructionArtifactDeletion(artifact: ClaimedReconstructionArtifact): Promise<void> {
+    const client = await this.pool.connect()
+    try {
+      await client.query('begin')
+      const deleted = await client.query(`update reconstruction_artifacts
+        set state='DELETED',deleted_at=now()
+        where id=$1 and reconstruction_job_id=$2 and state in ('STAGED','DELETE_PENDING')`,
+      [artifact.id, artifact.reconstructionId])
+      if (!deleted.rowCount) throw new Error('STALE_RECONSTRUCTION_GC_CLAIM')
+      if (artifact.kind === 'STATIC_ARCHIVE') {
+        await client.query(`update reconstruction_jobs
+          set status='EXPIRED',updated_at=now(),version=version+1
+          where id=$1 and status in ('PUBLISHED','PARTIAL')`, [artifact.reconstructionId])
+      }
+      await client.query('commit')
+    } catch (error) {
+      await client.query('rollback')
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  async retryReconstructionArtifactDeletion(artifact: ClaimedReconstructionArtifact): Promise<void> {
+    await this.pool.query(`update reconstruction_artifacts
+      set delete_after=now()+interval '1 minute'
+      where id=$1 and reconstruction_job_id=$2 and state in ('STAGED','DELETE_PENDING')`,
+    [artifact.id, artifact.reconstructionId])
   }
 
   async getScreenshotReference(ownerId: string, captureId: string): Promise<ScreenshotReference | null> {
@@ -490,4 +725,23 @@ export class CaptureDatabase {
       messageId, jobId, version, correlationId, JSON.stringify(payload),
     ])
   }
+}
+
+async function insertStagedReconstructionArtifact(
+  client: PoolClient,
+  reconstructionId: string,
+  ownerId: string,
+  generation: number,
+  kind: 'STATIC_ARCHIVE' | 'MANIFEST',
+  logicalFilename: string,
+  object: StoredObject,
+): Promise<void> {
+  await client.query(`insert into reconstruction_artifacts (
+      id,owner_id,reconstruction_job_id,kind,generation,logical_filename,
+      storage_bucket,storage_key,content_type,byte_size,sha256,state,
+      created_at,published_at,delete_after
+    ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'STAGED',now(),null,now()+interval '1 hour')`, [
+    randomUUID(), ownerId, reconstructionId, kind, generation, logicalFilename,
+    object.bucket, object.key, object.contentType, object.bytes, object.sha256,
+  ])
 }

@@ -125,6 +125,24 @@ batch, version đến sai thứ tự, `too many parts`, disk pressure, retention
 
 **Important edge cases:** Missing objects, duplicate hashes, retention/deletion, partial captures, long URLs, and unavailable screenshots.
 
+## CAP-004 — Tạo và tải bản clone tĩnh một trang
+
+**Mô tả:** Mỗi browser capture mới tạo best-effort một ZIP clone tĩnh của đúng
+một trang từ HTML sau render và resource body đủ điều kiện trong cùng Playwright
+session.
+
+**Tiêu chí chấp nhận:** Chỉ CSS, JavaScript, image và font same-origin được đóng
+gói; URL→path và rewrite ổn định; manifest versioned công bố file bị thiếu hoặc
+truncate; giới hạn 100 file, 50 MiB input và 64 MiB archive; archive private hết
+hạn sau 7 ngày; owner tải qua Control Plane dưới dạng attachment sau kiểm tra
+size/SHA-256. Clone `PARTIAL` hoặc `FAILED` không làm mất capture hợp lệ, và UI
+không preview hay thực thi HTML/JavaScript trong archive.
+
+**Trường hợp biên:** URL chỉ khác query, path Unicode/traversal, tên dành riêng
+Windows, collision, CSS URL tương đối, `srcset`, external origin, body hết budget,
+worker mất lease, upload thành công nhưng commit thất bại, object hết hạn hoặc bị
+thay đổi và capture cũ chưa có reconstruction.
+
 ## Deferred requirements
 
 Scan comparison và regression detection bắt đầu ở V2; AI root-cause analysis ở

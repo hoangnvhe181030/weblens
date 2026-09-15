@@ -20,6 +20,14 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
 
   try {
     await database.migrate()
+    const migrations = await database.pool.query<{ version: string }>(
+      'select version from capture_schema_migrations order by version',
+    )
+    assert.deepEqual(migrations.rows.map((row) => row.version), [
+      '001_create_capture_runtime.sql',
+      '002_create_static_reconstruction.sql',
+      '003_index_staged_reconstruction_gc.sql',
+    ])
     assert.equal(await database.acceptCommand(command), false)
     assert.equal(await database.acceptCommand(command), true)
     await assert.rejects(
@@ -47,11 +55,33 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
     const htmlObject = storedObject('html', result.html)
     const screenshotObject = storedObject('screenshot', result.screenshot)
     const resourceObject = storedObject('resource', resource.body)
+    const archiveObject = storedObject('archive', Buffer.from('zip-evidence'))
+    const manifestObject = storedObject('manifest', Buffer.from('{"schemaVersion":1}'))
+    result.reconstruction.archiveBytes = archiveObject.bytes
     await assert.rejects(
-      database.stageResult(firstLease, result, htmlObject, screenshotObject, []),
+      database.stageResult(firstLease, result, htmlObject, screenshotObject, [], null),
       /STALE_CAPTURE_LEASE/u,
     )
-    await database.stageResult(secondLease, result, htmlObject, screenshotObject, [{ resource, object: resourceObject }])
+    await assert.rejects(
+      database.stageReconstructionArtifacts(firstLease, { archive: archiveObject, manifest: manifestObject }),
+      /STALE_CAPTURE_LEASE/u,
+    )
+    await database.stageReconstructionArtifacts(
+      secondLease,
+      { archive: archiveObject, manifest: manifestObject },
+    )
+    const stagedArtifacts = await database.pool.query<{ state: string }>(
+      'select state from reconstruction_artifacts order by kind',
+    )
+    assert.deepEqual(stagedArtifacts.rows.map((row) => row.state), ['STAGED', 'STAGED'])
+    await database.stageResult(
+      secondLease, result, htmlObject, screenshotObject, [{ resource, object: resourceObject }],
+      { archive: archiveObject, manifest: manifestObject },
+    )
+    const publishedArtifacts = await database.pool.query<{ state: string }>(
+      'select state from reconstruction_artifacts order by kind',
+    )
+    assert.deepEqual(publishedArtifacts.rows.map((row) => row.state), ['PUBLISHED', 'PUBLISHED'])
 
     const claims = await Promise.all([
       database.claimAnalytics(randomUUID()),
@@ -75,6 +105,106 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
     )
     assert.equal(reference?.bytes, resource.body.length)
     assert.equal(reference?.key, resourceObject.key)
+    const reconstruction = await database.getReconstruction(command.payload.ownerId, command.aggregateId)
+    assert.equal(reconstruction?.['reconstruction_status'], 'PUBLISHED')
+    assert.equal(reconstruction?.['packaged_count'], 1)
+    const reconstructionId = String(reconstruction?.['reconstruction_id'])
+    assert.equal(await database.getReconstructionArchiveReference(randomUUID(), reconstructionId), null)
+    const archiveReference = await database.getReconstructionArchiveReference(
+      command.payload.ownerId,
+      reconstructionId,
+    )
+    assert.equal(archiveReference?.key, archiveObject.key)
+    assert.equal(archiveReference?.bytes, archiveObject.bytes)
+    assert.equal(archiveReference?.state, 'PUBLISHED')
+
+    await database.pool.query(
+      "update reconstruction_artifacts set delete_after=created_at+interval '1 millisecond'",
+    )
+    const firstExpiredArtifact = await database.claimReconstructionArtifactForDeletion()
+    const secondExpiredArtifact = await database.claimReconstructionArtifactForDeletion()
+    assert.ok(firstExpiredArtifact)
+    assert.ok(secondExpiredArtifact)
+    assert.notEqual(firstExpiredArtifact.id, secondExpiredArtifact.id)
+    await database.completeReconstructionArtifactDeletion(firstExpiredArtifact)
+    await database.completeReconstructionArtifactDeletion(secondExpiredArtifact)
+    const expiredReconstruction = await database.getReconstruction(
+      command.payload.ownerId,
+      command.aggregateId,
+    )
+    assert.equal(expiredReconstruction?.['reconstruction_status'], 'EXPIRED')
+    const expiredReference = await database.getReconstructionArchiveReference(
+      command.payload.ownerId,
+      reconstructionId,
+    )
+    assert.equal(expiredReference?.state, 'DELETED')
+
+    const cloneFailureCommand = commandEnvelope()
+    await database.acceptCommand(cloneFailureCommand)
+    const cloneFailureLease = await database.claimJob(randomUUID())
+    assert.ok(cloneFailureLease)
+    const cloneFailureResult = captureResult()
+    cloneFailureResult.reconstruction = {
+      ...cloneFailureResult.reconstruction,
+      status: 'FAILED',
+      packagedCount: 0,
+      inputBytes: 0,
+      archiveBytes: null,
+      completenessCode: null,
+      failureCode: 'CLONE_ARCHIVE_GENERATION_FAILED',
+    }
+    await database.stageResult(
+      cloneFailureLease,
+      cloneFailureResult,
+      storedObject('failure-html', cloneFailureResult.html),
+      storedObject('failure-screenshot', cloneFailureResult.screenshot),
+      [],
+      null,
+    )
+    const cloneFailureAnalytics = await database.claimAnalytics(randomUUID())
+    assert.ok(cloneFailureAnalytics)
+    await database.completeAnalytics(cloneFailureAnalytics)
+    const captureWithFailedClone = await database.getSnapshot(
+      cloneFailureCommand.payload.ownerId,
+      cloneFailureCommand.aggregateId,
+    )
+    assert.equal(captureWithFailedClone?.['status'], 'COMPLETED')
+    assert.equal(captureWithFailedClone?.['reconstruction_status'], 'FAILED')
+    assert.equal(captureWithFailedClone?.['failure_code'], 'CLONE_ARCHIVE_GENERATION_FAILED')
+
+    const gcRaceCommand = commandEnvelope()
+    await database.acceptCommand(gcRaceCommand)
+    const gcRaceLease = await database.claimJob(randomUUID())
+    assert.ok(gcRaceLease)
+    const gcRaceResult = captureResult()
+    const gcRaceArchive = storedObject('gc-race-archive', Buffer.from('gc-race-zip'))
+    const gcRaceManifest = storedObject('gc-race-manifest', Buffer.from('{"schemaVersion":1}'))
+    gcRaceResult.reconstruction.archiveBytes = gcRaceArchive.bytes
+    await database.stageReconstructionArtifacts(
+      gcRaceLease,
+      { archive: gcRaceArchive, manifest: gcRaceManifest },
+    )
+    await database.pool.query(
+      "update reconstruction_artifacts set delete_after=created_at+interval '1 millisecond' "
+        + 'where reconstruction_job_id=(select id from reconstruction_jobs where capture_job_id=$1)',
+      [gcRaceCommand.aggregateId],
+    )
+    const gcClaim = await database.claimReconstructionArtifactForDeletion()
+    assert.ok(gcClaim)
+    await database.stageResult(
+      gcRaceLease,
+      gcRaceResult,
+      storedObject('gc-race-html', gcRaceResult.html),
+      storedObject('gc-race-screenshot', gcRaceResult.screenshot),
+      [],
+      { archive: gcRaceArchive, manifest: gcRaceManifest },
+    )
+    const gcRaceReconstruction = await database.getReconstruction(
+      gcRaceCommand.payload.ownerId,
+      gcRaceCommand.aggregateId,
+    )
+    assert.equal(gcRaceReconstruction?.['reconstruction_status'], 'FAILED')
+    assert.equal(gcRaceReconstruction?.['failure_code'], 'CLONE_ARTIFACT_STAGE_INCOMPLETE')
   } finally {
     await database.close()
     await admin.query(`drop schema "${schemaName}" cascade`)
@@ -144,6 +274,20 @@ function captureResult(): CaptureResult {
     browserVersion: 'test-browser',
     observedAt: new Date().toISOString(),
     totalTransferBytes: 1,
+    reconstruction: {
+      status: 'PUBLISHED',
+      engineVersion: 'weblens-1/pagesource-0.1.2@f59ed61',
+      discoveredCount: 1,
+      packagedCount: 1,
+      skippedCount: 0,
+      inputBytes: 13,
+      archiveBytes: null,
+      completenessCode: 'COMPLETE',
+      failureCode: null,
+      archivePath: null,
+      temporaryDirectory: null,
+      manifest: null,
+    },
   }
 }
 
@@ -153,6 +297,9 @@ function storedObject(kind: string, bytes: Buffer): StoredObject {
     key: `integration/${kind}`,
     bytes: bytes.length,
     sha256: createHash('sha256').update(bytes).digest(),
-    contentType: kind === 'screenshot' ? 'image/jpeg' : 'text/html; charset=utf-8',
+    contentType: kind.includes('screenshot') ? 'image/jpeg'
+      : kind.includes('archive') ? 'application/zip'
+        : kind.includes('manifest') ? 'application/json'
+          : 'text/html; charset=utf-8',
   }
 }

@@ -73,4 +73,36 @@ describe('SnapshotPage', () => {
     expect(document.querySelector('iframe')).not.toBeInTheDocument()
     expect(document.querySelector('script')).not.toBeInTheDocument()
   })
+
+  it('hiển thị trạng thái reconstruction và chỉ tải clone dưới dạng ZIP', async () => {
+    vi.spyOn(webLensService, 'getSnapshot').mockResolvedValue({
+      ...snapshot,
+      artifacts: { renderedHtmlBytes: 1200, screenshotBytes: 0 },
+    })
+    vi.spyOn(webLensService, 'getReconstructionArchive').mockResolvedValue(new Blob(
+      [new TextEncoder().encode('PK-static-clone')],
+      { type: 'application/zip' },
+    ))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:weblens-static-clone')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+
+    render(
+      <MemoryRouter initialEntries={['/app/snapshots/snapshot-1']}>
+        <Routes>
+          <Route path="/app/snapshots/:snapshotId" element={<SnapshotPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText(/Bản clone tĩnh một trang/i)).toBeInTheDocument()
+    expect(screen.getByText(/Hoàn tất một phần · 5 file đã đóng gói/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Tải bản clone/i }))
+
+    await waitFor(() => {
+      expect(webLensService.getReconstructionArchive).toHaveBeenCalledWith('reconstruction-1')
+      expect(click).toHaveBeenCalledOnce()
+    })
+    expect(document.querySelector('iframe')).not.toBeInTheDocument()
+  })
 })

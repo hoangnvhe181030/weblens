@@ -200,5 +200,6 @@ export interface ApiCaptureSnapshot {
   diff: NonNullable<import('../domain/types').PageSnapshot['diff']>
   performance: NonNullable<import('../domain/types').PageSnapshot['performance']>
   artifacts: NonNullable<import('../domain/types').PageSnapshot['artifacts']>
+  reconstruction: import('../domain/types').StaticReconstruction | null
   resources: import('../domain/types').CapturedResource[]
 }

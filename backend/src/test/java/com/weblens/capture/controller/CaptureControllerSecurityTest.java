@@ -126,6 +126,40 @@ class CaptureControllerSecurityTest {
     }
 
     @Test
+    void reconstructionArchiveRequiresUserAuthentication() throws Exception {
+        mvc.perform(get(
+                        "/api/v1/reconstructions/{reconstructionId}/artifacts/archive",
+                        UUID.randomUUID()
+                ))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void reconstructionArchiveIsAlwaysReturnedAsZipAttachment() throws Exception {
+        UUID userId = UUID.randomUUID();
+        UUID reconstructionId = UUID.randomUUID();
+        byte[] archive = "PK-static-clone".getBytes(StandardCharsets.UTF_8);
+        given(captures.getReconstructionArchive(userId, reconstructionId))
+                .willReturn(new CaptureArtifactContent(archive, "application/zip", "\"sha256-clone\""));
+
+        mvc.perform(get(
+                        "/api/v1/reconstructions/{reconstructionId}/artifacts/archive",
+                        reconstructionId
+                ).with(jwt().jwt(token -> token.subject(userId.toString()))))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.parseMediaType("application/zip")))
+                .andExpect(content().bytes(archive))
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(header().string(
+                        HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"weblens-static-clone.zip\""
+                ))
+                .andExpect(header().string("X-Content-Type-Options", "nosniff"))
+                .andExpect(header().string(HttpHeaders.ETAG, "\"sha256-clone\""))
+                .andExpect(header().doesNotExist("X-WebLens-Service-Token"));
+    }
+
+    @Test
     void latestReadyCaptureRequiresUserAuthentication() throws Exception {
         mvc.perform(get(
                         "/api/v1/scans/{scanId}/scan-pages/{pageId}/captures/latest-ready",

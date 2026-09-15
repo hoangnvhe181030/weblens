@@ -1,6 +1,7 @@
 # Kiến trúc WebLens V1 và V1.5
 
-Trạng thái: cập nhật theo ADR-005, ADR-006 và E2E TASK-011 ngày 2026-09-13.
+Trạng thái: cập nhật theo ADR-005, ADR-006, ADR-007, E2E TASK-011 và TASK-013
+ngày 2026-09-14.
 
 ## Trạng thái hiện tại
 
@@ -10,6 +11,8 @@ crawler lưu workflow trong PostgreSQL và analytical fact trong ClickHouse. Cap
 Worker lưu workflow trong PostgreSQL, rendered/network fact trong ClickHouse và
 artifact lớn trong MinIO. E2E đăng ký → website → scan → page evidence → capture →
 snapshot đã đạt; capacity production vẫn cần benchmark trên phần cứng triển khai.
+Clone tĩnh một trang của TASK-013 cũng đã đạt E2E với staged publish, SHA-256,
+download owner-scoped và retention GC; clone toàn website không thuộc lát cắt này.
 
 PostgreSQL production được tự triển khai theo
 [ADR-004](adr/ADR-004-self-hosted-postgresql.md). Kiến trúc ba deployable và cách
@@ -146,6 +149,15 @@ watermark và reconciliation.
    `Content-Disposition` an toàn. UI không nhận credential/object-storage URL và
    không thực thi artifact. Presigned URL chỉ được xem xét lại khi benchmark chứng
    minh proxy streaming là bottleneck.
+8. Trong cùng Playwright session, worker ánh xạ raw URL chỉ trong RAM để rewrite
+   HTML/CSS, tạo manifest và ZIP clone tĩnh một trang. Query value không được ghi
+   vào PostgreSQL, ClickHouse, manifest hoặc log.
+9. Worker upload archive ngoài transaction, rồi publish reconstruction metadata
+   theo capture lease generation. Stale worker không được công bố artifact thắng;
+   clone partial/failed không làm capture evidence thất bại.
+10. `reconstruction_jobs` và `reconstruction_artifacts` thuộc Capture Worker
+    PostgreSQL; ZIP/manifest nằm trong MinIO và hết hạn sau 7 ngày. Không có
+    cross-service FK hoặc distributed transaction.
 
 ## Giao tiếp và consistency contract
 

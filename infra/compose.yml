@@ -106,6 +106,7 @@ services:
       WEBLENS_SERVICE_TOKEN: ${WEBLENS_SERVICE_TOKEN}
       WEBLENS_CONTROL_CAPTURE_EVENT_URL: http://host.docker.internal:8080/internal/v1/events/captures
       CAPTURE_CONCURRENCY: ${CAPTURE_CONCURRENCY:-2}
+      CAPTURE_RECONSTRUCTION_GC_POLL_MS: ${CAPTURE_RECONSTRUCTION_GC_POLL_MS:-30000}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

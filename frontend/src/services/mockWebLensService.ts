@@ -19,6 +19,7 @@ export interface WebLensService {
   getSnapshot(id: string): Promise<PageSnapshot>
   getCaptureScreenshot(id: string): Promise<Blob>
   getCapturedResource(captureId: string, resourceId: string): Promise<Blob>
+  getReconstructionArchive(reconstructionId: string): Promise<Blob>
 }
 
 const demoWebsites = [...websites]
@@ -55,4 +56,5 @@ export const mockWebLensService: WebLensService = {
   async getSnapshot(id) { await delay(); if (id !== snapshot.id) throw notFound('bản chụp'); return snapshot },
   async getCaptureScreenshot() { throw new Error('Ảnh screenshot không có trong chế độ mock.') },
   async getCapturedResource() { throw new Error('Resource body không có trong chế độ mock.') },
+  async getReconstructionArchive() { throw new Error('Archive clone không có trong chế độ mock.') },
 }

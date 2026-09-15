@@ -94,6 +94,7 @@ export const backendWebLensService: WebLensService = {
       diff: source.diff,
       performance: source.performance,
       artifacts: source.artifacts,
+      reconstruction: source.reconstruction,
       resources: source.resources,
     }
   },
@@ -105,6 +106,12 @@ export const backendWebLensService: WebLensService = {
   async getCapturedResource(captureId, resourceId): Promise<Blob> {
     return apiBlobRequest(
       `/api/v1/captures/${encodeURIComponent(captureId)}/resources/${encodeURIComponent(resourceId)}/content`,
+    )
+  },
+
+  async getReconstructionArchive(reconstructionId): Promise<Blob> {
+    return apiBlobRequest(
+      `/api/v1/reconstructions/${encodeURIComponent(reconstructionId)}/artifacts/archive`,
     )
   },
 }

@@ -4,6 +4,7 @@ import com.weblens.auth.security.AuthenticatedUserId;
 import com.weblens.capture.dto.CaptureArtifactContent;
 import com.weblens.capture.dto.CaptureResponse;
 import com.weblens.capture.dto.CaptureSnapshotResponse;
+import com.weblens.capture.dto.ReconstructionResponse;
 import com.weblens.capture.service.CaptureService;
 import com.weblens.common.config.OpenApiConfig;
 import com.weblens.common.logging.CorrelationIdFilter;
@@ -116,6 +117,39 @@ public class CaptureController {
                 .cacheControl(CacheControl.noStore())
                 .header(HttpHeaders.CONTENT_DISPOSITION,
                         ContentDisposition.attachment().filename("captured-resource.bin").build().toString());
+        if (artifact.etag() != null && !artifact.etag().isBlank()) {
+            response.eTag(artifact.etag());
+        }
+        return response.body(bytes);
+    }
+
+    @GetMapping("/captures/{captureId}/reconstruction")
+    @Operation(summary = "Get static clone reconstruction status")
+    ReconstructionResponse getReconstruction(
+            @AuthenticationPrincipal Jwt jwt,
+            @PathVariable UUID captureId
+    ) {
+        return captures.getReconstruction(AuthenticatedUserId.from(jwt), captureId);
+    }
+
+    @GetMapping(value = "/reconstructions/{reconstructionId}/artifacts/archive",
+            produces = "application/zip")
+    @Operation(summary = "Download one owner-authorized static clone archive")
+    ResponseEntity<byte[]> getReconstructionArchive(
+            @AuthenticationPrincipal Jwt jwt,
+            @PathVariable UUID reconstructionId
+    ) {
+        CaptureArtifactContent artifact = captures.getReconstructionArchive(
+                AuthenticatedUserId.from(jwt), reconstructionId
+        );
+        byte[] bytes = artifact.bytes();
+        ResponseEntity.BodyBuilder response = ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType("application/zip"))
+                .contentLength(bytes.length)
+                .cacheControl(CacheControl.noStore())
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        ContentDisposition.attachment().filename("weblens-static-clone.zip").build().toString())
+                .header("X-Content-Type-Options", "nosniff");
         if (artifact.etag() != null && !artifact.etag().isBlank()) {
             response.eTag(artifact.etag());
         }

@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { chromium, type Browser, type BrowserContext, type Request, type Response } from 'playwright'
 import { assertPublicHttpUrl } from './security.js'
 import { SafeProxy } from './safe-proxy.js'
+import { buildStaticClone, planStaticClone } from './static-clone.js'
 import type {
   CaptureCommandPayload,
   CaptureResult,
+  CloneInputResource,
   DiffSummary,
   Measurement,
   NetworkRecord,
@@ -22,9 +24,11 @@ interface BrowserMetricState {
 interface ResponseCandidate {
   response: Response
   sequence: number
-  url: string
+  sourceUrl: string
+  publicUrl: string
   resourceType: string
   mimeType: string
+  captureBody: boolean
 }
 
 const bodyResourceTypes = new Set(['stylesheet', 'script', 'image', 'font'])
@@ -49,6 +53,8 @@ export async function capturePage(command: CaptureCommandPayload): Promise<Captu
   const requestStarted = new Map<Request, { started: number; sequence: number }>()
   const network: NetworkRecord[] = []
   const candidates: ResponseCandidate[] = []
+  const failedCloneInputs: CloneInputResource[] = []
+  let bodyCandidateCount = 0
   let sequence = 0
   let totalTransferBytes = 0
 
@@ -115,8 +121,18 @@ export async function capturePage(command: CaptureCommandPayload): Promise<Captu
       durationMs: Math.max(0, Date.now() - tracked.started),
       failureCode: '',
     })
-    if (bodyResourceTypes.has(resourceType) && candidates.length < command.maxResourceBodies) {
-      candidates.push({ response, sequence: tracked.sequence, url: sanitizeUrl(response.url()), resourceType, mimeType })
+    if (bodyResourceTypes.has(resourceType) && candidates.length < command.maxNetworkRequests) {
+      const captureBody = bodyCandidateCount < command.maxResourceBodies
+      if (captureBody) bodyCandidateCount += 1
+      candidates.push({
+        response,
+        sequence: tracked.sequence,
+        sourceUrl: response.url(),
+        publicUrl: sanitizeUrl(response.url()),
+        resourceType,
+        mimeType,
+        captureBody,
+      })
     }
   })
   page.on('requestfailed', (request) => {
@@ -130,6 +146,19 @@ export async function capturePage(command: CaptureCommandPayload): Promise<Captu
       durationMs: Math.max(0, Date.now() - tracked.started),
       failureCode: capText(request.failure()?.errorText ?? 'REQUEST_FAILED', 64),
     })
+    const resourceType = capText(request.resourceType(), 32)
+    if (bodyResourceTypes.has(resourceType) && failedCloneInputs.length < command.maxNetworkRequests) {
+      failedCloneInputs.push({
+        sequence: tracked.sequence,
+        sourceUrl: request.url(),
+        publicUrl: sanitizeUrl(request.url()),
+        resourceType,
+        mimeType: '',
+        body: null,
+        wasTruncated: false,
+        skipReason: 'REQUEST_FAILED',
+      })
+    }
   })
 
     await page.goto(command.targetUrl, { waitUntil: 'load', timeout: command.timeoutSeconds * 1000 })
@@ -138,7 +167,7 @@ export async function capturePage(command: CaptureCommandPayload): Promise<Captu
     if (Date.now() - started > command.timeoutSeconds * 1000) throw new Error('CAPTURE_TIMEOUT')
 
     const observedAt = new Date().toISOString()
-    const rendered = await extractRenderedMetadata(page)
+    const rendered = sanitizeRenderedMetadata(await extractRenderedMetadata(page))
     const browserMetrics = await page.evaluate(() => {
       return (window as unknown as { __weblensMetrics?: BrowserMetricState }).__weblensMetrics
         ?? { lcp: null, cls: 0, lcpObserved: false, clsObserved: false }
@@ -151,16 +180,23 @@ export async function capturePage(command: CaptureCommandPayload): Promise<Captu
     const html = Buffer.from(await page.content(), 'utf8')
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false })
     if (html.length + screenshot.length > command.maxTotalBytes) throw new Error('CAPTURE_BYTE_BUDGET_EXCEEDED')
-    const resourceBodies = await collectResourceBodies(
+    const collected = await collectResourceBodies(
       candidates,
       command.maxResourceBytes,
       command.maxTotalBytes - html.length - screenshot.length,
     )
+    const resourceBodies = collected.bodies
     const bodyBytes = resourceBodies.reduce((total, resource) => total + resource.body.length, 0)
     if (totalTransferBytes > command.maxTotalBytes) throw new Error('CAPTURE_TRANSFER_BUDGET_EXCEEDED')
-    const finalUrl = (await assertPublicHttpUrl(page.url())).toString()
+    const sourceFinalUrl = (await assertPublicHttpUrl(page.url())).toString()
+    const reconstruction = await createReconstruction(
+      page,
+      sourceFinalUrl,
+      html,
+      [...collected.cloneInputs, ...failedCloneInputs].sort((left, right) => left.sequence - right.sequence),
+    )
     return {
-      finalUrl,
+      finalUrl: sanitizeUrl(sourceFinalUrl),
       html,
       screenshot: Buffer.from(screenshot),
       rendered,
@@ -171,11 +207,23 @@ export async function capturePage(command: CaptureCommandPayload): Promise<Captu
       browserVersion: capText(browser.version(), 64),
       observedAt,
       totalTransferBytes: Math.min(totalTransferBytes + bodyBytes, command.maxTotalBytes),
+      reconstruction,
     }
   } finally {
     await context?.close().catch(() => undefined)
     await browser?.close().catch(() => undefined)
     await proxy.close().catch(() => undefined)
+  }
+}
+
+function sanitizeRenderedMetadata(value: RenderedMetadata): RenderedMetadata {
+  return {
+    ...value,
+    canonicalUrl: value.canonicalUrl ? sanitizeUrl(value.canonicalUrl) : '',
+    openGraph: {
+      ...value.openGraph,
+      imageUrl: value.openGraph.imageUrl ? sanitizeUrl(value.openGraph.imageUrl) : '',
+    },
   }
 }
 
@@ -270,28 +318,135 @@ async function collectResourceBodies(
   candidates: ResponseCandidate[],
   maxResourceBytes: number,
   remainingBudget: number,
-): Promise<ResourceBody[]> {
+): Promise<{ bodies: ResourceBody[]; cloneInputs: CloneInputResource[] }> {
   const bodies: ResourceBody[] = []
+  const cloneInputs: CloneInputResource[] = []
   let remaining = Math.max(0, remainingBudget)
   for (const candidate of candidates) {
-    if (remaining <= 0) break
+    if (!candidate.captureBody) {
+      cloneInputs.push(cloneInput(candidate, null, false, 'RESOURCE_BODY_COUNT_LIMIT'))
+      continue
+    }
+    if (remaining <= 0) {
+      cloneInputs.push(cloneInput(candidate, null, false, 'CAPTURE_BYTE_BUDGET_EXCEEDED'))
+      continue
+    }
     try {
       await candidate.response.finished()
       const raw = Buffer.from(await candidate.response.body())
-      if (raw.length === 0) continue
+      if (raw.length === 0) {
+        cloneInputs.push(cloneInput(candidate, null, false, 'EMPTY_BODY'))
+        continue
+      }
       const allowed = Math.min(maxResourceBytes, remaining)
       const body = raw.subarray(0, allowed)
       bodies.push({
-        resourceId: randomUUID(), sequence: candidate.sequence, url: candidate.url,
+        resourceId: randomUUID(), sequence: candidate.sequence, url: candidate.publicUrl,
         resourceType: candidate.resourceType, mimeType: candidate.mimeType,
         body, wasTruncated: raw.length > body.length,
       })
+      cloneInputs.push(cloneInput(candidate, body, raw.length > body.length, null))
       remaining -= body.length
     } catch {
       // Resource bodies are optional evidence; network metadata remains authoritative.
+      cloneInputs.push(cloneInput(candidate, null, false, 'BODY_UNAVAILABLE'))
     }
   }
-  return bodies
+  return { bodies, cloneInputs }
+}
+
+function cloneInput(
+  candidate: ResponseCandidate,
+  body: Buffer | null,
+  wasTruncated: boolean,
+  skipReason: string | null,
+): CloneInputResource {
+  return {
+    sequence: candidate.sequence,
+    sourceUrl: candidate.sourceUrl,
+    publicUrl: candidate.publicUrl,
+    resourceType: candidate.resourceType,
+    mimeType: candidate.mimeType,
+    body,
+    wasTruncated,
+    skipReason,
+  }
+}
+
+async function createReconstruction(
+  page: import('playwright').Page,
+  finalUrl: string,
+  html: Buffer,
+  resources: CloneInputResource[],
+): Promise<CaptureResult['reconstruction']> {
+  try {
+    const plan = planStaticClone(finalUrl, resources, html.length)
+    const cloneHtml = Buffer.from(await rewriteRenderedHtml(page, finalUrl, plan.replacements), 'utf8')
+    return await buildStaticClone(plan, cloneHtml)
+  } catch {
+    return {
+      status: 'FAILED', engineVersion: 'weblens-1/pagesource-0.1.2@f59ed61',
+      discoveredCount: 1 + resources.length, packagedCount: 0,
+      skippedCount: resources.length, inputBytes: 0, archiveBytes: null,
+      completenessCode: null, failureCode: 'CLONE_BUILD_FAILED', archivePath: null,
+      temporaryDirectory: null, manifest: null,
+    }
+  }
+}
+
+async function rewriteRenderedHtml(
+  page: import('playwright').Page,
+  finalUrl: string,
+  replacements: Record<string, string>,
+): Promise<string> {
+  return page.evaluate(({ baseUrl, paths }) => {
+    const redactOrReplace = (raw: string): string => {
+      if (!raw || /^(?:data|blob|about|javascript|chrome|chrome-extension):/iu.test(raw)) return raw
+      try {
+        const target = new URL(raw, document.baseURI || baseUrl)
+        const fragment = target.hash
+        target.hash = ''
+        const replacement = paths[target.toString()]
+        if (replacement) return replacement + fragment
+        target.username = ''
+        target.password = ''
+        for (const key of [...target.searchParams.keys()]) {
+          target.searchParams.delete(key)
+          target.searchParams.append(key, '[REDACTED]')
+        }
+        return target.toString() + fragment
+      } catch { return '' }
+    }
+    const rewriteCssUrls = (value: string): string => value.replace(
+      /url\(\s*(['"]?)(.*?)\1\s*\)/giu,
+      (_match, quote: string, raw: string) => `url(${quote}${redactOrReplace(raw)}${quote})`,
+    )
+    const clone = document.documentElement.cloneNode(true) as HTMLElement
+    clone.querySelectorAll('base').forEach((element) => element.remove())
+    const elements = [clone, ...clone.querySelectorAll<HTMLElement>('*')]
+    for (const element of elements) {
+      for (const attribute of ['src', 'href', 'poster']) {
+        const raw = element.getAttribute(attribute)
+        if (raw !== null) element.setAttribute(attribute, redactOrReplace(raw))
+      }
+      const srcset = element.getAttribute('srcset')
+      if (srcset !== null) {
+        element.setAttribute('srcset', srcset.split(',').map((candidate) => {
+          const [raw, ...descriptor] = candidate.trim().split(/\s+/u)
+          return raw ? [redactOrReplace(raw), ...descriptor].join(' ') : ''
+        }).filter(Boolean).join(', '))
+      }
+      const style = element.getAttribute('style')
+      if (style !== null) element.setAttribute('style', rewriteCssUrls(style))
+    }
+    clone.querySelectorAll('style').forEach((element) => {
+      element.textContent = rewriteCssUrls(element.textContent ?? '')
+    })
+    const doctype = document.doctype
+      ? `<!DOCTYPE ${document.doctype.name}>\n`
+      : '<!DOCTYPE html>\n'
+    return doctype + clone.outerHTML
+  }, { baseUrl: finalUrl, paths: replacements })
 }
 
 function diff(staticValue: CaptureCommandPayload['staticObservation'], rendered: RenderedMetadata, at: string): DiffSummary {

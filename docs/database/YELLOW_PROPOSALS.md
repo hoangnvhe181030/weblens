@@ -1,13 +1,12 @@
 # Đề xuất schema YELLOW
 
-Trạng thái: tất cả các bảng bên dưới đều **CHỜ PHÊ DUYỆT**. Tài liệu này không cho
-phép tạo migration, entity, runtime module hoặc hành vi lập lịch. Kiểu dữ liệu,
-khóa, index và trạng thái vòng đời chỉ là phương án để thảo luận, không phải schema
-cuối cùng. Chưa giả định throughput hoặc thời gian lưu giữ.
+Trạng thái: `reconstruction_jobs` và `reconstruction_artifacts` đã được phê duyệt
+cho đúng phạm vi ADR-007 ngày 2026-09-13. Bảy bảng YELLOW còn lại vẫn **CHỜ PHÊ
+DUYỆT** và chưa được phép tạo migration, entity hoặc runtime module.
 
 Theo roadmap, giải thích bằng AI thuộc V3, monitoring/alert thuộc V4, truy xuất
-knowledge thuộc V6 và ML thuộc V7. Reconstruction chưa có định nghĩa sản phẩm
-hoặc release phase được phê duyệt. Các đề xuất này không thay đổi ranh giới đó.
+knowledge thuộc V6 và ML thuộc V7. Reconstruction clone tĩnh một trang thuộc
+V1.5 theo ADR-007; việc reconstruction khác vẫn chưa được phê duyệt.
 
 ## Quy ước dự kiến dùng chung
 
@@ -197,10 +196,16 @@ hữu retry và cancellation? Quota token/cost và truy vấn báo cáo? Retenti
 prompt thô, redaction, output expiry và metadata usage nào được phép sống lâu hơn
 output?
 
-## 8. reconstruction_jobs — CHỜ PHÊ DUYỆT; chưa rõ ý nghĩa sản phẩm
+## 8. reconstruction_jobs — ĐƯỢC PHÊ DUYỆT CHO ADR-007
 
-Chỉ tên bảng không đủ xác định reconstruction là phát lại snapshot, đóng gói
-resource hay sinh mã website bằng AI. Chưa có phương án nào được phê duyệt.
+Người dùng đã làm rõ proposal đầu tiên: reconstruction là gói clone tĩnh
+best-effort của **một trang browser capture**, tham khảo hành vi của Pagesource;
+không phải sinh mã bằng AI, clone toàn bộ website hoặc khôi phục source/backend
+gốc. Quyết định kiến trúc và schema chi tiết đã được duyệt tại
+`docs/adr/ADR-007-tich-hop-pagesource-cho-ban-clone-tinh.md` và
+`docs/database/RECONSTRUCTION_STATIC_CLONE_PROPOSAL.md`.
+
+Revision 1 được người dùng phê duyệt ngày 2026-09-13 để implementation.
 
 Nếu một workflow reconstruction bất đồng bộ được duyệt, các trường dự kiến có thể
 gồm `id`, `owner_id`, tham chiếu source evidence chưa giải quyết, kind/version
@@ -218,10 +223,12 @@ hoặc mã được sinh không? Phải định nghĩa isolation, quyền với 
 vi khi evidence thiếu, khả năng tái lập, cancellation và retention source/output
 trước khi chọn schema. Không tự suy ra quan hệ cuối với snapshot/resource.
 
-## 9. reconstruction_artifacts — CHỜ PHÊ DUYỆT; phụ thuộc reconstruction_jobs
+## 9. reconstruction_artifacts — ĐƯỢC PHÊ DUYỆT CHO ADR-007
 
-Mục đích có điều kiện: lập chỉ mục output của reconstruction job đã được phê duyệt
-mà không lưu payload lớn trong hàng quan hệ.
+Mục đích có điều kiện: lập chỉ mục archive ZIP và manifest của reconstruction job
+đã được phê duyệt mà không lưu payload lớn trong hàng quan hệ. Proposal hiện tại
+đặt payload trong MinIO và chỉ giữ private object reference, byte, SHA-256,
+retention và publication state trong Capture Worker PostgreSQL.
 
 Các trường dự kiến: `id`, `owner_id`, `reconstruction_job_id`, artifact kind,
 logical filename, private object reference, checksum, media type, byte size,
@@ -243,7 +250,8 @@ bị thiếu? Retention, xóa object dùng chung và cách ly viewer khỏi HTML
 
 ## Hồ sơ phê duyệt
 
-Với mỗi bảng, phải ghi revision đề xuất, trách nhiệm và vòng đời đã duyệt, quyền
-sở hữu/visibility, phụ thuộc RED chưa giải quyết, retention, ngữ nghĩa lỗi được
-chấp nhận, quyết định của người review và ngày review. Cho đến khi có hồ sơ này,
-cả chín bảng vẫn giữ trạng thái CHỜ PHÊ DUYỆT.
+Hồ sơ revision 1 cho hai bảng reconstruction nằm tại
+`docs/database/RECONSTRUCTION_STATIC_CLONE_PROPOSAL.md`: Capture Worker sở hữu,
+owner-private, retention 7 ngày, không FK xuyên service và capture thành công độc
+lập với clone. Quyết định: Accepted ngày 2026-09-13. Bảy bảng YELLOW khác vẫn chờ
+hồ sơ review riêng.

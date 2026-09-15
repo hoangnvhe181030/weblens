@@ -38,6 +38,8 @@ export function SnapshotPage() {
   } | null>(null)
   const [downloadingResourceId, setDownloadingResourceId] = useState<string | null>(null)
   const [resourceDownloadError, setResourceDownloadError] = useState<string | null>(null)
+  const [cloneDownloading, setCloneDownloading] = useState(false)
+  const [cloneDownloadError, setCloneDownloadError] = useState<string | null>(null)
   const filtered = useMemo(
     () => snapshot?.resources.filter((resource) => (
       (type === 'all' || resource.type === type)
@@ -115,6 +117,29 @@ export function SnapshotPage() {
     }`.trim()
   }
 
+  const downloadClone = async () => {
+    if (!snapshot?.reconstruction?.downloadAvailable || cloneDownloading) return
+    setCloneDownloading(true)
+    setCloneDownloadError(null)
+    try {
+      const blob = await webLensService.getReconstructionArchive(snapshot.reconstruction.id)
+      if (blob.type && blob.type !== 'application/zip') throw new Error('Archive không có định dạng ZIP hợp lệ.')
+      const objectUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = objectUrl
+      anchor.download = 'weblens-static-clone.zip'
+      anchor.rel = 'noopener'
+      document.body.append(anchor)
+      anchor.click()
+      anchor.remove()
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
+    } catch (downloadError) {
+      setCloneDownloadError(downloadError instanceof Error ? downloadError.message : 'Không thể tải bản clone.')
+    } finally {
+      setCloneDownloading(false)
+    }
+  }
+
   if (loading) return <div className="app-page"><LoadingState label="Đang tải snapshot…" /></div>
   if (error || !snapshot) return <div className="app-page"><ErrorState title="Không tìm thấy snapshot" /></div>
 
@@ -141,6 +166,39 @@ export function SnapshotPage() {
         <div><Clock3 /><span><small>CLS LAB</small><strong>{metric('cls')}</strong></span></div>
         <div><Clock3 /><span><small>TTFB LAB</small><strong>{metric('ttfb')}</strong></span></div>
         <div><Braces /><span><small>CHROMIUM</small><strong>{snapshot.browserVersion ?? 'Không xác định'}</strong></span></div>
+      </section>
+
+      <section className="content-card reconstruction-card" aria-labelledby="reconstruction-title">
+        <div className="reconstruction-copy">
+          <span className="page-kicker">PAGESOURCE STATIC CLONE</span>
+          <h2 id="reconstruction-title">Bản clone tĩnh một trang</h2>
+          {snapshot.reconstruction
+            ? (
+              <p>
+                {cloneStatus(snapshot.reconstruction.status)} · {snapshot.reconstruction.packagedCount} file đã đóng gói
+                · {snapshot.reconstruction.skippedCount} file bỏ qua
+                {snapshot.reconstruction.archiveBytes ? ` · ${formatBytes(snapshot.reconstruction.archiveBytes)}` : ''}
+              </p>
+            )
+            : <p>Capture này được tạo trước khi tính năng clone tĩnh được bật.</p>}
+          {snapshot.reconstruction?.completenessCode
+            ? <small>Mức đầy đủ: {snapshot.reconstruction.completenessCode}</small>
+            : null}
+          {snapshot.reconstruction?.failureCode
+            ? <small className="reconstruction-error">Lỗi: {snapshot.reconstruction.failureCode}</small>
+            : null}
+          {cloneDownloadError ? <small className="reconstruction-error" role="alert">{cloneDownloadError}</small> : null}
+        </div>
+        <button
+          className="primary-action reconstruction-download"
+          type="button"
+          disabled={!snapshot.reconstruction?.downloadAvailable || cloneDownloading}
+          onClick={() => void downloadClone()}
+        >
+          {cloneDownloading ? <LoaderCircle className="spin" /> : <Download />}
+          {cloneDownloading ? 'Đang tải…' : 'Tải bản clone'}
+        </button>
+        <p className="reconstruction-safety">ZIP chỉ để tải xuống; WebLens không preview hoặc chạy HTML/JavaScript bên trong.</p>
       </section>
 
       <div className="snapshot-layout">
@@ -285,4 +343,16 @@ function signed(value: number): string {
 
 function shortHash(value: string | null): string {
   return value ? `${value.slice(0, 12)}…` : 'không có'
+}
+
+function cloneStatus(status: NonNullable<import('../domain/types').PageSnapshot['reconstruction']>['status']): string {
+  const labels = {
+    QUEUED: 'Đang chờ',
+    RUNNING: 'Đang tạo',
+    PUBLISHED: 'Hoàn chỉnh',
+    PARTIAL: 'Hoàn tất một phần',
+    FAILED: 'Tạo clone thất bại',
+    EXPIRED: 'Đã hết hạn',
+  } satisfies Record<typeof status, string>
+  return labels[status]
 }

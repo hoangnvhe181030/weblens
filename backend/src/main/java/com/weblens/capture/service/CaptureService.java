@@ -4,6 +4,7 @@ import com.weblens.auth.service.CurrentUserService;
 import com.weblens.capture.dto.CaptureArtifactContent;
 import com.weblens.capture.dto.CaptureResponse;
 import com.weblens.capture.dto.CaptureSnapshotResponse;
+import com.weblens.capture.dto.ReconstructionResponse;
 import com.weblens.capture.client.CaptureReportClient;
 import com.weblens.capture.entity.CaptureRequestEntity;
 import com.weblens.capture.model.CaptureStatus;
@@ -151,6 +152,20 @@ public class CaptureService {
     public CaptureArtifactContent getResourceBody(UUID ownerId, UUID captureId, UUID resourceId) {
         requireReady(ownerId, captureId);
         return captureReports.getResourceBody(ownerId, captureId, resourceId);
+    }
+
+    public ReconstructionResponse getReconstruction(UUID ownerId, UUID captureId) {
+        requireReady(ownerId, captureId);
+        ReconstructionResponse response = captureReports.getReconstruction(ownerId, captureId);
+        if (response == null) {
+            throw new NotFoundException("RECONSTRUCTION_NOT_FOUND", "The static reconstruction does not exist.");
+        }
+        return response;
+    }
+
+    public CaptureArtifactContent getReconstructionArchive(UUID ownerId, UUID reconstructionId) {
+        currentUsers.requireActive(ownerId);
+        return captureReports.getReconstructionArchive(ownerId, reconstructionId);
     }
 
     private void requireReady(UUID ownerId, UUID captureId) {

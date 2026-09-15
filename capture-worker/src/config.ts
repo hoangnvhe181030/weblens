@@ -16,6 +16,7 @@ export interface Config {
   workerPollMillis: number
   analyticsPollMillis: number
   eventPollMillis: number
+  reconstructionGcPollMillis: number
 }
 
 function required(name: string): string {
@@ -56,5 +57,6 @@ export function loadConfig(): Config {
     workerPollMillis: integer('CAPTURE_WORKER_POLL_MS', 500, 100, 60_000),
     analyticsPollMillis: integer('CAPTURE_ANALYTICS_POLL_MS', 500, 100, 60_000),
     eventPollMillis: integer('CAPTURE_EVENT_POLL_MS', 500, 100, 60_000),
+    reconstructionGcPollMillis: integer('CAPTURE_RECONSTRUCTION_GC_POLL_MS', 30_000, 1_000, 300_000),
   }
 }

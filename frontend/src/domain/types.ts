@@ -137,6 +137,20 @@ export interface CapturedResource {
   bodyTruncated: boolean
 }
 
+export interface StaticReconstruction {
+  id: string
+  status: 'QUEUED' | 'RUNNING' | 'PUBLISHED' | 'PARTIAL' | 'FAILED' | 'EXPIRED'
+  kind: 'STATIC_PAGE_ARCHIVE'
+  engineVersion: string
+  packagedCount: number
+  skippedCount: number
+  archiveBytes: number | null
+  completenessCode: string | null
+  failureCode: string | null
+  expiresAt: string | null
+  downloadAvailable: boolean
+}
+
 export interface PageSnapshot {
   id: string
   scanPageId: string
@@ -180,6 +194,7 @@ export interface PageSnapshot {
     unavailableReason: string | null
   }>
   artifacts?: { renderedHtmlBytes: number; screenshotBytes: number }
+  reconstruction?: StaticReconstruction | null
   resources: CapturedResource[]
 }
 

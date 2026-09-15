@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
-import { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
+import { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 import type { Config } from './config.js'
 import type { StoredObject } from './types.js'
 
@@ -33,6 +35,28 @@ export class ObjectStorage {
       Metadata: { sha256: sha256.toString('hex') },
     }))
     return { bucket: this.config.s3Bucket, key, bytes: body.length, sha256, contentType }
+  }
+
+  async putFile(key: string, path: string, contentType: string, maxBytes: number): Promise<StoredObject> {
+    const size = (await stat(path)).size
+    if (size <= 0 || size > maxBytes) throw new Error('ARTIFACT_SIZE_OUT_OF_BOUNDS')
+    const hash = createHash('sha256')
+    for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer)
+    const sha256 = hash.digest()
+    await this.client.send(new PutObjectCommand({
+      Bucket: this.config.s3Bucket,
+      Key: key,
+      Body: createReadStream(path),
+      ContentLength: size,
+      ContentType: contentType,
+      Metadata: { sha256: sha256.toString('hex') },
+    }))
+    return { bucket: this.config.s3Bucket, key, bytes: size, sha256, contentType }
+  }
+
+  async delete(object: StoredObject): Promise<void> {
+    if (object.bucket !== this.config.s3Bucket) throw new Error('INVALID_STORAGE_BUCKET')
+    await this.client.send(new DeleteObjectCommand({ Bucket: object.bucket, Key: object.key }))
   }
 
   async get(bucket: string, key: string): Promise<Buffer> {

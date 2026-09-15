@@ -11,6 +11,7 @@ const maxCommandBytes = 64 * 1024
 type CaptureServerDatabase = Pick<
   CaptureDatabase,
   'ping' | 'acceptCommand' | 'getSnapshot' | 'getScreenshotReference' | 'getResourceReference'
+  | 'getReconstruction' | 'getReconstructionArchiveReference'
 >
 type CaptureServerAnalytics = Pick<CaptureAnalytics, 'ping' | 'listResources'>
 
@@ -58,6 +59,30 @@ export function startServer(
           reference.sha256Hex,
           'application/octet-stream',
           'attachment; filename="captured-resource.bin"',
+        )
+      }
+      const reconstructionMatch = /^\/internal\/v1\/reports\/captures\/([0-9a-f-]+)\/reconstruction$/u.exec(url.pathname)
+      if (request.method === 'GET' && reconstructionMatch?.[1]) {
+        const ownerId = url.searchParams.get('ownerId') ?? ''
+        const reconstruction = await database.getReconstruction(ownerId, reconstructionMatch[1])
+        if (!reconstruction) return problem(response, 404, 'RECONSTRUCTION_NOT_FOUND')
+        return json(response, 200, reconstructionResponse(reconstruction))
+      }
+      const archiveMatch = /^\/internal\/v1\/reports\/reconstructions\/([0-9a-f-]+)\/artifacts\/archive$/u.exec(url.pathname)
+      if (request.method === 'GET' && archiveMatch?.[1]) {
+        const ownerId = url.searchParams.get('ownerId') ?? ''
+        const reference = await database.getReconstructionArchiveReference(ownerId, archiveMatch[1])
+        if (!reference) return problem(response, 404, 'RECONSTRUCTION_ARTIFACT_NOT_FOUND')
+        if (reference.state !== 'PUBLISHED') throw new Error('ARTIFACT_EXPIRED')
+        ensureNotExpired(reference)
+        const artifact = verifyArtifact(await storage.get(reference.bucket, reference.key), reference)
+        return binary(
+          response,
+          200,
+          artifact,
+          reference.sha256Hex,
+          'application/zip',
+          'attachment; filename="weblens-static-clone.zip"',
         )
       }
       const match = /^\/internal\/v1\/reports\/captures\/([0-9a-f-]+)$/u.exec(url.pathname)
@@ -113,7 +138,25 @@ function snapshotResponse(
       renderedHtmlBytes: Number(snapshot['html_bytes'] ?? 0),
       screenshotBytes: Number(snapshot['screenshot_bytes'] ?? 0),
     } : null,
+    reconstruction: reconstructionResponse(snapshot),
     resources,
+  }
+}
+
+function reconstructionResponse(source: Record<string, unknown>): Record<string, unknown> | null {
+  if (!source['reconstruction_id']) return null
+  return {
+    id: source['reconstruction_id'],
+    status: source['reconstruction_status'],
+    kind: source['reconstruction_kind'],
+    engineVersion: source['engine_version'],
+    packagedCount: Number(source['packaged_count'] ?? 0),
+    skippedCount: Number(source['skipped_count'] ?? 0),
+    archiveBytes: source['archive_bytes'] === null ? null : Number(source['archive_bytes']),
+    completenessCode: source['completeness_code'],
+    failureCode: source['failure_code'],
+    expiresAt: source['reconstruction_expires_at'],
+    downloadAvailable: source['reconstruction_download_available'] === true,
   }
 }
 
