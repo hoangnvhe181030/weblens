@@ -53,6 +53,15 @@ class CurrentUserSecurityTest {
     private JwtDecoder jwtDecoder;
 
     @Test
+    void unavailableSessionStoreReturns503RatherThan401() throws Exception {
+        given(jwtDecoder.decode("valid-but-store-down"))
+                .willThrow(new org.springframework.security.oauth2.jwt.JwtException("Session store unavailable"));
+        mvc.perform(get("/api/v1/me").header("Authorization", "Bearer valid-but-store-down"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.code").value("AUTH_SESSION_STORE_UNAVAILABLE"));
+    }
+
+    @Test
     void protectedEndpointReturnsProblemDetailWithoutBearerToken() throws Exception {
         mvc.perform(get("/api/v1/me").header(CorrelationIdFilter.HEADER, "security-test"))
                 .andExpect(status().isUnauthorized())

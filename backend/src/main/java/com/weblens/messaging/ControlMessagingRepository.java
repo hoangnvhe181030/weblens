@@ -37,7 +37,7 @@ public class ControlMessagingRepository {
                 ) values (
                     :messageId, :aggregateType, :aggregateId, :aggregateVersion,
                     :eventType, :contractVersion, :correlationId, cast(:payload as jsonb),
-                    'PENDING', :occurredAt, :occurredAt
+                    'PENDING', clock_timestamp(), :occurredAt
                 )
                 """)
                 .param("messageId", envelope.messageId())
@@ -52,7 +52,7 @@ public class ControlMessagingRepository {
                 .update();
     }
 
-    @Transactional
+    @Transactional(timeout = CommandDispatchExecutor.DATABASE_TIMEOUT_SECONDS)
     public List<OutboxRecord> claim(UUID workerId, int limit, Duration leaseDuration, Instant now) {
         if (limit < 1 || limit > 100) {
             throw new IllegalArgumentException("Outbox claim limit must be between 1 and 100");
@@ -63,15 +63,23 @@ public class ControlMessagingRepository {
                     from outbox_events
                     where aggregate_type = 'SCAN'
                       and event_type in ('SCAN_REQUESTED', 'SCAN_CANCEL_REQUESTED')
-                      and ((status = 'PENDING' and available_at <= :now)
-                           or (status = 'CLAIMED' and lease_expires_at <= :now))
+                      and not exists (
+                          select 1 from outbox_events predecessor
+                          where predecessor.aggregate_type = outbox_events.aggregate_type
+                            and predecessor.aggregate_id = outbox_events.aggregate_id
+                            and predecessor.status <> 'DELIVERED'
+                            and (predecessor.aggregate_version, predecessor.created_at, predecessor.message_id)
+                              < (outbox_events.aggregate_version, outbox_events.created_at, outbox_events.message_id)
+                      )
+                      and ((status in ('PENDING', 'DEAD') and available_at <= statement_timestamp())
+                           or (status = 'CLAIMED' and lease_expires_at <= statement_timestamp()))
                     order by available_at, created_at, message_id
                     for update skip locked
                     limit :limit
                 )
                 update outbox_events outbox
                 set status = 'CLAIMED', lease_owner = :workerId,
-                    lease_expires_at = :leaseUntil,
+                    lease_expires_at = clock_timestamp() + :leaseMillis * interval '1 millisecond',
                     delivery_attempts = delivery_attempts + 1,
                     last_error_code = case
                         when outbox.status = 'CLAIMED' then 'LEASE_EXPIRED'
@@ -83,10 +91,9 @@ public class ControlMessagingRepository {
                           outbox.payload::text, outbox.delivery_attempts,
                           outbox.lease_owner
                 """)
-                .param("now", timestamp(now))
                 .param("limit", limit)
                 .param("workerId", workerId)
-                .param("leaseUntil", timestamp(now.plus(leaseDuration)))
+                .param("leaseMillis", leaseDuration.toMillis())
                 .query((resultSet, rowNumber) -> new OutboxRecord(
                         resultSet.getObject("message_id", UUID.class),
                         resultSet.getObject("correlation_id", UUID.class),
@@ -97,7 +104,7 @@ public class ControlMessagingRepository {
                 .list();
     }
 
-    @Transactional
+    @Transactional(timeout = CommandDispatchExecutor.DATABASE_TIMEOUT_SECONDS)
     public List<OutboxRecord> claimCaptures(UUID workerId, int limit, Duration leaseDuration, Instant now) {
         if (limit < 1 || limit > 100) {
             throw new IllegalArgumentException("Outbox claim limit must be between 1 and 100");
@@ -108,15 +115,23 @@ public class ControlMessagingRepository {
                     from outbox_events
                     where aggregate_type = 'CAPTURE'
                       and event_type = 'CAPTURE_REQUESTED'
-                      and ((status = 'PENDING' and available_at <= :now)
-                           or (status = 'CLAIMED' and lease_expires_at <= :now))
+                      and not exists (
+                          select 1 from outbox_events predecessor
+                          where predecessor.aggregate_type = outbox_events.aggregate_type
+                            and predecessor.aggregate_id = outbox_events.aggregate_id
+                            and predecessor.status <> 'DELIVERED'
+                            and (predecessor.aggregate_version, predecessor.created_at, predecessor.message_id)
+                              < (outbox_events.aggregate_version, outbox_events.created_at, outbox_events.message_id)
+                      )
+                      and ((status in ('PENDING', 'DEAD') and available_at <= statement_timestamp())
+                           or (status = 'CLAIMED' and lease_expires_at <= statement_timestamp()))
                     order by available_at, created_at, message_id
                     for update skip locked
                     limit :limit
                 )
                 update outbox_events outbox
                 set status = 'CLAIMED', lease_owner = :workerId,
-                    lease_expires_at = :leaseUntil,
+                    lease_expires_at = clock_timestamp() + :leaseMillis * interval '1 millisecond',
                     delivery_attempts = delivery_attempts + 1,
                     last_error_code = case
                         when outbox.status = 'CLAIMED' then 'LEASE_EXPIRED'
@@ -128,10 +143,9 @@ public class ControlMessagingRepository {
                           outbox.payload::text, outbox.delivery_attempts,
                           outbox.lease_owner
                 """)
-                .param("now", timestamp(now))
                 .param("limit", limit)
                 .param("workerId", workerId)
-                .param("leaseUntil", timestamp(now.plus(leaseDuration)))
+                .param("leaseMillis", leaseDuration.toMillis())
                 .query((resultSet, rowNumber) -> new OutboxRecord(
                         resultSet.getObject("message_id", UUID.class),
                         resultSet.getObject("correlation_id", UUID.class),
@@ -142,7 +156,7 @@ public class ControlMessagingRepository {
                 .list();
     }
 
-    @Transactional
+    @Transactional(timeout = CommandDispatchExecutor.DATABASE_TIMEOUT_SECONDS)
     public List<OutboxRecord> claimSiteClones(UUID workerId, int limit, Duration leaseDuration, Instant now) {
         if (limit < 1 || limit > 100) {
             throw new IllegalArgumentException("Outbox claim limit must be between 1 and 100");
@@ -153,15 +167,23 @@ public class ControlMessagingRepository {
                     from outbox_events
                     where aggregate_type = 'SITE_CLONE'
                       and event_type in ('SITE_CLONE_REQUESTED', 'SITE_CLONE_CANCEL_REQUESTED')
-                      and ((status = 'PENDING' and available_at <= :now)
-                           or (status = 'CLAIMED' and lease_expires_at <= :now))
+                      and not exists (
+                          select 1 from outbox_events predecessor
+                          where predecessor.aggregate_type = outbox_events.aggregate_type
+                            and predecessor.aggregate_id = outbox_events.aggregate_id
+                            and predecessor.status <> 'DELIVERED'
+                            and (predecessor.aggregate_version, predecessor.created_at, predecessor.message_id)
+                              < (outbox_events.aggregate_version, outbox_events.created_at, outbox_events.message_id)
+                      )
+                      and ((status in ('PENDING', 'DEAD') and available_at <= statement_timestamp())
+                           or (status = 'CLAIMED' and lease_expires_at <= statement_timestamp()))
                     order by available_at, created_at, message_id
                     for update skip locked
                     limit :limit
                 )
                 update outbox_events outbox
                 set status = 'CLAIMED', lease_owner = :workerId,
-                    lease_expires_at = :leaseUntil,
+                    lease_expires_at = clock_timestamp() + :leaseMillis * interval '1 millisecond',
                     delivery_attempts = delivery_attempts + 1,
                     last_error_code = case
                         when outbox.status = 'CLAIMED' then 'LEASE_EXPIRED'
@@ -173,10 +195,9 @@ public class ControlMessagingRepository {
                           outbox.payload::text, outbox.delivery_attempts,
                           outbox.lease_owner
                 """)
-                .param("now", timestamp(now))
                 .param("limit", limit)
                 .param("workerId", workerId)
-                .param("leaseUntil", timestamp(now.plus(leaseDuration)))
+                .param("leaseMillis", leaseDuration.toMillis())
                 .query((resultSet, rowNumber) -> new OutboxRecord(
                         resultSet.getObject("message_id", UUID.class),
                         resultSet.getObject("correlation_id", UUID.class),
@@ -187,34 +208,42 @@ public class ControlMessagingRepository {
                 .list();
     }
 
+    @Transactional(timeout = CommandDispatchExecutor.DATABASE_TIMEOUT_SECONDS)
     public boolean complete(OutboxRecord record, Instant now) {
+        if (!lockClaim(record)) return false;
         return jdbc.sql("""
                 update outbox_events
                 set status = 'DELIVERED', lease_owner = null, lease_expires_at = null,
-                    delivered_at = :now, last_error_code = null
+                    delivered_at = clock_timestamp(), last_error_code = null
                 where message_id = :messageId and status = 'CLAIMED'
                   and lease_owner = :leaseOwner
+                  and delivery_attempts = :attempt and lease_expires_at > clock_timestamp()
                 """)
-                .param("now", timestamp(now))
                 .param("messageId", record.messageId())
                 .param("leaseOwner", record.leaseOwner())
+                .param("attempt", record.deliveryAttempts())
                 .update() == 1;
     }
 
+    @Transactional(timeout = CommandDispatchExecutor.DATABASE_TIMEOUT_SECONDS)
     public boolean retry(OutboxRecord record, String errorCode, Instant now) {
+        if (!lockClaim(record)) return false;
         Duration delay = retryDelay(record.deliveryAttempts(), record.messageId());
         return jdbc.sql("""
                 update outbox_events
                 set status = case when delivery_attempts >= 20 then 'DEAD' else 'PENDING' end,
-                    available_at = :availableAt, lease_owner = null, lease_expires_at = null,
+                    available_at = clock_timestamp() + :delayMillis * interval '1 millisecond',
+                    lease_owner = null, lease_expires_at = null,
                     last_error_code = :errorCode
                 where message_id = :messageId and status = 'CLAIMED'
                   and lease_owner = :leaseOwner
+                  and delivery_attempts = :attempt and lease_expires_at > clock_timestamp()
                 """)
-                .param("availableAt", timestamp(now.plus(delay)))
+                .param("delayMillis", delay.toMillis())
                 .param("errorCode", boundedCode(errorCode))
                 .param("messageId", record.messageId())
                 .param("leaseOwner", record.leaseOwner())
+                .param("attempt", record.deliveryAttempts())
                 .update() == 1;
     }
 
@@ -227,6 +256,18 @@ public class ControlMessagingRepository {
                         resultSet.getBytes("payload_sha256"), resultSet.getString("outcome")
                 ))
                 .optional();
+    }
+
+    private boolean lockClaim(OutboxRecord record) {
+        // Check expiry in the next statement, after any row-lock wait has finished.
+        return jdbc.sql("""
+                select message_id from outbox_events
+                where message_id = :messageId and status = 'CLAIMED'
+                  and lease_owner = :leaseOwner and delivery_attempts = :attempt
+                for update
+                """)
+                .param("messageId", record.messageId()).param("leaseOwner", record.leaseOwner())
+                .param("attempt", record.deliveryAttempts()).query(UUID.class).optional().isPresent();
     }
 
     public void lockInboxMessage(UUID messageId) {
@@ -329,7 +370,7 @@ public class ControlMessagingRepository {
 		long baseMillis = (1L << exponent) * 1_000L;
 		long jitterRange = baseMillis / 2;
 		long jitter = Math.floorMod(messageId.getLeastSignificantBits(), jitterRange + 1);
-		return Duration.ofMillis(baseMillis / 2 + jitter);
+		return Duration.ofMillis(baseMillis / 2 + jitter).plus(attempt >= 20 ? Duration.ofMinutes(5) : Duration.ZERO);
     }
 
     private static String boundedCode(String value) {

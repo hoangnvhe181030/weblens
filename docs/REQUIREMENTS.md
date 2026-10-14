@@ -54,6 +54,15 @@ batch, version đến sai thứ tự, `too many parts`, disk pressure, retention
 
 **Important edge cases:** Repeated failures, disabled users, expired sessions, credential enumeration, concurrent sessions.
 
+**JWT lifecycle (ADR-019, 2026-10-05):** Every access token requires a live Redis
+session matching its owner and an unrevoked, unexpired PostgreSQL session.
+Restoring stale Redis data cannot revive a logged-out session.
+Refresh requires the current refresh credential in
+both Redis and PostgreSQL, with one winner for concurrent rotation. Successful
+logout rejects subsequent access and refresh for that session while preserving
+other sessions. Redis outage returns 503; missing session returns 401 and requires
+login. Do not store raw JWTs or recover deleted Redis sessions from PostgreSQL.
+
 ## SITE-001 — Register a website
 
 **Description:** An authenticated user can register a normalized HTTP(S) website target that they are authorized to scan.
@@ -93,6 +102,13 @@ batch, version đến sai thứ tự, `too many parts`, disk pressure, retention
 **Acceptance criteria:** States are monotonic according to the documented lifecycle; terminal success, partial success, cancellation, and failure are distinguishable; progress never exceeds configured bounds.
 
 **Important edge cases:** Worker/application restart, stale scan, late page result, concurrent polling.
+
+**Cancellation acceptance:** Cancelling a locally queued or running scan records
+`CANCEL_REQUESTED` until the Crawler confirms a terminal result. A delayed queued
+projection is not proof that remote execution has not started. Late progress must
+not undo a cancellation request; completion committed before remote cancellation
+must remain completion. Repeated cancellation must not enqueue duplicate commands.
+Cancellation state and its command outbox write commit atomically.
 
 ## REPORT-001 — View scan results
 

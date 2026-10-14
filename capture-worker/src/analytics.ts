@@ -68,7 +68,8 @@ export class CaptureAnalytics {
   }
 
   async ping(): Promise<void> {
-    await this.client.ping()
+    const result = await this.client.ping()
+    if (!result.success) throw new Error('CLICKHOUSE_UNAVAILABLE', { cause: result.error })
   }
 
   async write(outbox: ClaimedOutbox): Promise<void> {
@@ -205,6 +206,8 @@ export class CaptureAnalytics {
       query_params: { owner: ownerId, capture: captureId },
       format: 'JSONEachRow',
     })
+    // Release the response socket before another query can wait on the same pool.
+    const network = await networkResult.json<Record<string, unknown>>()
     const capturedResult = await this.client.query({
       query: `select resource_id as capturedBodyId,request_sequence as requestSequence,
         body_bytes as capturedBodyBytes,body_sha256 as bodySha256,was_truncated as bodyTruncated
@@ -214,10 +217,7 @@ export class CaptureAnalytics {
       query_params: { owner: ownerId, capture: captureId },
       format: 'JSONEachRow',
     })
-    const [network, captured] = await Promise.all([
-      networkResult.json<Record<string, unknown>>(),
-      capturedResult.json<Record<string, unknown>>(),
-    ])
+    const captured = await capturedResult.json<Record<string, unknown>>()
     return mergeResourceMetadata(network, captured)
   }
 

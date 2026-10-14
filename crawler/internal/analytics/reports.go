@@ -6,14 +6,42 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"regexp"
 	"strings"
+	"sync"
+	"time"
 
+	clickhouseDriver "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
 	"github.com/weblens-project/weblens-crawler/internal/model"
 )
 
 var ErrPageNotFound = errors.New("page report was not found")
+
+type reportCorrelationKey struct{}
+
+type nativeDialTraceKey struct{}
+
+type nativeDialTrace struct {
+	logger             *slog.Logger
+	operation, queryID string
+}
+
+var reportCorrelationPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+func WithReportCorrelation(ctx context.Context, correlationID string) context.Context {
+	if !reportCorrelationPattern.MatchString(correlationID) {
+		correlationID = uuid.NewString()
+	}
+	return context.WithValue(ctx, reportCorrelationKey{}, correlationID)
+}
+
+func ReportCorrelation(ctx context.Context) string {
+	correlationID, _ := ctx.Value(reportCorrelationKey{}).(string)
+	return correlationID
+}
 
 func (s *Sink) ListPages(
 	ctx context.Context,
@@ -104,7 +132,12 @@ func (s *Sink) ListPages(
 	}
 	query += " ORDER BY normalized_url, page_id LIMIT ?"
 	arguments = append(arguments, limit+1)
-	rows, err := s.connection.Query(ctx, query, arguments...)
+	ctx, release, err := s.beginReport(ctx, "pages")
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
+	rows, err := s.readConnection.Query(ctx, query, arguments...)
 	if err != nil {
 		return nil, false, fmt.Errorf("query page report: %w", err)
 	}
@@ -155,6 +188,10 @@ func (s *Sink) ListPages(
 	if err := rows.Err(); err != nil {
 		return nil, false, fmt.Errorf("iterate page report: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, false, fmt.Errorf("close page report: %w", err)
+	}
+	release()
 	hasMore := len(pages) > limit
 	if hasMore {
 		pages = pages[:limit]
@@ -214,7 +251,12 @@ func (s *Sink) ScanSummary(
 			WHERE page.owner_id = ? AND page.scan_id = ?
 		)`, quoteIdentifier(s.database), quoteIdentifier(s.database))
 	var summary model.ScanReportSummary
-	err := s.connection.QueryRow(ctx, query, ownerID, scanID, ownerID, scanID).Scan(
+	ctx, release, err := s.beginReport(ctx, "summary")
+	if err != nil {
+		return model.ScanReportSummary{}, err
+	}
+	defer release()
+	err = s.readConnection.QueryRow(ctx, query, ownerID, scanID, ownerID, scanID).Scan(
 		&summary.TotalURLCount,
 		&summary.IssuePageCount,
 		&summary.FindingCount,
@@ -241,13 +283,18 @@ const reportPageColumns = `page_id, scan_id, normalized_url, final_url, status_c
 	stylesheet_count, is_indexable, indexability_reason, observed_at`
 
 func (s *Sink) GetPage(ctx context.Context, ownerID, pageID uuid.UUID) (model.ReportPage, error) {
+	ctx, release, err := s.beginReport(ctx, "page_detail")
+	if err != nil {
+		return model.ReportPage{}, err
+	}
+	defer release()
 	var page model.ReportPage
 	var statusCode uint16
 	var fetchOutcome string
 	var linkCount uint64
 	var hreflangLanguages, hreflangURLs []string
 	var isIndexable, dnsObserved, connectObserved, tlsObserved, ttfbObserved uint8
-	err := s.connection.QueryRow(ctx, fmt.Sprintf(`
+	err = s.readConnection.QueryRow(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM %s.page_metrics_current
 		WHERE owner_id = ? AND page_id = ?
@@ -266,6 +313,7 @@ func (s *Sink) GetPage(ctx context.Context, ownerID, pageID uuid.UUID) (model.Re
 		&linkCount, &page.Images, &page.Scripts, &page.Stylesheets,
 		&isIndexable, &page.IndexabilityReason, &page.ObservedAt,
 	)
+	release()
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.ReportPage{}, ErrPageNotFound
@@ -339,7 +387,12 @@ func (s *Sink) listFindings(ctx context.Context, ownerID, scanID, pageID uuid.UU
 }
 
 func (s *Sink) queryFindings(ctx context.Context, query string, arguments ...any) ([]pageFinding, error) {
-	rows, err := s.connection.Query(ctx, query, arguments...)
+	ctx, release, err := s.beginReport(ctx, "findings")
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	rows, err := s.readConnection.Query(ctx, query, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("query findings report: %w", err)
 	}
@@ -364,6 +417,45 @@ func (s *Sink) queryFindings(ctx context.Context, query string, arguments ...any
 		return nil, fmt.Errorf("iterate findings report: %w", err)
 	}
 	return findings, nil
+}
+
+func (s *Sink) beginReport(ctx context.Context, operation string) (context.Context, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return ctx, nil, err
+	}
+	started := time.Now()
+	select {
+	case s.readSlots <- struct{}{}:
+	case <-ctx.Done():
+		s.logger.Info("ClickHouse report admission timeout", "operation", operation,
+			"correlationId", ReportCorrelation(ctx),
+			"admission_wait_ms", float64(time.Since(started))/float64(time.Millisecond))
+		return ctx, nil, ctx.Err()
+	}
+	queryStarted := time.Now()
+	queryID := uuid.NewString()
+	ctx = clickhouseDriver.Context(ctx, clickhouseDriver.WithQueryID(queryID))
+	ctx = context.WithValue(ctx, nativeDialTraceKey{}, nativeDialTrace{s.logger, operation, queryID})
+	s.logger.Debug("ClickHouse report query started", "operation", operation,
+		"correlationId", ReportCorrelation(ctx), "query_id", queryID)
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			<-s.readSlots
+			duration := time.Since(started)
+			if duration >= 250*time.Millisecond || ctx.Err() != nil {
+				stats := s.readConnection.Stats()
+				s.logger.Info("ClickHouse report timing", "operation", operation,
+					"correlationId", ReportCorrelation(ctx),
+					"query_id", queryID,
+					"admission_wait_ms", float64(queryStarted.Sub(started))/float64(time.Millisecond),
+					// Includes native acquisition/dial, network, query and consumption.
+					"query_and_read_ms", float64(time.Since(queryStarted))/float64(time.Millisecond),
+					"pool_open", stats.Open, "pool_idle", stats.Idle, "pool_limit", stats.MaxOpenConns,
+					"context_error", ctx.Err())
+			}
+		})
+	}, nil
 }
 
 func placeholders(count int) string {

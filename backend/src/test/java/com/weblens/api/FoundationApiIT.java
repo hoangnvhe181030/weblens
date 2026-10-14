@@ -11,6 +11,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.weblens.auth.security.AuthCookieFactory;
+import com.weblens.messaging.ScanEventService;
+import com.weblens.messaging.contract.ScanEventEnvelope;
+import com.weblens.messaging.contract.ScanProgressPayload;
 import jakarta.servlet.http.Cookie;
 import java.util.Arrays;
 import java.util.UUID;
@@ -18,31 +21,27 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
+import com.weblens.support.AuthIntegrationInfrastructure;
 
 @SpringBootTest
-@AutoConfigureMockMvc
+@AutoConfigureMockMvc(print = org.springframework.boot.test.autoconfigure.web.servlet.MockMvcPrint.NONE)
 @ActiveProfiles("test")
-@Testcontainers(disabledWithoutDocker = true)
-class FoundationApiIT {
-
-    @Container
-    @ServiceConnection
-    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:17.6-alpine");
+@org.junit.jupiter.api.condition.EnabledIf("com.weblens.support.AuthIntegrationInfrastructure#available")
+class FoundationApiIT extends AuthIntegrationInfrastructure {
 
     @Autowired
     private MockMvc mvc;
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private ScanEventService scanEvents;
 
     @Test
     void realJwtWebsiteAndScanLifecycleWorksEndToEnd() throws Exception {
@@ -140,8 +139,24 @@ class FoundationApiIT {
         mvc.perform(post("/api/v1/scans/{scanId}/cancellations", scanId)
                         .header(HttpHeaders.AUTHORIZATION, bearer(accessToken)))
                 .andExpect(status().isAccepted())
-                .andExpect(jsonPath("$.status").value("CANCELLED"));
+                .andExpect(jsonPath("$.status").value("CANCEL_REQUESTED"));
         mvc.perform(post("/api/v1/scans/{scanId}/cancellations", scanId)
+                        .header(HttpHeaders.AUTHORIZATION, bearer(accessToken)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCEL_REQUESTED"));
+
+        mvc.perform(delete("/api/v1/websites/{websiteId}", websiteId)
+                        .header(HttpHeaders.AUTHORIZATION, bearer(accessToken)))
+                .andExpect(status().isConflict());
+        UUID scanUuid = UUID.fromString(scanId);
+        UUID ownerId = UUID.fromString(registrationBody.path("user").path("id").asText());
+        scanEvents.consume(new ScanEventEnvelope(
+                UUID.randomUUID(), "SCAN", scanUuid, 1, "SCAN_PROGRESS", 1,
+                UUID.randomUUID(), java.time.Instant.now(),
+                new ScanProgressPayload(scanUuid, ownerId, "CANCELLED", 1, 0, 1, 0, 1,
+                        0, 0, "USER_CANCELLED", "Cancelled by crawler")
+        ));
+        mvc.perform(get("/api/v1/scans/{scanId}", scanId)
                         .header(HttpHeaders.AUTHORIZATION, bearer(accessToken)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
@@ -184,6 +199,21 @@ class FoundationApiIT {
                 .andExpect(jsonPath("$.code").value("INVALID_REFRESH_TOKEN"));
 
         mvc.perform(delete("/api/v1/auth/session")
+                        .header(HttpHeaders.AUTHORIZATION, bearer(accessToken))
+                        .cookie(secondRefresh, secondCsrf)
+                        .header(AuthCookieFactory.CSRF_HEADER, secondCsrf.getValue()))
+                .andExpect(status().isNoContent());
+
+        mvc.perform(get("/api/v1/me").header(HttpHeaders.AUTHORIZATION, bearer(accessToken)))
+                .andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/v1/me").header(HttpHeaders.AUTHORIZATION,
+                        bearer(json(refresh).path("accessToken").asText())))
+                .andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/v1/me").header(HttpHeaders.AUTHORIZATION, bearer(otherAccessToken)))
+                .andExpect(status().isOk());
+
+        mvc.perform(delete("/api/v1/auth/session")
+                        .header(HttpHeaders.AUTHORIZATION, bearer(accessToken))
                         .cookie(secondRefresh, secondCsrf)
                         .header(AuthCookieFactory.CSRF_HEADER, secondCsrf.getValue()))
                 .andExpect(status().isNoContent());

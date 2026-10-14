@@ -12,6 +12,7 @@ export interface Config {
   s3AccessKey: string
   s3SecretKey: string
   s3Bucket: string
+  storageRequestTimeoutMillis?: number
   controlEventUrl: string
   controlSiteCloneEventUrl: string
   crawlerReportBaseUrl: string
@@ -22,6 +23,7 @@ export interface Config {
   reconstructionGcPollMillis: number
   siteCloneConcurrency: number
   siteClonePollMillis: number
+  siteCloneAssemblyTimeoutMillis?: number
 	  migrateClickHouseOnStart: boolean
 }
 
@@ -67,6 +69,7 @@ export function loadConfig(): Config {
     s3AccessKey: required('S3_ACCESS_KEY'),
     s3SecretKey: required('S3_SECRET_KEY'),
     s3Bucket: process.env.S3_CAPTURE_BUCKET?.trim() || 'weblens-captures',
+    storageRequestTimeoutMillis: integer('CAPTURE_STORAGE_TIMEOUT_MS', 120_000, 100, 300_000),
     controlEventUrl: required('WEBLENS_CONTROL_CAPTURE_EVENT_URL'),
     controlSiteCloneEventUrl: required('WEBLENS_CONTROL_SITE_CLONE_EVENT_URL'),
     crawlerReportBaseUrl: required('WEBLENS_CRAWLER_REPORT_BASE_URL'),
@@ -77,6 +80,7 @@ export function loadConfig(): Config {
     reconstructionGcPollMillis: integer('CAPTURE_RECONSTRUCTION_GC_POLL_MS', 30_000, 1_000, 300_000),
     siteCloneConcurrency: integer('CAPTURE_SITE_CLONE_CONCURRENCY', 2, 1, 32),
     siteClonePollMillis: integer('CAPTURE_SITE_CLONE_POLL_MS', 500, 100, 60_000),
+    siteCloneAssemblyTimeoutMillis: integer('CAPTURE_SITE_ASSEMBLY_TIMEOUT_MS', 1_800_000, 1_000, 604_800_000),
     migrateClickHouseOnStart: boolean('CAPTURE_MIGRATE_CLICKHOUSE_ON_START', true),
   }
 }

@@ -57,6 +57,41 @@ class SiteCloneServiceTest {
     }
 
     @Test
+    void detailPreservesControlPlaneMetadataWhileUsingWorkerProgress() {
+        UUID ownerId = UUID.randomUUID();
+        UUID cloneId = UUID.randomUUID();
+        var clone = waitingClone(cloneId, ownerId);
+        clone.markReadyForDispatch(NOW);
+        given(siteClones.findByIdAndOwnerId(cloneId, ownerId)).willReturn(Optional.of(clone));
+        given(reports.get(ownerId, cloneId)).willReturn(new SiteCloneReportClient.WorkerReport(
+                cloneId, clone.getScanId(), clone.getTargetUrl(), SiteCloneStatus.PUBLISHED,
+                100, 10, 10, 0, 2, 6809, null, null, NOW.plusSeconds(10), NOW.plusSeconds(11),
+                NOW.plusSeconds(60), java.util.List.of()));
+
+        var result = service.get(ownerId, cloneId);
+        assertThat(result.websiteId()).isEqualTo(clone.getWebsiteId());
+        assertThat(result.createdAt()).isEqualTo(NOW);
+        assertThat(result.status()).isEqualTo(SiteCloneStatus.PUBLISHED);
+        assertThat(result.totalArchiveBytes()).isEqualTo(6809);
+        assertThat(result.processedCount()).isEqualTo(10);
+    }
+
+    @Test
+    void detailRejectsAWorkerReportForAnotherScan() {
+        UUID ownerId = UUID.randomUUID();
+        UUID cloneId = UUID.randomUUID();
+        var clone = waitingClone(cloneId, ownerId);
+        clone.markReadyForDispatch(NOW);
+        given(siteClones.findByIdAndOwnerId(cloneId, ownerId)).willReturn(Optional.of(clone));
+        given(reports.get(ownerId, cloneId)).willReturn(new SiteCloneReportClient.WorkerReport(
+                cloneId, UUID.randomUUID(), clone.getTargetUrl(), SiteCloneStatus.PUBLISHED,
+                100, 10, 10, 0, 2, 6809, null, null, NOW, NOW, NOW, java.util.List.of()));
+        assertThatThrownBy(() -> service.get(ownerId, cloneId))
+                .isInstanceOfSatisfying(com.weblens.common.exception.ApiException.class,
+                        exception -> assertThat(exception.code()).isEqualTo("SITE_CLONE_REPORT_UNAVAILABLE"));
+    }
+
+    @Test
     void cancellationLocksSourceScanBeforeWaitingClone() {
         UUID ownerId = UUID.randomUUID();
         UUID cloneId = UUID.randomUUID();

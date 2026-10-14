@@ -21,16 +21,19 @@ import {
 import { SiteCloneDatabase, type ClaimedSitePage, type ClaimedSitePhase } from './site-database.js'
 import type { CaptureCommandPayload, SitePageBundle } from './types.js'
 import type { InteractiveBrowserSessionManager } from './browser-session.js'
+import { LeaseAttempt } from './lease-attempt.js'
 
 export class SiteCloneWorker {
   private running = true
   private readonly crawler: CrawlerReportClient
+  private readonly activeAttempts = new Set<LeaseAttempt>()
 
   constructor(
     private readonly config: Config,
     private readonly database: SiteCloneDatabase,
     private readonly storage: ObjectStorage,
     private readonly browserSessions: InteractiveBrowserSessionManager,
+    private readonly render: typeof capturePage = capturePage,
   ) {
     this.crawler = new CrawlerReportClient(config)
   }
@@ -51,6 +54,7 @@ export class SiteCloneWorker {
 
   stop(): void {
     this.running = false
+    for (const attempt of this.activeAttempts) attempt.abort('WORKER_SHUTDOWN')
   }
 
   private async ingestionLoop(workerId: string): Promise<void> {
@@ -168,15 +172,11 @@ export class SiteCloneWorker {
     const trace = { siteCloneRequestId: work.jobId, scanId: work.scanId, correlationId: work.correlationId,
       pageId: work.pageId, attempt: work.attemptCount, leaseGeneration: work.leaseGeneration, phase: 'RENDERING' }
     log('info', 'site clone page started', trace)
-    const heartbeat = setInterval(() => {
-      void this.database.extendPageLease(work).catch((error: unknown) => log('warn', 'site page heartbeat failed', {
-        siteCloneRequestId: work.jobId,
-        pageId: work.pageId,
-        errorType: errorName(error),
-      }))
-    }, 15_000)
+    const attempt = new LeaseAttempt(15 * 60_000, () => this.database.extendPageLease(work), 15_000)
+    this.activeAttempts.add(attempt)
     let result: Awaited<ReturnType<typeof capturePage>> | null = null
     let uploaded: import('./types.js').StoredObject | null = null
+    let completionAttempted = false
     try {
       const target = work.pageId === work.jobId
         ? fallbackDesignPage(work, work.publicUrl)
@@ -186,9 +186,11 @@ export class SiteCloneWorker {
         throw new Error('SITE_PAGE_ORIGIN_CHANGED')
       }
       const sessionExpected = this.browserSessions.status(work.ownerId, work.jobId) !== null
-      const session = await this.browserSessions.waitForReady(work.ownerId, work.jobId, 10 * 60 * 1_000)
+      const session = await this.browserSessions.waitForReady(work.ownerId, work.jobId, 10 * 60 * 1_000, attempt.signal)
+      attempt.check()
       if (sessionExpected && !session) throw new Error('BROWSER_SESSION_NOT_READY')
-      result = await capturePage(captureCommand(work, targetUrl), {
+      result = await this.render(captureCommand(work, targetUrl), {
+        signal: attempt.signal,
         mainPath: work.localPath,
         contentAddressedResources: true,
         includeSiteBundle: true,
@@ -216,7 +218,10 @@ export class SiteCloneWorker {
         `${work.ownerId}/site-clones/${work.jobId}/pages/${work.pageId}/${work.leaseGeneration}.json`,
         encoded,
         'application/json',
+        attempt.signal,
       )
+      attempt.check()
+      completionAttempted = true
       const accepted = await this.database.completePage(work, uploaded, inputBytes)
       if (!accepted) await this.storage.delete(uploaded)
       log('info', 'site clone page completed', {
@@ -225,7 +230,8 @@ export class SiteCloneWorker {
     } catch (error) {
       log('warn', 'site clone page attempt failed', { ...trace, errorCode: boundedErrorCode(error),
         durationMs: Date.now() - started, retryEligible: work.attemptCount < work.maxRetries })
-      if (uploaded) await this.storage.delete(uploaded).catch(() => undefined)
+      // Preserve objects after an ambiguous COMMIT; database-authoritative GC owns cleanup.
+      if (uploaded && !completionAttempted) await this.storage.delete(uploaded).catch(() => undefined)
       await this.database.failPage(work, boundedErrorCode(error)).catch((databaseError: unknown) => {
         log('warn', 'site clone page failure persistence failed', {
           siteCloneRequestId: work.jobId,
@@ -234,7 +240,8 @@ export class SiteCloneWorker {
         })
       })
     } finally {
-      clearInterval(heartbeat)
+      attempt.close()
+      this.activeAttempts.delete(attempt)
       if (result) {
         const { cleanupStaticClone } = await import('./static-clone.js')
         await cleanupStaticClone(result.reconstruction)
@@ -260,12 +267,9 @@ export class SiteCloneWorker {
     const started = Date.now()
     log('info', 'site clone assembly started', { siteCloneRequestId: job.id, scanId: job.scanId,
       correlationId: job.correlationId, phase: 'ASSEMBLING', attempt: job.attemptCount })
-    const heartbeat = setInterval(() => {
-      void this.database.extendPhaseLease(job).catch((error: unknown) => log('warn', 'site assembly heartbeat failed', {
-        siteCloneRequestId: job.id,
-        errorType: errorName(error),
-      }))
-    }, 15_000)
+    const attempt = new LeaseAttempt(this.config.siteCloneAssemblyTimeoutMillis ?? 1_800_000,
+      () => this.database.extendPhaseLease(job), 15_000)
+    this.activeAttempts.add(attempt)
     let build: SiteArchiveBuild | null = null
     const staged: import('./types.js').StoredObject[] = []
     const uploaded: import('./types.js').StoredObject[] = []
@@ -283,7 +287,8 @@ export class SiteCloneWorker {
         job.payload.maxShardBytes,
         job.payload.maxArchiveBytes,
         async (reference) => {
-          const value = await this.storage.get(reference.bucket, reference.key)
+          attempt.check()
+          const value = await this.storage.get(reference.bucket, reference.key, reference.bytes, attempt.signal)
           verifyBytes(value, reference.bytes, reference.sha256Hex)
           return value
         },
@@ -296,14 +301,16 @@ export class SiteCloneWorker {
           part.path,
           'application/zip',
           job.payload.maxShardBytes,
+          attempt.signal,
         ))
       }
       staged.push(await this.storage.put(
         `site-clone-staging/${job.ownerId}/${job.id}/${job.leaseGeneration}/manifest.json`,
         archiveBuild.manifest,
         'application/json',
+        attempt.signal,
       ))
-      await Promise.all(staged.map((object) => this.storage.verify(object)))
+      await Promise.all(staged.map((object) => this.storage.verify(object, attempt.signal)))
       const artifactInputs = staged.map((object, index): import('./site-database.js').SiteArtifactInput => {
         const filename = object.contentType === 'application/json'
           ? 'manifest.json'
@@ -317,14 +324,17 @@ export class SiteCloneWorker {
           : { kind: 'ARCHIVE_SHARD', shardNumber: archiveBuild.parts[index]!.shardNumber, logicalFilename: filename,
               object: finalObject }
       })
+      attempt.check()
       await this.database.stageArtifacts(job, artifactInputs)
       for (let index = 0; index < staged.length; index++) {
         uploaded.push(await this.storage.copy(
           staged[index]!,
           artifactInputs[index]!.object.key,
+          attempt.signal,
         ))
       }
-      await Promise.all(uploaded.map((object) => this.storage.verify(object)))
+      await Promise.all(uploaded.map((object) => this.storage.verify(object, attempt.signal)))
+      attempt.check()
       await this.database.publishArtifacts(job, artifactInputs)
       await this.browserSessions.close(job.ownerId, job.id)
       await Promise.allSettled(staged.map((object) => this.storage.delete(object)))
@@ -334,7 +344,8 @@ export class SiteCloneWorker {
         shardCount: archiveBuild.parts.length,
       })
     } catch (error) {
-      await Promise.allSettled([...staged, ...uploaded].map((object) => this.storage.delete(object)))
+      // Final objects are registered before copying. GC resolves staged/published references.
+      await Promise.allSettled(staged.map((object) => this.storage.delete(object)))
       await this.database.retryAssembly(job, boundedErrorCode(error)).catch(() => undefined)
       log('warn', 'site clone assembly failed', {
         siteCloneRequestId: job.id,
@@ -342,7 +353,8 @@ export class SiteCloneWorker {
         errorCode: boundedErrorCode(error),
       })
     } finally {
-      clearInterval(heartbeat)
+      attempt.close()
+      this.activeAttempts.delete(attempt)
       await cleanupSiteArchives(build)
     }
   }
@@ -407,7 +419,9 @@ export class SiteCloneWorker {
         if (!response.ok) throw new Error(`CONTROL_HTTP_${response.status}`)
         await this.database.completeEvent(event)
       } catch {
-        await this.database.retryEvent(event, 'CONTROL_DELIVERY_FAILED')
+        await this.database.retryEvent(event, 'CONTROL_DELIVERY_FAILED').catch((error: unknown) => {
+          log('error', 'site clone event retry scheduling failed', { messageId: event.messageId, errorType: errorName(error) })
+        })
       }
     }
   }

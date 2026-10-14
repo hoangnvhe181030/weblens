@@ -1,16 +1,155 @@
 package analytics
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
+
+	clickhouseDriver "github.com/ClickHouse/clickhouse-go/v2"
 
 	"github.com/google/uuid"
 	"github.com/weblens-project/weblens-crawler/internal/model"
 )
+
+func TestNativeTLSColdWarmIntegration(t *testing.T) {
+	address := os.Getenv("WEBLENS_TEST_CLICKHOUSE_ADDR")
+	if address == "" {
+		t.Skip("set WEBLENS_TEST_CLICKHOUSE_ADDR for owned ClickHouse TLS integration")
+	}
+	certificateServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	certificate := certificateServer.TLS.Certificates[0]
+	roots := x509.NewCertPool()
+	roots.AddCert(certificateServer.Certificate())
+	certificateServer.Close()
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var peers sync.WaitGroup
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			peer, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			peers.Add(1)
+			go func() {
+				defer peers.Done()
+				defer peer.Close()
+				upstream, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+				if err != nil {
+					return
+				}
+				defer upstream.Close()
+				stop := context.AfterFunc(ctx, func() { _ = peer.Close(); _ = upstream.Close() })
+				defer stop()
+				copied := make(chan struct{})
+				go func() { _, _ = io.Copy(upstream, peer); _ = upstream.Close(); close(copied) }()
+				_, _ = io.Copy(peer, upstream)
+				_ = peer.Close()
+				<-copied
+			}()
+		}
+	}()
+	t.Cleanup(func() { cancel(); _ = listener.Close(); <-acceptDone; peers.Wait() })
+	for round := 1; round <= 3; round++ {
+		connection, err := clickhouseDriver.Open(&clickhouseDriver.Options{
+			Addr:        []string{listener.Addr().String()},
+			Auth:        clickhouseDriver.Auth{Database: "default", Username: envOrDefault("WEBLENS_TEST_CLICKHOUSE_USERNAME", "default"), Password: os.Getenv("WEBLENS_TEST_CLICKHOUSE_PASSWORD")},
+			TLS:         &tls.Config{RootCAs: roots, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12},
+			DialTimeout: 5 * time.Second, MaxOpenConns: 1, MaxIdleConns: 1, DialStrategy: dialNativeWithContext,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var traceOutput bytes.Buffer
+		sink := &Sink{readConnection: connection, readSlots: make(chan struct{}, 1),
+			logger: slog.New(slog.NewJSONHandler(&traceOutput, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+		for pass := 0; pass < 3; pass++ {
+			traceOutput.Reset()
+			requestCtx, requestCancel := context.WithTimeout(ctx, time.Second)
+			started := time.Now()
+			queryCtx, release, admissionErr := sink.beginReport(WithReportCorrelation(requestCtx, "owned-tls-probe"), "tls_probe")
+			if admissionErr != nil {
+				requestCancel()
+				_ = connection.Close()
+				t.Fatal(admissionErr)
+			}
+			var value uint8
+			var serverQueryID string
+			err = connection.QueryRow(queryCtx, "SELECT toUInt8(1), queryID()").Scan(&value, &serverQueryID)
+			release()
+			requestCancel()
+			if err != nil || value != 1 {
+				_ = connection.Close()
+				t.Fatalf("TLS round=%d pass=%d failed: %v", round, pass, err)
+			}
+			var trace map[string]any
+			if decodeErr := json.NewDecoder(bytes.NewReader(traceOutput.Bytes())).Decode(&trace); decodeErr != nil ||
+				trace["query_id"] != serverQueryID || trace["correlationId"] != "owned-tls-probe" || len(sink.readSlots) != 0 {
+				_ = connection.Close()
+				t.Fatal("TLS server query ID did not match the bounded report trace or slot was retained")
+			}
+			decoder := json.NewDecoder(bytes.NewReader(traceOutput.Bytes()))
+			var nativeDials int
+			for {
+				var entry map[string]any
+				decodeErr := decoder.Decode(&entry)
+				if decodeErr == io.EOF {
+					break
+				}
+				if decodeErr != nil {
+					_ = connection.Close()
+					t.Fatal(decodeErr)
+				}
+				if entry["msg"] != "ClickHouse native dial timing" {
+					continue
+				}
+				nativeDials++
+				if entry["success"] != true || entry["secure"] != true || entry["query_id"] != serverQueryID {
+					_ = connection.Close()
+					t.Fatal("successful TLS dial lost the server query trace")
+				}
+			}
+			expectedDials := 0
+			if pass == 0 {
+				expectedDials = 1
+			}
+			if nativeDials != expectedDials {
+				_ = connection.Close()
+				t.Fatal("warm TLS query redialed instead of physically reusing the connection")
+			}
+			// The driver closes result channels before publishing the idle connection.
+			// Wait for that asynchronous publication, then still require physical reuse.
+			idleDeadline := time.Now().Add(time.Second)
+			for connection.Stats().Idle != 1 && time.Now().Before(idleDeadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if stats := connection.Stats(); stats.Open != 0 || stats.Idle != 1 {
+				_ = connection.Close()
+				t.Fatalf("TLS query retained capacity or lost reuse: %+v", stats)
+			}
+			t.Logf("round=%d pass=%d cold_pool=%t elapsed=%s result=1", round, pass, pass == 0, time.Since(started))
+		}
+		_ = connection.Close()
+	}
+}
 
 func TestClickHouseBatchIntegration(t *testing.T) {
 	address := os.Getenv("WEBLENS_TEST_CLICKHOUSE_ADDR")
@@ -19,15 +158,19 @@ func TestClickHouseBatchIntegration(t *testing.T) {
 	}
 	options := Options{
 		Address: address, Database: "weblens_crawl_analytics",
-		Username: envOrDefault("WEBLENS_TEST_CLICKHOUSE_USERNAME", "default"),
-		Password: os.Getenv("WEBLENS_TEST_CLICKHOUSE_PASSWORD"),
+		ReadMaxConnections: 24,
+		HTTPURL:            os.Getenv("WEBLENS_TEST_CLICKHOUSE_HTTP_URL"),
+		Username:           envOrDefault("WEBLENS_TEST_CLICKHOUSE_USERNAME", "default"),
+		Password:           os.Getenv("WEBLENS_TEST_CLICKHOUSE_PASSWORD"),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, options); err != nil {
+	migrationOptions := options
+	migrationOptions.HTTPURL = ""
+	if err := Migrate(ctx, migrationOptions); err != nil {
 		t.Fatalf("migrate ClickHouse test database: %v", err)
 	}
-	if err := Migrate(ctx, options); err != nil {
+	if err := Migrate(ctx, migrationOptions); err != nil {
 		t.Fatalf("repeat ClickHouse migration: %v", err)
 	}
 	sink, err := Open(ctx, options)
@@ -35,6 +178,18 @@ func TestClickHouseBatchIntegration(t *testing.T) {
 		t.Fatalf("open ClickHouse test database: %v", err)
 	}
 	t.Cleanup(func() { _ = sink.Close() })
+	// Cancelling an acquisition/request must not close an already pooled connection.
+	for attempt := 0; attempt < 5; attempt++ {
+		requestCtx, requestCancel := context.WithTimeout(ctx, time.Second)
+		pingErr := sink.readConnection.Ping(requestCtx)
+		requestCancel()
+		if pingErr != nil {
+			t.Fatalf("report connection failed after previous request cancellation: %v", pingErr)
+		}
+		if stats := sink.readConnection.Stats(); stats.Open != 0 || stats.Idle != 1 {
+			t.Fatalf("healthy connection was not returned to the idle pool: %+v", stats)
+		}
+	}
 
 	ownerID, scanID := uuid.New(), uuid.New()
 	batches := []model.AnalyticsBatch{
@@ -95,6 +250,18 @@ func TestClickHouseBatchIntegration(t *testing.T) {
 	}
 	if page.ID != batches[0].PageID {
 		t.Fatalf("expected report page %s, got %s", batches[0].PageID, page.ID)
+	}
+	otherOwner := uuid.New()
+	foreignPages, _, err := sink.ListPages(ctx, otherOwner, scanID, 100, "", uuid.Nil, model.PageFilters{})
+	if err != nil || len(foreignPages) != 0 {
+		t.Fatal("wrong-owner page report leaked data")
+	}
+	foreignSummary, err := sink.ScanSummary(ctx, otherOwner, scanID)
+	if err != nil || foreignSummary.TotalURLCount != 0 {
+		t.Fatal("wrong-owner summary leaked data")
+	}
+	if _, err := sink.GetPage(ctx, otherOwner, batches[0].PageID); err == nil {
+		t.Fatal("wrong-owner page detail accepted")
 	}
 }
 

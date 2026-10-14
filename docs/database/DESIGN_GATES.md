@@ -96,6 +96,14 @@ cho bất kỳ bảng RED/YELLOW nào khác.
 
 ## Sản phẩm bàn giao
 
+Ngày 2026-10-13, người dùng phê duyệt hồ sơ billing/payment revision 1 trong
+`BILLING_PAYMENT_REVIEW_2026-10-13.md`, gồm workload/policy và nhóm RED
+`credit_accounts`, `credit_ledger`, `usage_reservations`, `payment_orders`.
+Được tiếp tục bước 8–13, forward migration và persistence/IPN kiểm thử local
+theo `BILLING_SCHEMA_EXECUTION_2026-10-13.md`. Không mở quyền sửa schema các bảng
+RED khác, nhận tiền thật hoặc deploy production. Thu phí scan cần contract
+billable evidence có version, không dùng succeededCount hiện có.
+
 - GREEN: thiết kế hiện tại, bằng chứng triển khai, kiểm thử và giới hạn vận hành.
 - YELLOW: trường dữ liệu dự kiến, trách nhiệm, phương án, hành vi khi lỗi, quyết
   định lưu giữ và câu hỏi phê duyệt; không có DDL thực thi hoặc mã JPA.

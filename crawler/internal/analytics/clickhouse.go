@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/url"
 	"sort"
@@ -20,40 +21,75 @@ import (
 	clickhouseDriver "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/google/uuid"
+	"github.com/weblens-project/weblens-crawler/internal/config"
 	"github.com/weblens-project/weblens-crawler/internal/crawl"
 	"github.com/weblens-project/weblens-crawler/internal/model"
 	"github.com/weblens-project/weblens-crawler/migrations"
 )
 
 type Sink struct {
-	connection driver.Conn
-	database   string
+	connection     driver.Conn
+	readConnection driver.Conn
+	readSlots      chan struct{}
+	database       string
+	logger         *slog.Logger
 }
 
 type Options struct {
-	Address  string
-	Database string
-	Username string
-	Password string
-	Secure   bool
+	Address            string
+	HTTPURL            string
+	ReadMaxConnections int
+	Database           string
+	Username           string
+	Password           string
+	Secure             bool
+	Logger             *slog.Logger
 }
 
 func Open(ctx context.Context, options Options) (*Sink, error) {
-	connection, err := openConnection(options, options.Database)
+	readLimit := options.ReadMaxConnections
+	if readLimit == 0 {
+		readLimit = 7
+	}
+	if readLimit < 1 || readLimit > 64 {
+		return nil, errors.New("ClickHouse read connection limit must be between 1 and 64")
+	}
+	// Retain three dedicated ingestion connections; reports cannot consume them.
+	connection, err := openConnection(options, options.Database, 3)
 	if err != nil {
 		return nil, err
 	}
 	if err := connection.Ping(ctx); err != nil {
+		_ = connection.Close()
 		return nil, fmt.Errorf("ping ClickHouse: %w", err)
 	}
-	return &Sink{connection: connection, database: options.Database}, nil
+	readConnection, err := openConnection(options, options.Database, readLimit)
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	if err := readConnection.Ping(ctx); err != nil {
+		_ = readConnection.Close()
+		_ = connection.Close()
+		return nil, fmt.Errorf("ping ClickHouse report pool: %w", err)
+	}
+	logger := options.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Sink{connection: connection, readConnection: readConnection, readSlots: make(chan struct{}, readLimit), database: options.Database, logger: logger}, nil
 }
 
 func Migrate(ctx context.Context, options Options) error {
-	connection, err := openConnection(options, "default")
+	// Migration code relies on structured native exception codes; never parse HTTP error text as DDL success.
+	if options.HTTPURL != "" {
+		return errors.New("ClickHouse migrations require the native endpoint without CRAWLER_CLICKHOUSE_HTTP_URL")
+	}
+	connection, err := openConnection(options, "default", 10)
 	if err != nil {
 		return err
 	}
+	defer connection.Close()
 	if err := connection.Ping(ctx); err != nil {
 		return fmt.Errorf("ping ClickHouse for migration: %w", err)
 	}
@@ -79,16 +115,41 @@ func Migrate(ctx context.Context, options Options) error {
 	return nil
 }
 
-func openConnection(options Options, database string) (driver.Conn, error) {
+func openConnection(options Options, database string, limit int) (driver.Conn, error) {
 	if strings.TrimSpace(options.Address) == "" || strings.TrimSpace(database) == "" {
 		return nil, errors.New("ClickHouse address and database are required")
 	}
 	connectionOptions := &clickhouseDriver.Options{
 		Addr:        []string{options.Address},
 		Auth:        clickhouseDriver.Auth{Database: database, Username: options.Username, Password: options.Password},
-		DialTimeout: 5 * time.Second, MaxOpenConns: 10, MaxIdleConns: 5,
+		DialTimeout: 5 * time.Second, MaxOpenConns: limit, MaxIdleConns: min(limit, 5),
 		ConnMaxLifetime: 30 * time.Minute,
 		Compression:     &clickhouseDriver.Compression{Method: clickhouseDriver.CompressionLZ4},
+		DialStrategy:    dialNativeWithContext,
+	}
+	if options.HTTPURL != "" {
+		u, err := config.ParseClickHouseHTTPURL(options.HTTPURL)
+		if err != nil {
+			return nil, err
+		}
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		connectionOptions.Addr = []string{net.JoinHostPort(u.Hostname(), port)}
+		connectionOptions.Protocol = clickhouseDriver.HTTP
+		connectionOptions.MaxIdleConns = limit
+		// HTTP error bodies are plain text; native LZ4 framing cannot decode them.
+		connectionOptions.Compression = &clickhouseDriver.Compression{Method: clickhouseDriver.CompressionGZIP, Level: 1}
+		connectionOptions.DialStrategy = nil
+		if u.Scheme == "https" {
+			connectionOptions.TLS = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()}
+		}
+		return clickhouseDriver.Open(connectionOptions)
 	}
 	if options.Secure {
 		serverName, _, err := net.SplitHostPort(options.Address)
@@ -98,6 +159,67 @@ func openConnection(options Options, database string) (driver.Conn, error) {
 		connectionOptions.TLS = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
 	}
 	return clickhouseDriver.Open(connectionOptions)
+}
+
+func dialNativeWithContext(ctx context.Context, connID int, options *clickhouseDriver.Options, dial clickhouseDriver.Dial) (clickhouseDriver.DialResult, error) {
+	return clickhouseDriver.DefaultDialStrategy(ctx, connID, options, func(ctx context.Context, address string, options *clickhouseDriver.Options) (clickhouseDriver.DialResult, error) {
+		started := time.Now()
+		var transportDuration time.Duration
+		var nativeStarted time.Time
+		dialOptions := *options
+		var connection net.Conn
+		var stop func() bool
+		dialOptions.DialContext = func(ctx context.Context, address string) (net.Conn, error) {
+			transportStarted := time.Now()
+			dialer := &net.Dialer{Timeout: options.DialTimeout}
+			var err error
+			if options.TLS != nil {
+				connection, err = (&tls.Dialer{NetDialer: dialer, Config: options.TLS}).DialContext(ctx, "tcp", address)
+			} else {
+				connection, err = dialer.DialContext(ctx, "tcp", address)
+			}
+			transportDuration = time.Since(transportStarted)
+			if err != nil {
+				return nil, err
+			}
+			nativeStarted = time.Now()
+			// The native Hello handshake otherwise ignores cancellation until DialTimeout.
+			stop = context.AfterFunc(ctx, func() { _ = connection.Close() })
+			return connection, nil
+		}
+		result, err := dial(ctx, address, &dialOptions)
+		// Acquisition's context is cancelled on return; never attach it to a pooled connection.
+		if stop != nil {
+			stop()
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if err != nil && connection != nil {
+			_ = connection.Close()
+		}
+		if trace, ok := ctx.Value(nativeDialTraceKey{}).(nativeDialTrace); ok && trace.logger != nil {
+			var nativeDuration time.Duration
+			phase := "tcp_tls"
+			if !nativeStarted.IsZero() {
+				phase = "native_setup"
+				nativeDuration = time.Since(nativeStarted)
+			}
+			level := slog.LevelDebug
+			if err != nil || time.Since(started) >= 250*time.Millisecond {
+				level = slog.LevelInfo
+			}
+			trace.logger.Log(ctx, level, "ClickHouse native dial timing",
+				"operation", trace.operation, "correlationId", ReportCorrelation(ctx), "query_id", trace.queryID,
+				"tcp_tls_ms", float64(transportDuration)/float64(time.Millisecond),
+				// Includes client setup, Hello and Addendum; it is not server query execution.
+				"native_setup_ms", float64(nativeDuration)/float64(time.Millisecond),
+				"dial_ms", float64(time.Since(started))/float64(time.Millisecond),
+				"last_phase", phase, "secure", options.TLS != nil,
+				"success", err == nil, "context_cancelled", ctx.Err() != nil)
+		}
+		return result, err
+	})
 }
 
 func splitStatements(script string) []string {
@@ -119,11 +241,11 @@ func splitStatements(script string) []string {
 }
 
 func (s *Sink) Ping(ctx context.Context) error {
-	return s.connection.Ping(ctx)
+	return errors.Join(s.connection.Ping(ctx), s.readConnection.Ping(ctx))
 }
 
 func (s *Sink) Close() error {
-	return s.connection.Close()
+	return errors.Join(s.connection.Close(), s.readConnection.Close())
 }
 
 func (s *Sink) Write(ctx context.Context, batch model.AnalyticsBatch) error {
@@ -136,39 +258,85 @@ type preparedAnalytics struct {
 }
 
 func (s *Sink) WriteBatch(ctx context.Context, batches []model.AnalyticsBatch) map[uuid.UUID]error {
+	return s.writeBatch(ctx, batches, nil)
+}
+
+type batchTiming struct {
+	receiptChecks  int
+	receiptLookup  time.Duration
+	insertMetrics  time.Duration
+	insertFindings time.Duration
+	insertLinks    time.Duration
+	insertReceipts time.Duration
+}
+
+func (s *Sink) writeBatch(ctx context.Context, batches []model.AnalyticsBatch, timing *batchTiming) map[uuid.UUID]error {
 	results := make(map[uuid.UUID]error, len(batches))
-	pending := make([]preparedAnalytics, 0, len(batches))
+	decoded := make([]preparedAnalytics, 0, len(batches))
 	for _, batch := range batches {
 		payload, err := decodeAnalyticsBatch(batch)
 		if err != nil {
 			results[batch.ID] = err
 			continue
 		}
-		exists, err := s.receiptExists(ctx, batch, payload)
-		if err != nil {
-			results[batch.ID] = err
+		decoded = append(decoded, preparedAnalytics{outbox: batch, payload: payload})
+	}
+	if len(decoded) == 0 {
+		return results
+	}
+
+	started := time.Now()
+	receipts, err := s.receiptIDs(ctx, decoded)
+	if timing != nil {
+		timing.receiptChecks = len(decoded)
+		timing.receiptLookup = time.Since(started)
+	}
+	if err != nil {
+		return sharedFailure(results, decoded, err)
+	}
+
+	pending := make([]preparedAnalytics, 0, len(decoded))
+	for _, item := range decoded {
+		if _, exists := receipts[item.outbox.ID]; exists {
+			results[item.outbox.ID] = nil
 			continue
 		}
-		if exists {
-			results[batch.ID] = nil
-			continue
-		}
-		pending = append(pending, preparedAnalytics{outbox: batch, payload: payload})
+		pending = append(pending, item)
 	}
 	if len(pending) == 0 {
 		return results
 	}
 
-	if err := s.insertPageMetrics(ctx, pending); err != nil {
+	started = time.Now()
+	err = s.insertPageMetrics(ctx, pending)
+	if timing != nil {
+		timing.insertMetrics = time.Since(started)
+	}
+	if err != nil {
 		return sharedFailure(results, pending, err)
 	}
-	if err := s.insertFindings(ctx, pending); err != nil {
+	started = time.Now()
+	err = s.insertFindings(ctx, pending)
+	if timing != nil {
+		timing.insertFindings = time.Since(started)
+	}
+	if err != nil {
 		return sharedFailure(results, pending, err)
 	}
-	if err := s.insertLinks(ctx, pending); err != nil {
+	started = time.Now()
+	err = s.insertLinks(ctx, pending)
+	if timing != nil {
+		timing.insertLinks = time.Since(started)
+	}
+	if err != nil {
 		return sharedFailure(results, pending, err)
 	}
-	if err := s.insertReceipts(ctx, pending); err != nil {
+	started = time.Now()
+	err = s.insertReceipts(ctx, pending)
+	if timing != nil {
+		timing.insertReceipts = time.Since(started)
+	}
+	if err != nil {
 		return sharedFailure(results, pending, err)
 	}
 	for _, item := range pending {
@@ -201,18 +369,34 @@ func decodeAnalyticsBatch(batch model.AnalyticsBatch) (model.AnalyticsPayload, e
 	return payload, nil
 }
 
-func (s *Sink) receiptExists(ctx context.Context, batch model.AnalyticsBatch, payload model.AnalyticsPayload) (bool, error) {
-	var existing uint64
-	err := s.connection.QueryRow(ctx, fmt.Sprintf(`
-        SELECT count()
-        FROM %s.ingestion_receipts FINAL
-        WHERE owner_id = ? AND aggregate_id = ? AND batch_id = ?`, quoteIdentifier(s.database)),
-		payload.OwnerID, payload.ScanID, batch.ID,
-	).Scan(&existing)
-	if err != nil {
-		return false, fmt.Errorf("read ClickHouse ingestion receipt: %w", err)
+func (s *Sink) receiptIDs(ctx context.Context, items []preparedAnalytics) (map[uuid.UUID]struct{}, error) {
+	keys := make([]clickhouseDriver.GroupSet, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, clickhouseDriver.GroupSet{Value: []any{
+			item.payload.OwnerID, item.payload.ScanID, item.outbox.ID,
+		}})
 	}
-	return existing > 0, nil
+	rows, err := s.connection.Query(ctx, fmt.Sprintf(`
+        SELECT batch_id
+        FROM %s.ingestion_receipts FINAL
+		WHERE (owner_id, aggregate_id, batch_id) IN (?)`, quoteIdentifier(s.database)), keys,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read ClickHouse ingestion receipts: %w", err)
+	}
+	defer rows.Close()
+	receipts := make(map[uuid.UUID]struct{}, len(items))
+	for rows.Next() {
+		var batchID uuid.UUID
+		if err := rows.Scan(&batchID); err != nil {
+			return nil, fmt.Errorf("scan ClickHouse ingestion receipt: %w", err)
+		}
+		receipts[batchID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read ClickHouse ingestion receipts: %w", err)
+	}
+	return receipts, nil
 }
 
 func sharedFailure(results map[uuid.UUID]error, pending []preparedAnalytics, err error) map[uuid.UUID]error {

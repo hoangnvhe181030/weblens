@@ -2,7 +2,11 @@
 
 This directory is the production baseline accepted in ADR-008. It targets an
 Ubuntu Linux amd64 VPS with Docker Engine and the Compose plugin. It does not add
-Kafka, Redis, or Kubernetes.
+Kafka or Kubernetes. ADR-019 now requires a private Redis auth endpoint; provision
+it before starting the backend and set the `WEBLENS_REDIS_*` variables. Use a
+bounded single primary with `noeviction`. Shared managed persistence may remain
+enabled: access also checks durable PostgreSQL revocation, preventing stale Redis
+snapshots from reviving logged-out sessions. See `../production-windows/README.md`.
 
 ## 1. Prepare DNS and the VPS
 

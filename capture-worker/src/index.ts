@@ -11,6 +11,7 @@ import { cleanupStaticClone, STATIC_CLONE_MAX_ARCHIVE_BYTES } from './static-clo
 import { ObjectStorage } from './storage.js'
 import { InteractiveBrowserSessionManager } from './browser-session.js'
 import { readBrowserSettings } from './browser.js'
+import { LeaseAttempt } from './lease-attempt.js'
 
 const config = loadConfig()
 const browserSettings = readBrowserSettings()
@@ -30,6 +31,7 @@ log('info', 'capture worker started', { port: config.port, concurrency: config.c
 
 let running = true
 const loops: Promise<void>[] = []
+const activeAttempts = new Set<LeaseAttempt>()
 for (let index = 0; index < config.concurrency; index++) loops.push(jobLoop(randomUUID()))
 loops.push(analyticsLoop(randomUUID()), eventLoop(randomUUID()), reconstructionGcLoop())
 const siteWorker = new SiteCloneWorker(config, siteDatabase, storage, browserSessions)
@@ -45,27 +47,26 @@ async function jobLoop(workerId: string): Promise<void> {
       await delay(config.workerPollMillis)
       continue
     }
-    const leaseTimer = setInterval(() => {
-      void database.extendLease(job).then((ok) => {
-        if (!ok) log('warn', 'capture lease was lost', { captureRequestId: job.id })
-      }).catch((error: unknown) => log('warn', 'capture lease heartbeat failed', {
-        captureRequestId: job.id, errorType: errorName(error),
-      }))
-    }, 10_000)
+    const attempt = new LeaseAttempt(job.payload.timeoutSeconds * 1000 + 120_000,
+      () => database.extendLease(job), 10_000)
+    activeAttempts.add(attempt)
     let resultForCleanup: Awaited<ReturnType<typeof capturePage>> | null = null
     try {
       log('info', 'capture started', { captureRequestId: job.id, correlationId: job.correlationId, attempt: job.attemptCount })
-      const result = await capturePage(job.payload)
+      const result = await capturePage(job.payload, { signal: attempt.signal })
       resultForCleanup = result
-      const prefix = `${job.ownerId}/${job.id}`
-      const htmlObject = await storage.put(`${prefix}/rendered.html`, result.html, 'text/html; charset=utf-8')
-      const screenshotObject = await storage.put(`${prefix}/screenshot.jpg`, result.screenshot, 'image/jpeg')
+      attempt.check()
+      if (!await database.extendLease(job)) throw new Error('STALE_CAPTURE_LEASE')
+      const prefix = `${job.ownerId}/${job.id}/${job.leaseGeneration}`
+      const htmlObject = await storage.put(`${prefix}/rendered.html`, result.html, 'text/html; charset=utf-8', attempt.signal)
+      const screenshotObject = await storage.put(`${prefix}/screenshot.jpg`, result.screenshot, 'image/jpeg', attempt.signal)
       const resourceObjects = []
       for (const resource of result.resourceBodies) {
         const object = await storage.put(
           `${prefix}/resources/${resource.sequence}-${resource.resourceId}`,
           resource.body,
           resource.mimeType || 'application/octet-stream',
+          attempt.signal,
         )
         resourceObjects.push({ resource, object })
       }
@@ -81,12 +82,14 @@ async function jobLoop(workerId: string): Promise<void> {
             result.reconstruction.archivePath,
             'application/zip',
             STATIC_CLONE_MAX_ARCHIVE_BYTES,
+            attempt.signal,
           )
           uploadedReconstructionObjects.push(archive)
           const manifest = await storage.put(
             `${reconstructionPrefix}/manifest.json`,
             result.reconstruction.manifest,
             'application/json',
+            attempt.signal,
           )
           uploadedReconstructionObjects.push(manifest)
           reconstructionObjects = { archive, manifest }
@@ -97,7 +100,10 @@ async function jobLoop(workerId: string): Promise<void> {
             captureRequestId: job.id,
             errorType: errorName(error),
           })
-          await Promise.allSettled(uploadedReconstructionObjects.map((object) => storage.delete(object)))
+          // A failed COMMIT response does not prove that artifact registration rolled back.
+          if (!reconstructionStagingStarted) {
+            await Promise.allSettled(uploadedReconstructionObjects.map((object) => storage.delete(object)))
+          }
           reconstructionObjects = null
           result.reconstruction.status = 'FAILED'
           result.reconstruction.failureCode = reconstructionStagingStarted
@@ -107,6 +113,7 @@ async function jobLoop(workerId: string): Promise<void> {
           result.reconstruction.archiveBytes = null
         }
       }
+      attempt.check()
       await database.stageResult(
         job, result, htmlObject, screenshotObject, resourceObjects, reconstructionObjects,
       )
@@ -118,9 +125,12 @@ async function jobLoop(workerId: string): Promise<void> {
     } catch (error) {
       const code = boundedErrorCode(error)
       log('warn', 'capture attempt failed', { captureRequestId: job.id, errorCode: code, attempt: job.attemptCount })
-      await database.failJob(job, code)
+      await database.failJob(job, code).catch((failure: unknown) => {
+        log('error', 'capture failure persistence failed', { captureRequestId: job.id, errorType: errorName(failure) })
+      })
     } finally {
-      clearInterval(leaseTimer)
+      attempt.close()
+      activeAttempts.delete(attempt)
       if (resultForCleanup) await cleanupStaticClone(resultForCleanup.reconstruction)
     }
   }
@@ -171,7 +181,9 @@ async function analyticsLoop(workerId: string): Promise<void> {
       await database.completeAnalytics(outbox)
     } catch (error) {
       log('warn', 'capture analytics delivery failed', { outboxId: outbox.id, errorType: errorName(error) })
-      await database.retryAnalytics(outbox, 'CLICKHOUSE_DELIVERY_FAILED')
+      await database.retryAnalytics(outbox, 'CLICKHOUSE_DELIVERY_FAILED').catch((retryError: unknown) => {
+        log('error', 'capture analytics retry scheduling failed', { outboxId: outbox.id, errorType: errorName(retryError) })
+      })
     }
   }
 }
@@ -198,7 +210,9 @@ async function eventLoop(workerId: string): Promise<void> {
       await database.completeEvent(event)
     } catch (error) {
       log('warn', 'capture event delivery failed', { messageId: event.messageId, errorType: errorName(error) })
-      await database.retryEvent(event, 'CONTROL_DELIVERY_FAILED')
+      await database.retryEvent(event, 'CONTROL_DELIVERY_FAILED').catch((retryError: unknown) => {
+        log('error', 'capture event retry scheduling failed', { messageId: event.messageId, errorType: errorName(retryError) })
+      })
     }
   }
 }
@@ -207,11 +221,19 @@ async function shutdown(signal: string): Promise<void> {
   if (!running) return
   running = false
   siteWorker.stop()
+  for (const attempt of activeAttempts) attempt.abort('WORKER_SHUTDOWN')
+  storage.close()
   log('info', 'capture worker stopping', { signal })
+  const deadline = setTimeout(() => {
+    log('error', 'capture shutdown deadline exceeded', { signal })
+    process.exit(1)
+  }, 55_000)
+  deadline.unref()
   server.close()
   await browserSessions.closeAll()
   await Promise.allSettled(loops)
   await Promise.allSettled([database.close(), analytics.close()])
+  clearTimeout(deadline)
 }
 
 process.once('SIGINT', () => void shutdown('SIGINT'))
@@ -227,5 +249,5 @@ function errorName(error: unknown): string {
 
 function boundedErrorCode(error: unknown): string {
   const raw = error instanceof Error ? error.message : 'CAPTURE_FAILED'
-  return raw.toUpperCase().replace(/[^A-Z0-9_]/gu, '_').slice(0, 64) || 'CAPTURE_FAILED'
+  return /^[A-Z][A-Z0-9_]{0,63}$/u.test(raw) ? raw : 'CAPTURE_OPERATION_FAILED'
 }

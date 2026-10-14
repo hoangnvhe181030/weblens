@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,7 +88,10 @@ func run(logger *slog.Logger, args []string) error {
 
 	clickhouseOptions := analytics.Options{
 		Address: cfg.ClickHouseAddress, Database: cfg.ClickHouseDatabase,
-		Username: cfg.ClickHouseUsername, Password: cfg.ClickHousePassword, Secure: cfg.ClickHouseSecure,
+		HTTPURL:            cfg.ClickHouseHTTPURL,
+		ReadMaxConnections: cfg.ClickHouseReadMaxConns,
+		Username:           cfg.ClickHouseUsername, Password: cfg.ClickHousePassword, Secure: cfg.ClickHouseSecure,
+		Logger: logger,
 	}
 	if migrationCommand == "migrate" || migrationCommand == "migrate-postgres" || cfg.MigrateOnStart {
 		if err := postgres.Migrate(startupContext, cfg.PostgresURL); err != nil {
@@ -146,9 +150,14 @@ func run(logger *slog.Logger, args []string) error {
 
 	componentContext, cancelComponents := context.WithCancel(rootContext)
 	defer cancelComponents()
-	go engine.Run(componentContext)
-	go analyticsWorker.Run(componentContext)
-	go eventPublisher.Run(componentContext)
+	var components sync.WaitGroup
+	for _, run := range []func(context.Context){engine.Run, analyticsWorker.Run, eventPublisher.Run} {
+		components.Add(1)
+		go func() {
+			defer components.Done()
+			run(componentContext)
+		}()
+	}
 
 	serverErrors := make(chan error, 1)
 	go func() {
@@ -162,15 +171,30 @@ func run(logger *slog.Logger, args []string) error {
 	case serverError := <-serverErrors:
 		if !errors.Is(serverError, http.ErrServerClosed) {
 			cancelComponents()
-			return serverError
+			serverErrors <- serverError
 		}
 	}
 
 	cancelComponents()
 	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancelShutdown()
-	if err := httpServer.Shutdown(shutdownContext); err != nil {
-		return err
+	shutdownError := httpServer.Shutdown(shutdownContext)
+	stopped := make(chan struct{})
+	go func() { components.Wait(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-shutdownContext.Done():
+		return fmt.Errorf("crawler components did not stop: %w", shutdownContext.Err())
+	}
+	if shutdownError != nil {
+		return shutdownError
+	}
+	select {
+	case serverError := <-serverErrors:
+		if !errors.Is(serverError, http.ErrServerClosed) {
+			return serverError
+		}
+	default:
 	}
 	return nil
 }

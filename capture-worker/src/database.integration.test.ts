@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { test } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { Pool } from 'pg'
 import { CaptureDatabase } from './database.js'
 import { SiteCloneDatabase } from './site-database.js'
@@ -26,6 +27,11 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
 
   try {
     await database.migrate()
+    await database.migrate()
+    await database.pool.query("update capture_schema_migrations set checksum='tampered' where version='005_bound_site_reconstruction_phases.sql'")
+    await assert.rejects(database.migrate(), /MIGRATION_CHECKSUM_MISMATCH/u)
+    await database.pool.query("update capture_schema_migrations set checksum=null where version='005_bound_site_reconstruction_phases.sql'")
+    await database.migrate()
     const migrations = await database.pool.query<{ version: string }>(
       'select version from capture_schema_migrations order by version',
     )
@@ -49,6 +55,14 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
       "update capture_jobs set lease_expires_at=now()-interval '1 second' where id=$1",
       [command.aggregateId],
     )
+    assert.equal(await database.extendLease(firstLease), false)
+    await assert.rejects(database.stageResult(firstLease, captureResult(),
+      storedObject('html', Buffer.from('html')), storedObject('screenshot', Buffer.from('image')), [], null),
+    /STALE_CAPTURE_LEASE/u)
+    await assert.rejects(database.stageReconstructionArtifacts(firstLease, {
+      archive: storedObject('expired-archive', Buffer.from('zip')),
+      manifest: storedObject('expired-manifest', Buffer.from('{}')),
+    }), /STALE_CAPTURE_LEASE/u)
     const secondLease = await database.claimJob(randomUUID())
     assert.ok(secondLease)
     assert.ok(secondLease.leaseGeneration > firstLease.leaseGeneration)
@@ -97,7 +111,14 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
     ])
     const claimed = claims.filter((value) => value !== null)
     assert.equal(claimed.length, 1)
-    await database.completeAnalytics(claimed[0]!)
+    await database.pool.query('update analytics_outbox set delivery_attempts=20 where id=$1', [claimed[0]!.id])
+    await database.retryAnalytics(claimed[0]!, 'CLICKHOUSE_DELIVERY_FAILED')
+    assert.equal(await database.claimAnalytics(randomUUID()), null)
+    await database.pool.query('update analytics_outbox set available_at=now() where id=$1', [claimed[0]!.id])
+    const recovered = await database.claimAnalytics(randomUUID())
+    assert.equal(recovered?.id, claimed[0]!.id)
+    assert.deepEqual(recovered?.payload, claimed[0]!.payload)
+    await database.completeAnalytics(recovered!)
 
     const snapshot = await database.getSnapshot(command.payload.ownerId, command.aggregateId)
     assert.equal(snapshot?.['status'], 'COMPLETED')
@@ -146,6 +167,20 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
       reconstructionId,
     )
     assert.equal(expiredReference?.state, 'DELETED')
+
+    const exhaustedCommand = commandEnvelope()
+    await database.acceptCommand(exhaustedCommand)
+    const exhaustedLease = await database.claimJob(randomUUID())
+    assert.ok(exhaustedLease)
+    await database.pool.query("update capture_jobs set attempt_count=3,lease_expires_at=now()-interval '1 second' where id=$1", [exhaustedLease.id])
+    assert.equal(await database.claimJob(randomUUID()), null)
+    const exhaustedState = await database.pool.query('select status,terminal_code from capture_jobs where id=$1', [exhaustedLease.id])
+    assert.deepEqual(exhaustedState.rows[0], { status: 'FAILED', terminal_code: 'CAPTURE_RETRIES_EXHAUSTED' })
+    const failureEvents = await database.pool.query("select count(*)::integer as count from event_outbox where capture_job_id=$1 and payload->'payload'->>'status'='FAILED'", [exhaustedLease.id])
+    assert.equal(failureEvents.rows[0].count, 1)
+    await database.claimJob(randomUUID())
+    const repeatedEvents = await database.pool.query("select count(*)::integer as count from event_outbox where capture_job_id=$1 and payload->'payload'->>'status'='FAILED'", [exhaustedLease.id])
+    assert.equal(repeatedEvents.rows[0].count, 1)
 
     const cloneFailureCommand = commandEnvelope()
     await database.acceptCommand(cloneFailureCommand)
@@ -283,6 +318,9 @@ test('site clone migration, phase retry, page fencing, cancellation partial và 
     )
     const expiredProgress = await sites.getProgress(command.payload.ownerId, command.aggregateId, -1, 50, 'RENDERING', '')
     assert.equal(expiredProgress?.activePages[0]?.leaseExpired, true)
+    assert.equal(await sites.extendPageLease(stalePage), false)
+    await assert.rejects(sites.completePage(stalePage, storedObject('expired-bundle', Buffer.from('{}')), 2),
+      /STALE_SITE_PAGE_LEASE/u)
     const winningPage = await sites.claimPage(randomUUID())
     assert.ok(winningPage)
     assert.equal(winningPage.pageId, stalePage.pageId)
@@ -419,11 +457,17 @@ test('site clone migration, phase retry, page fencing, cancellation partial và 
       from site_reconstruction_artifacts where site_reconstruction_job_id=$1`, [publishRetryCommand.aggregateId])
     assert.ok(stagingRetention.rows.every((row) => row.state === 'STAGED' && row.expires_within_day))
     await sites.retryAssembly(firstAssembly, 'MINIO_UPLOAD_FAILED')
-    const removedStage = await database.pool.query<{ count: string }>(
-      'select count(*)::text as count from site_reconstruction_artifacts where site_reconstruction_job_id=$1',
+    const expiredStage = await database.pool.query<{ count: string }>(
+      "select count(*)::text as count from site_reconstruction_artifacts where site_reconstruction_job_id=$1 and state='STAGED' and delete_after<=now()",
       [publishRetryCommand.aggregateId],
     )
-    assert.equal(removedStage.rows[0]?.count, '0')
+    assert.equal(expiredStage.rows[0]?.count, '2')
+    for (let index = 0; index < 2; index++) {
+      const deletion = await sites.claimObjectForDeletion()
+      assert.ok(deletion)
+      assert.equal(deletion.jobId, publishRetryCommand.aggregateId)
+      await sites.completeObjectDeletion(deletion)
+    }
     await database.pool.query(
       'update site_reconstruction_jobs set phase_available_at=now() where id=$1',
       [publishRetryCommand.aggregateId],
@@ -431,13 +475,114 @@ test('site clone migration, phase retry, page fencing, cancellation partial và 
     const secondAssembly = await sites.claimAssembly(randomUUID())
     assert.ok(secondAssembly)
     assert.equal((await sites.listBundles(secondAssembly)).length, 1)
-    await sites.publishArtifacts(secondAssembly, stagedArtifacts)
+    await sites.publishArtifacts(secondAssembly, stagedArtifacts.map((artifact) => ({
+      ...artifact, object: { ...artifact.object, key: `${artifact.object.key}/generation-${secondAssembly.leaseGeneration}` },
+    })))
     const published = await sites.getReport(publishRetryCommand.payload.ownerId, publishRetryCommand.aggregateId)
     assert.equal(published?.['status'], 'PUBLISHED')
+    const parallelCommand = siteCloneCommand()
+    parallelCommand.payload.pageConcurrency = 1
+    await sites.acceptCommand(parallelCommand)
+    const parallelIngestion = await sites.claimIngestion(randomUUID())
+    assert.ok(parallelIngestion)
+    assert.equal(parallelIngestion.id, parallelCommand.aggregateId)
+    await sites.addTargets(parallelIngestion, [0, 1, 2].map((ordinal) => {
+      const id = randomUUID()
+      return target(id, ordinal, `https://example.com/${ordinal}`, `pages/${id}.html`)
+    }))
+    await sites.finishIngestion(parallelIngestion)
+    const parallelClaims = await Promise.all(Array.from({ length: 8 }, () => sites.claimPage(randomUUID())))
+    const runningPages = parallelClaims.filter((page) => page?.jobId === parallelCommand.aggregateId)
+    assert.equal(runningPages.length, 1)
+    await sites.completePage(runningPages[0]!, storedObject('parallel-bundle', Buffer.from('bundle')), 6)
+    assert.equal((await sites.claimPage(randomUUID()))?.jobId, parallelCommand.aggregateId)
   } finally {
     await database.close()
     await admin.query(`drop schema "${schemaName}" cascade`)
     await admin.end()
+  }
+})
+
+test('heartbeat rechecks expiry after an unchanged row lock is released', {
+  skip: databaseUrl ? false : 'CAPTURE_TEST_DATABASE_URL is required',
+  timeout: 30_000,
+}, async () => {
+  const admin = new Pool({ connectionString: databaseUrl! })
+  const schema = `weblens_heartbeat_${randomUUID().replaceAll('-', '')}`
+  await admin.query(`create schema "${schema}"`)
+  const isolated = new URL(databaseUrl!)
+  isolated.searchParams.set('options', `-csearch_path=${schema}`)
+  isolated.searchParams.set('application_name', schema)
+  const database = new CaptureDatabase(isolated.toString())
+  const sites = new SiteCloneDatabase(database.pool)
+  try {
+    await database.migrate()
+    await database.acceptCommand(commandEnvelope())
+    const capture = await database.claimJob(randomUUID())
+    assert.ok(capture)
+    assert.equal(await database.extendLease(capture), true)
+    await lockedExpiry('capture_jobs', 'lease_expires_at', 'id=$1', [capture.id], () => database.extendLease(capture))
+
+    const command = siteCloneCommand()
+    await sites.acceptCommand(command)
+    const ingestion = await sites.claimIngestion(randomUUID())
+    assert.ok(ingestion)
+    assert.equal(await sites.extendPhaseLease(ingestion), true)
+    await lockedExpiry('site_reconstruction_jobs', 'phase_lease_expires_at', 'id=$1', [ingestion.id],
+      () => sites.extendPhaseLease(ingestion))
+    const reclaimed = await sites.claimIngestion(randomUUID())
+    assert.ok(reclaimed)
+    await sites.addTargets(reclaimed, [target(randomUUID(), 1, 'https://example.com/', 'index.html')])
+    await sites.finishIngestion(reclaimed)
+    const page = await sites.claimPage(randomUUID())
+    assert.ok(page)
+    assert.equal(await sites.extendPageLease(page), true)
+    await lockedExpiry('site_reconstruction_pages', 'lease_expires_at',
+      'site_reconstruction_job_id=$1 and page_id=$2', [page.jobId, page.pageId], () => sites.extendPageLease(page))
+    const retry = await sites.claimPage(randomUUID())
+    assert.ok(retry)
+    assert.equal(await sites.completePage(retry, storedObject('bundle', Buffer.from('{}')), 2), true)
+    const assembly = await sites.claimAssembly(randomUUID())
+    assert.ok(assembly)
+    assert.equal(await sites.extendPhaseLease(assembly), true)
+    await lockedExpiry('site_reconstruction_jobs', 'phase_lease_expires_at', 'id=$1', [assembly.id],
+      () => sites.extendPhaseLease(assembly))
+  } finally {
+    await database.close()
+    await admin.query(`drop schema "${schema}" cascade`)
+    await admin.end()
+  }
+
+  async function lockedExpiry(table: string, expiry: string, scope: string, ids: string[], renew: () => Promise<boolean>) {
+    await database.pool.query(`update ${table} set ${expiry}=clock_timestamp()+interval '2 seconds' where ${scope}`, ids)
+    const blocker = await database.pool.connect()
+    let pending: Promise<boolean> | undefined
+    try {
+      await blocker.query('begin')
+      await blocker.query(`select 1 from ${table} where ${scope} for update`, ids)
+      pending = renew()
+      const waitingDeadline = Date.now() + 1500
+      let blocked = false
+      while (Date.now() < waitingDeadline) {
+        const waiting = await database.pool.query<{ blocked: boolean }>(`select exists(
+          select 1 from pg_stat_activity where application_name=$1 and wait_event_type='Lock'
+            and query like $2) as blocked`, [schema, `%${table}%`])
+        if (waiting.rows[0]!.blocked) { blocked = true; break }
+        await delay(10)
+      }
+      assert.ok(blocked, 'renewal must enter the database lock wait while the lease is live')
+      while (!(await database.pool.query<{ expired: boolean }>(
+        `select ${expiry}<=clock_timestamp() as expired from ${table} where ${scope}`, ids)).rows[0]!.expired) {
+        await delay(20)
+      }
+      // Rollback without changing the tuple: UPDATE must not rely on tuple re-evaluation.
+      await blocker.query('rollback')
+      assert.equal(await pending, false, `${table} must not resurrect an expired lease`)
+    } finally {
+      await blocker.query('rollback')
+      blocker.release()
+      await pending?.catch(() => undefined)
+    }
   }
 })
 

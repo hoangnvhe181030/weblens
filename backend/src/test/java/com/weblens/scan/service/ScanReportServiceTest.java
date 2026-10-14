@@ -2,6 +2,8 @@ package com.weblens.scan.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.weblens.auth.service.CurrentUserService;
@@ -11,20 +13,35 @@ import com.weblens.scan.client.CrawlerReportClient;
 import com.weblens.scan.client.CrawlerReportStateContract;
 import com.weblens.scan.client.CrawlerScanPagesContract;
 import com.weblens.scan.client.CrawlerScanSummaryContract;
-import com.weblens.scan.entity.ScanEntity;
 import com.weblens.scan.dto.ScanPageFilter;
-import com.weblens.scan.model.ScanConfiguration;
 import com.weblens.scan.repository.ScanRepository;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import com.weblens.common.exception.ApiException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpHeaders;
+import org.springframework.web.client.HttpClientErrorException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import com.weblens.support.BoundaryTransactionManager;
+import com.weblens.common.exception.NotFoundException;
+import com.weblens.common.exception.UnauthorizedException;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.springframework.aop.framework.ProxyFactory;
+import org.springframework.transaction.annotation.AnnotationTransactionAttributeSource;
+import org.springframework.transaction.interceptor.TransactionInterceptor;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.IllegalTransactionStateException;
+import org.springframework.web.client.ResourceAccessException;
 
 @ExtendWith(MockitoExtension.class)
 class ScanReportServiceTest {
@@ -37,10 +54,105 @@ class ScanReportServiceTest {
     private CrawlerReportClient crawler;
 
     private ScanReportService service;
+    private BoundaryTransactionManager transactions;
 
     @BeforeEach
     void setUp() {
-        service = new ScanReportService(scans, currentUsers, crawler, new ObjectMapper());
+        transactions = new BoundaryTransactionManager();
+        var target = new ScanReportService(scans, currentUsers, crawler, new ObjectMapper(),
+                transactions, new SimpleMeterRegistry(), 8);
+        var proxy = new ProxyFactory(target);
+        proxy.addAdvice(new TransactionInterceptor(transactions, new AnnotationTransactionAttributeSource()));
+        service = (ScanReportService) proxy.getProxy();
+    }
+
+    @Test
+    void unauthorizedScanNeverCallsCrawler() {
+        var userId = UUID.randomUUID();
+        var scanId = UUID.randomUUID();
+        given(scans.existsByIdAndRequestedByUserId(scanId, userId)).willReturn(false);
+        assertThatThrownBy(() -> service.listPages(userId, scanId, 100, null, filter()))
+                .isInstanceOf(NotFoundException.class);
+        verifyNoInteractions(crawler);
+    }
+
+    @Test
+    void disabledUserNeverCallsCrawler() {
+        var userId = UUID.randomUUID();
+        org.mockito.BDDMockito.willThrow(new UnauthorizedException("INVALID_USER", "Unavailable"))
+                .given(currentUsers).requireActive(userId);
+        assertThatThrownBy(() -> service.getPage(userId, UUID.randomUUID()))
+                .isInstanceOf(UnauthorizedException.class);
+        verifyNoInteractions(crawler);
+    }
+
+    @Test
+    void remoteFailureOccursAfterAuthorizationCommitAndPreservesCause() {
+        var userId = UUID.randomUUID();
+        var pageId = UUID.randomUUID();
+        var failure = new ResourceAccessException("Test transport failure");
+        given(crawler.getPage(userId, pageId)).willAnswer(invocation -> {
+            assertThat(transactions.commits).isEqualTo(1);
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+            throw failure;
+        });
+        assertThatThrownBy(() -> service.getPage(userId, pageId)).hasCause(failure);
+    }
+
+    @Test
+    void callerCannotHoldAnAmbientTransactionDuringRemoteReport() {
+        assertThatThrownBy(() -> new TransactionTemplate(transactions).execute(
+                status -> service.getPage(UUID.randomUUID(), UUID.randomUUID())))
+                .isInstanceOf(IllegalTransactionStateException.class);
+        verifyNoInteractions(crawler, currentUsers);
+    }
+
+    private ScanPageFilter filter() {
+        return new ScanPageFilter(false, List.of(), null, null, null, null, List.of(), List.of(), List.of());
+    }
+
+    @Test
+    void acceptedScanWithMissingRemoteExecutionIsRetryableNotMissing() {
+        UUID owner = UUID.randomUUID(), scan = UUID.randomUUID();
+        given(scans.existsByIdAndRequestedByUserId(scan, owner)).willReturn(true);
+        given(crawler.listPages(owner, scan, 100, null, filter())).willThrow(
+                HttpClientErrorException.create(HttpStatus.NOT_FOUND, "Missing", HttpHeaders.EMPTY, new byte[0], null));
+        assertThatThrownBy(() -> service.listPages(owner, scan, 100, null, filter()))
+                .isInstanceOfSatisfying(ApiException.class, error -> {
+                    assertThat(error.status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+                    assertThat(error.code()).isEqualTo("SCAN_REPORT_NOT_READY");
+                });
+    }
+
+    @Test
+    void saturatedReportsFailFastAndReleaseCapacityAfterRemoteFailure() throws Exception {
+        var occupied = new CountDownLatch(8);
+        var release = new CountDownLatch(1);
+        given(crawler.getPage(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .willAnswer(invocation -> {
+                    occupied.countDown();
+                    if (!release.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Test timed out");
+                    throw new ResourceAccessException("Downstream unavailable");
+                });
+        try (var threads = Executors.newFixedThreadPool(8)) {
+            var attempts = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+            try {
+                for (int index = 0; index < 8; index++) attempts.add(threads.submit(() -> {
+                    assertThatThrownBy(() -> service.getPage(UUID.randomUUID(), UUID.randomUUID()))
+                            .isInstanceOf(ApiException.class);
+                }));
+                assertThat(occupied.await(3, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> service.getPage(UUID.randomUUID(), UUID.randomUUID()))
+                        .isInstanceOfSatisfying(ApiException.class,
+                                error -> assertThat(error.code()).isEqualTo("SCAN_REPORT_BUSY"));
+            } finally {
+                release.countDown();
+            }
+            for (var attempt : attempts) attempt.get(3, TimeUnit.SECONDS);
+        }
+        assertThatThrownBy(() -> service.getPage(UUID.randomUUID(), UUID.randomUUID()))
+                .isInstanceOfSatisfying(ApiException.class,
+                        error -> assertThat(error.code()).isEqualTo("CRAWLER_REPORT_UNAVAILABLE"));
     }
 
     @Test
@@ -49,13 +161,12 @@ class ScanReportServiceTest {
         UUID scanId = UUID.randomUUID();
         UUID pageId = UUID.randomUUID();
         Instant observedAt = Instant.parse("2026-09-11T10:00:00Z");
-        given(scans.findByIdAndRequestedByUserId(scanId, ownerId)).willReturn(Optional.of(new ScanEntity(
-                scanId, UUID.randomUUID(), ownerId,
-                new ScanConfiguration(25, 3, 10_485_760, 120, 5, 3),
-                "crawler-v1", null, null, observedAt.minusSeconds(10)
-        )));
+        given(scans.existsByIdAndRequestedByUserId(scanId, ownerId)).willReturn(true);
         ScanPageFilter filter = new ScanPageFilter(false, List.of(), null, null, null, null, List.of(), List.of(), List.of());
-        given(crawler.listPages(ownerId, scanId, 100, null, filter)).willReturn(new CrawlerScanPagesContract(
+        given(crawler.listPages(ownerId, scanId, 100, null, filter)).willAnswer(invocation -> {
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+            assertThat(transactions.commits).isEqualTo(1);
+            return new CrawlerScanPagesContract(
                 new CrawlerReportStateContract(scanId, ownerId, "COMPLETED", 1, 1, observedAt),
                 new CrawlerScanSummaryContract(245, 17, 23, 220, 5, 10, 3, 7),
                 List.of(new CrawlerPageContract(
@@ -66,7 +177,8 @@ class ScanReportServiceTest {
                                 Map.of("length", 4)
                         )), observedAt
                 ))
-        ));
+            );
+        });
 
         var response = service.listPages(ownerId, scanId, 100, null, filter);
 

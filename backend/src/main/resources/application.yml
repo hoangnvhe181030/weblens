@@ -1,6 +1,18 @@
 spring:
   application:
     name: weblens-backend
+  data:
+    redis:
+      host: ${WEBLENS_REDIS_HOST:127.0.0.1}
+      port: ${WEBLENS_REDIS_PORT:56379}
+      username: ${WEBLENS_REDIS_USERNAME:}
+      password: ${WEBLENS_REDIS_PASSWORD:}
+      connect-timeout: 1s
+      timeout: 1s
+      ssl:
+        enabled: ${WEBLENS_REDIS_SSL:false}
+      repositories:
+        enabled: false
   datasource:
     url: ${DB_URL}
     username: ${DB_USERNAME}
@@ -40,6 +52,8 @@ server:
     include-stacktrace: never
   shutdown: graceful
   tomcat:
+    mbeanregistry:
+      enabled: true
     # NIO có thể giữ nhiều connection hơn số thread xử lý. Đây là trần cấu hình,
     # không phải tuyên bố một máy đã benchmark thành công 100.000 client.
     max-connections: ${WEBLENS_TOMCAT_MAX_CONNECTIONS:100000}
@@ -50,10 +64,15 @@ server:
       min-spare: ${WEBLENS_TOMCAT_MIN_SPARE_THREADS:32}
 
 management:
+  metrics:
+    distribution:
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99
+        weblens.scan.report.stage: 0.5,0.95,0.99
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics
   endpoint:
     health:
       show-details: never
@@ -68,6 +87,9 @@ springdoc:
     tags-sorter: alpha
 
 weblens:
+  billing:
+    # Enable only with an external sandbox profile/catalog; scan charging is not wired yet.
+    enabled: ${WEBLENS_BILLING_ENABLED:false}
   security:
     jwt:
       secret: ${WEBLENS_JWT_SECRET}
@@ -100,6 +122,8 @@ weblens:
     archive-retention-days: ${WEBLENS_SITE_CLONE_ARCHIVE_RETENTION_DAYS:7}
     metadata-retention-days: ${WEBLENS_SITE_CLONE_METADATA_RETENTION_DAYS:30}
   crawler:
+    dispatch-concurrency: ${WEBLENS_CRAWLER_DISPATCH_CONCURRENCY:4}
+    report-concurrency: ${WEBLENS_CRAWLER_REPORT_CONCURRENCY:8}
     command-url: ${WEBLENS_CRAWLER_COMMAND_URL:http://localhost:8081/internal/v1/commands/scans}
     report-base-url: ${WEBLENS_CRAWLER_REPORT_BASE_URL:http://localhost:8081}
     service-token: ${WEBLENS_SERVICE_TOKEN}
@@ -109,6 +133,7 @@ weblens:
     dispatch-enabled: ${WEBLENS_CRAWLER_DISPATCH_ENABLED:true}
     dispatch-poll-interval: ${WEBLENS_CRAWLER_DISPATCH_POLL_INTERVAL:PT0.5S}
   capture:
+    dispatch-concurrency: ${WEBLENS_CAPTURE_DISPATCH_CONCURRENCY:2}
     command-url: ${WEBLENS_CAPTURE_COMMAND_URL:http://localhost:8082/internal/v1/commands/captures}
     site-clone-command-url: ${WEBLENS_SITE_CLONE_COMMAND_URL:http://localhost:8082/internal/v1/commands/site-clones}
     report-base-url: ${WEBLENS_CAPTURE_REPORT_BASE_URL:http://localhost:8082}
@@ -126,3 +151,4 @@ logging:
   level:
     root: INFO
     org.springframework.security: INFO
+    com.weblens.scan.admission: ${WEBLENS_ADMISSION_LOG_LEVEL:INFO}

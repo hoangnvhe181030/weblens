@@ -44,7 +44,9 @@ public class InternalServiceAuthenticationFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return !request.getRequestURI().startsWith(INTERNAL_PREFIX);
+        String path = request.getRequestURI().substring(request.getContextPath().length());
+        return !path.startsWith(INTERNAL_PREFIX)
+                && !path.equals("/actuator/metrics") && !path.startsWith("/actuator/metrics/");
     }
 
     @Override

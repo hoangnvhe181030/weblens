@@ -178,12 +178,16 @@ export class SiteCloneDatabase {
   }
 
   async extendPhaseLease(job: ClaimedSitePhase): Promise<boolean> {
-    const result = await this.pool.query(`update site_reconstruction_jobs
-      set phase_lease_expires_at=now()+case when status='ASSEMBLING'
+    const result = await this.pool.query(`with locked as materialized (
+        select id,phase_lease_expires_at from site_reconstruction_jobs
+        where id=$1 and phase_lease_owner=$2 and phase_lease_generation=$3
+          and status in ('INGESTING','ASSEMBLING') for update
+      ) update site_reconstruction_jobs job
+      set phase_lease_expires_at=clock_timestamp()+case when job.status='ASSEMBLING'
             then interval '5 minutes' else interval '60 seconds' end,
-          updated_at=now()
-      where id=$1 and phase_lease_owner=$2 and phase_lease_generation=$3
-        and status in ('INGESTING','ASSEMBLING')`, [job.id, job.leaseOwner, job.leaseGeneration])
+          updated_at=clock_timestamp()
+      from locked where job.id=locked.id and locked.phase_lease_expires_at>clock_timestamp()`,
+    [job.id, job.leaseOwner, job.leaseGeneration])
     return result.rowCount === 1
   }
 
@@ -267,6 +271,8 @@ export class SiteCloneDatabase {
     const client = await this.pool.connect()
     try {
       await client.query('begin')
+      // ponytail: serialize short admissions, not rendering; use per-job slots if claim throughput becomes a bottleneck.
+      await client.query("select pg_advisory_xact_lock(hashtextextended('weblens-site-page-admission',0))")
       const reclaimed = await client.query<{ site_reconstruction_job_id: string }>(`with expired as (
           select page.site_reconstruction_job_id,page.page_id,
             page.attempt_count < job.max_retries_per_page as retryable
@@ -331,10 +337,14 @@ export class SiteCloneDatabase {
   }
 
   async extendPageLease(page: ClaimedSitePage): Promise<boolean> {
-    const result = await this.pool.query(`update site_reconstruction_pages
-      set lease_expires_at=now()+interval '60 seconds',updated_at=now()
-      where site_reconstruction_job_id=$1 and page_id=$2 and status='RENDERING'
-        and lease_owner=$3 and lease_generation=$4`,
+    const result = await this.pool.query(`with locked as materialized (
+        select site_reconstruction_job_id,page_id,lease_expires_at from site_reconstruction_pages
+        where site_reconstruction_job_id=$1 and page_id=$2 and status='RENDERING'
+          and lease_owner=$3 and lease_generation=$4 for update
+      ) update site_reconstruction_pages page
+      set lease_expires_at=clock_timestamp()+interval '60 seconds',updated_at=clock_timestamp()
+      from locked where page.site_reconstruction_job_id=locked.site_reconstruction_job_id
+        and page.page_id=locked.page_id and locked.lease_expires_at>clock_timestamp()`,
     [page.jobId, page.pageId, page.leaseOwner, page.leaseGeneration])
     return result.rowCount === 1
   }
@@ -349,7 +359,7 @@ export class SiteCloneDatabase {
       await client.query('begin')
       const locked = await client.query(`select page_id from site_reconstruction_pages
         where site_reconstruction_job_id=$1 and page_id=$2 and status='RENDERING'
-          and lease_owner=$3 and lease_generation=$4 for update`,
+          and lease_owner=$3 and lease_generation=$4 and lease_expires_at>clock_timestamp() for update`,
       [page.jobId, page.pageId, page.leaseOwner, page.leaseGeneration])
       if (!locked.rowCount) throw new Error('STALE_SITE_PAGE_LEASE')
       const job = await client.query<{ status: string; input_bytes: string; max_input_bytes: string }>(
@@ -368,16 +378,17 @@ export class SiteCloneDatabase {
         await client.query('commit')
         return false
       }
-      await client.query(`update site_reconstruction_pages set status='SUCCEEDED',
+      const completed = await client.query(`update site_reconstruction_pages set status='SUCCEEDED',
           lease_owner=null,lease_expires_at=null,bundle_bucket=$5,bundle_storage_key=$6,
           bundle_bytes=$7,bundle_sha256=$8,input_bytes=$9,failure_code=null,
           bundle_state='AVAILABLE',bundle_delete_after=now(),
           finished_at=now(),updated_at=now()
         where site_reconstruction_job_id=$1 and page_id=$2 and status='RENDERING'
-          and lease_owner=$3 and lease_generation=$4`, [
+          and lease_owner=$3 and lease_generation=$4 and lease_expires_at>clock_timestamp()`, [
         page.jobId, page.pageId, page.leaseOwner, page.leaseGeneration,
         bundle.bucket, bundle.key, bundle.bytes, bundle.sha256, inputBytes,
       ])
+      if (!completed.rowCount) throw new Error('STALE_SITE_PAGE_LEASE')
       await this.incrementJob(client, page.jobId, true, inputBytes)
       await client.query('commit')
       return true
@@ -501,7 +512,7 @@ export class SiteCloneDatabase {
               and page.failure_code='CANCELLED') as cancelled_count
         from site_reconstruction_jobs job where job.id=$1 and job.status='ASSEMBLING'
           and phase_lease_owner=$2 and phase_lease_generation=$3
-          and phase_lease_expires_at>now() for update`, [job.id, job.leaseOwner, job.leaseGeneration])
+          and phase_lease_expires_at>clock_timestamp() for update`, [job.id, job.leaseOwner, job.leaseGeneration])
       if (!locked.rowCount) throw new Error('STALE_SITE_ASSEMBLY_LEASE')
       const total = artifacts.reduce((sum, artifact) => sum + artifact.object.bytes, 0)
       if (total > job.payload.maxArchiveBytes) throw new Error('SITE_ARCHIVE_BUDGET_EXCEEDED')
@@ -512,12 +523,14 @@ export class SiteCloneDatabase {
       const counts = locked.rows[0]!
       const terminal = counts.failed_count > 0 || counts.cancelled_count > 0
         ? 'PARTIAL' : 'PUBLISHED'
-      await client.query(`update site_reconstruction_jobs set status=$4,
+      const published = await client.query(`update site_reconstruction_jobs set status=$4,
           phase_lease_owner=null,phase_lease_expires_at=null,archive_bytes=$5,
           artifact_count=$6,finished_at=now(),updated_at=now()
-        where id=$1 and phase_lease_owner=$2 and phase_lease_generation=$3`, [
+        where id=$1 and phase_lease_owner=$2 and phase_lease_generation=$3
+          and phase_lease_expires_at>clock_timestamp()`, [
         job.id, job.leaseOwner, job.leaseGeneration, terminal, total, artifacts.length,
       ])
+      if (!published.rowCount) throw new Error('STALE_SITE_ASSEMBLY_LEASE')
       await this.enqueueEvent(client, job.id, terminal)
       await client.query('commit')
     } catch (error) {
@@ -535,7 +548,7 @@ export class SiteCloneDatabase {
       await client.query('begin')
       const lease = await client.query(`select id from site_reconstruction_jobs
         where id=$1 and status='ASSEMBLING' and phase_lease_owner=$2
-          and phase_lease_generation=$3 and phase_lease_expires_at>now() for update`,
+          and phase_lease_generation=$3 and phase_lease_expires_at>clock_timestamp() for update`,
       [job.id, job.leaseOwner, job.leaseGeneration])
       if (!lease.rowCount) throw new Error('STALE_SITE_ASSEMBLY_LEASE')
       const total = artifacts.reduce((sum, artifact) => sum + artifact.object.bytes, 0)
@@ -576,6 +589,9 @@ export class SiteCloneDatabase {
           throw new Error('SITE_ARTIFACT_STAGE_MISMATCH')
         }
       }
+      const valid = await client.query(`select id from site_reconstruction_jobs
+        where id=$1 and phase_lease_expires_at>clock_timestamp()`, [job.id])
+      if (!valid.rowCount) throw new Error('STALE_SITE_ASSEMBLY_LEASE')
       await client.query('commit')
     } catch (error) {
       await client.query('rollback')
@@ -617,7 +633,7 @@ export class SiteCloneDatabase {
       [job.id, job.leaseOwner, job.leaseGeneration, phase, exhausted,
         Math.min(30, 2 ** job.attemptCount), boundedCode(code)])
       if (updated.rowCount) {
-        await client.query(`delete from site_reconstruction_artifacts
+        await client.query(`update site_reconstruction_artifacts set delete_after=greatest(clock_timestamp(),created_at+interval '1 microsecond')
           where site_reconstruction_job_id=$1 and generation=$2 and state='STAGED'`,
         [job.id, job.leaseGeneration])
         if (exhausted) await this.enqueueEvent(client, job.id, 'FAILED')
@@ -688,7 +704,7 @@ export class SiteCloneDatabase {
       message_id: string; payload: Record<string, unknown>; lease_owner: string
     }>(`with candidate as (
         select message_id from site_reconstruction_event_outbox
-        where (status='PENDING' and available_at<=now())
+        where (status in ('PENDING','DEAD') and available_at<=now())
           or (status='CLAIMED' and lease_expires_at<=now())
         order by available_at,created_at,message_id for update skip locked limit 1
       ) update site_reconstruction_event_outbox outbox set status='CLAIMED',lease_owner=$1,
@@ -708,7 +724,10 @@ export class SiteCloneDatabase {
   async retryEvent(event: ClaimedSiteEvent, code: string): Promise<void> {
     await this.pool.query(`update site_reconstruction_event_outbox set
       status=case when delivery_attempts>=20 then 'DEAD' else 'PENDING' end,
-      available_at=now()+interval '2 seconds',lease_owner=null,lease_expires_at=null,last_error_code=$3
+      available_at=now()+(case when delivery_attempts>=20 then 300
+        else least(60,power(2,least(delivery_attempts,6))::integer) end
+        + mod(abs(hashtext(message_id::text)::bigint),5)) * interval '1 second',
+      lease_owner=null,lease_expires_at=null,last_error_code=$3
       where message_id=$1 and status='CLAIMED' and lease_owner=$2`,
     [event.messageId, event.leaseOwner, boundedCode(code)])
   }
@@ -806,10 +825,11 @@ export class SiteCloneDatabase {
       storage_key: string; content_type: string; byte_size: string; sha256: Buffer
     }>(`with candidate as (
         select id from site_reconstruction_artifacts
-        where state in ('PUBLISHED','DELETE_PENDING') and delete_after<=now()
+        where state in ('STAGED','PUBLISHED','DELETE_PENDING') and delete_after<=now()
         order by delete_after,id for update skip locked limit 1
       ) update site_reconstruction_artifacts artifact
-      set state='DELETE_PENDING',delete_after=now()+interval '30 seconds'
+      set state=case when artifact.state='STAGED' then 'STAGED' else 'DELETE_PENDING' end,
+          delete_after=now()+interval '30 seconds'
       from candidate where artifact.id=candidate.id
       returning artifact.id,artifact.site_reconstruction_job_id,artifact.storage_bucket,
         artifact.storage_key,artifact.content_type,artifact.byte_size,artifact.sha256`)
@@ -863,7 +883,7 @@ export class SiteCloneDatabase {
       if (deletion.type === 'ARTIFACT') {
         const deleted = await client.query(`update site_reconstruction_artifacts
           set state='DELETED',deleted_at=now()
-          where id=$1 and site_reconstruction_job_id=$2 and state='DELETE_PENDING'`,
+          where id=$1 and site_reconstruction_job_id=$2 and state in ('STAGED','DELETE_PENDING')`,
         [deletion.objectId, deletion.jobId])
         if (!deleted.rowCount) throw new Error('STALE_SITE_GC_CLAIM')
         const remaining = await client.query(`select 1 from site_reconstruction_artifacts
@@ -895,7 +915,7 @@ export class SiteCloneDatabase {
     if (deletion.type === 'ARTIFACT') {
       await this.pool.query(`update site_reconstruction_artifacts
         set delete_after=now()+interval '1 minute'
-        where id=$1 and site_reconstruction_job_id=$2 and state='DELETE_PENDING'`,
+        where id=$1 and site_reconstruction_job_id=$2 and state in ('STAGED','DELETE_PENDING')`,
       [deletion.objectId, deletion.jobId])
       return
     }

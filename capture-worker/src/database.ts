@@ -63,7 +63,8 @@ export class CaptureDatabase {
   readonly pool: Pool
 
   constructor(databaseUrl: string) {
-    this.pool = new Pool({ connectionString: databaseUrl, max: 10, idleTimeoutMillis: 30_000 })
+    this.pool = new Pool({ connectionString: databaseUrl, max: 10, idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000, statement_timeout: 10_000, query_timeout: 12_000 })
   }
 
   async migrate(directory = resolve('migrations/postgresql')): Promise<void> {
@@ -71,17 +72,30 @@ export class CaptureDatabase {
     try {
       await client.query('select pg_advisory_lock(hashtextextended($1, 0))', ['weblens-capture-migrations'])
       await client.query(`create table if not exists capture_schema_migrations (
-        version text primary key, applied_at timestamptz not null default now())`)
+        version text primary key, applied_at timestamptz not null default now(), checksum text)`)
+      await client.query('alter table capture_schema_migrations add column if not exists checksum text')
       const files = (await readdir(directory)).filter((file) => file.endsWith('.sql')).sort()
+      const missing = await client.query<{ version: string }>(
+        'select version from capture_schema_migrations where not (version=any($1::text[]))', [files])
+      if (missing.rowCount) throw new Error(`MIGRATION_FILE_MISSING:${missing.rows[0]!.version}`)
       for (const file of files) {
-        const exists = await client.query<{ exists: boolean }>(
-          'select exists(select 1 from capture_schema_migrations where version = $1) as exists', [file],
-        )
-        if (exists.rows[0]?.exists) continue
+        const script = await readFile(resolve(directory, file), 'utf8')
+        const checksum = createHash('sha256').update(script).digest('hex')
+        const applied = await client.query<{ checksum: string | null }>(
+          'select checksum from capture_schema_migrations where version=$1', [file])
+        if (applied.rowCount) {
+          if (applied.rows[0]!.checksum === null) {
+            // Legacy versions have no historical checksum. Deployment verifies them against the previous release first.
+            await client.query('update capture_schema_migrations set checksum=$2 where version=$1', [file, checksum])
+          } else if (applied.rows[0]!.checksum !== checksum) {
+            throw new Error(`MIGRATION_CHECKSUM_MISMATCH:${file}`)
+          }
+          continue
+        }
         await client.query('begin')
         try {
-          await client.query(await readFile(resolve(directory, file), 'utf8'))
-          await client.query('insert into capture_schema_migrations(version) values ($1) on conflict do nothing', [file])
+          await client.query(script)
+          await client.query('insert into capture_schema_migrations(version,checksum) values ($1,$2)', [file, checksum])
           await client.query('commit')
         } catch (error) {
           await client.query('rollback')
@@ -146,6 +160,23 @@ export class CaptureDatabase {
     const client = await this.pool.connect()
     try {
       await client.query('begin')
+      const exhausted = await client.query<{
+        id: string; owner_id: string; correlation_id: string
+      }>(`with expired as (
+          select id from capture_jobs where status='RENDERING'
+            and lease_expires_at<=now() and attempt_count>=3
+          order by lease_expires_at,id for update skip locked limit 100
+        ) update capture_jobs job set status='FAILED',lease_owner=null,lease_expires_at=null,
+          terminal_code='CAPTURE_RETRIES_EXHAUSTED',
+          terminal_message='Capture lease expired after bounded retries',finished_at=now(),updated_at=now()
+        from expired where job.id=expired.id returning job.id,job.owner_id,job.correlation_id`)
+      for (const expired of exhausted.rows) {
+        await client.query(`update reconstruction_jobs set status='FAILED',
+          failure_code='CAPTURE_FAILED_BEFORE_CLONE',finished_at=now(),updated_at=now(),version=version+1
+          where capture_job_id=$1 and status in ('QUEUED','RUNNING')`, [expired.id])
+        await this.enqueueEvent(client, expired.id, expired.owner_id, expired.correlation_id,
+          'FAILED', 0, 0, 0, 0, 'CAPTURE_RETRIES_EXHAUSTED', 'Capture lease expired after bounded retries')
+      }
       await client.query(`update capture_jobs set status='QUEUED', lease_owner=null, lease_expires_at=null,
           available_at=now(), updated_at=now()
         where status='RENDERING' and lease_expires_at <= now() and attempt_count < 3`)
@@ -188,9 +219,13 @@ export class CaptureDatabase {
   }
 
   async extendLease(job: ClaimedJob): Promise<boolean> {
-    const result = await this.pool.query(`update capture_jobs
-      set lease_expires_at=now()+interval '45 seconds', updated_at=now()
-      where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3`,
+    // Materialize the locked row before evaluating expiry; unchanged lock waits do not recheck UPDATE predicates.
+    const result = await this.pool.query(`with locked as materialized (
+        select id,lease_expires_at from capture_jobs
+        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3 for update
+      ) update capture_jobs job
+      set lease_expires_at=clock_timestamp()+interval '45 seconds', updated_at=clock_timestamp()
+      from locked where job.id=locked.id and locked.lease_expires_at>clock_timestamp()`,
     [job.id, job.leaseOwner, job.leaseGeneration])
     return result.rowCount === 1
   }
@@ -200,7 +235,8 @@ export class CaptureDatabase {
     try {
       await client.query('begin')
       const capture = await client.query(`select id from capture_jobs
-        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3 for update`,
+        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3
+          and lease_expires_at>clock_timestamp() for update`,
       [job.id, job.leaseOwner, job.leaseGeneration])
       if (!capture.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       const reconstruction = await client.query<{ id: string }>(`select id from reconstruction_jobs
@@ -216,6 +252,9 @@ export class CaptureDatabase {
         client, reconstructionId, job.ownerId, job.leaseGeneration, 'MANIFEST',
         'manifest.json', objects.manifest,
       )
+      const valid = await client.query(`select id from capture_jobs
+        where id=$1 and lease_expires_at>clock_timestamp()`, [job.id])
+      if (!valid.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       await client.query('commit')
     } catch (error) {
       await client.query('rollback')
@@ -271,7 +310,8 @@ export class CaptureDatabase {
     try {
       await client.query('begin')
       const locked = await client.query(`select id from capture_jobs
-        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3 for update`,
+        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3
+          and lease_expires_at>clock_timestamp() for update`,
       [job.id, job.leaseOwner, job.leaseGeneration])
       if (!locked.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       const snapshotId = randomUUID()
@@ -364,9 +404,10 @@ export class CaptureDatabase {
         analyticsPayload.batchId, job.id, job.ownerId, job.leaseGeneration,
         encoded.toString('utf8'), hash,
       ])
-      await client.query(`update capture_jobs set status='PERSISTING',lease_owner=null,lease_expires_at=null,
+      const staged = await client.query(`update capture_jobs set status='PERSISTING',lease_owner=null,lease_expires_at=null,
           analytics_expected_count=$2,analytics_published_count=0,object_count=$3,total_object_bytes=$4,updated_at=now()
-        where id=$1`, [job.id, expected, objectCount, objectBytes])
+        where id=$1 and status='RENDERING' and lease_expires_at>clock_timestamp()`, [job.id, expected, objectCount, objectBytes])
+      if (!staged.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       await this.enqueueEvent(client, job.id, job.ownerId, job.correlationId, 'INDEXING', expected, 0, objectCount, objectBytes, null, null)
       await client.query('commit')
     } catch (error) {
@@ -418,7 +459,7 @@ export class CaptureDatabase {
       payload_sha256: Buffer; lease_owner: string
     }>(`with candidate as (
         select id from analytics_outbox
-        where (status='PENDING' and available_at<=now()) or (status='CLAIMED' and lease_expires_at<=now())
+        where (status in ('PENDING','DEAD') and available_at<=now()) or (status='CLAIMED' and lease_expires_at<=now())
         order by available_at,created_at,id for update skip locked limit 1
       ) update analytics_outbox outbox set status='CLAIMED',lease_owner=$1,
         lease_expires_at=now()+interval '30 seconds',delivery_attempts=delivery_attempts+1,updated_at=now()
@@ -464,7 +505,10 @@ export class CaptureDatabase {
 
   async retryAnalytics(outbox: ClaimedOutbox, code: string): Promise<void> {
     await this.pool.query(`update analytics_outbox set status=case when delivery_attempts>=20 then 'DEAD' else 'PENDING' end,
-      available_at=now()+interval '2 seconds',lease_owner=null,lease_expires_at=null,last_error_code=$3,updated_at=now()
+      available_at=now()+(case when delivery_attempts>=20 then 300
+        else least(60,power(2,least(delivery_attempts,6))::integer) end
+        + mod(abs(hashtext(id::text)::bigint),5)) * interval '1 second',
+      lease_owner=null,lease_expires_at=null,last_error_code=$3,updated_at=now()
       where id=$1 and status='CLAIMED' and lease_owner=$2`, [outbox.id, outbox.leaseOwner, code])
   }
 
@@ -473,7 +517,7 @@ export class CaptureDatabase {
       message_id: string; payload: Record<string, unknown>; lease_owner: string
     }>(`with candidate as (
         select message_id from event_outbox
-        where (status='PENDING' and available_at<=now()) or (status='CLAIMED' and lease_expires_at<=now())
+        where (status in ('PENDING','DEAD') and available_at<=now()) or (status='CLAIMED' and lease_expires_at<=now())
         order by available_at,created_at,message_id for update skip locked limit 1
       ) update event_outbox outbox set status='CLAIMED',lease_owner=$1,
         lease_expires_at=now()+interval '30 seconds',delivery_attempts=delivery_attempts+1
@@ -491,7 +535,10 @@ export class CaptureDatabase {
 
   async retryEvent(event: ClaimedEvent, code: string): Promise<void> {
     await this.pool.query(`update event_outbox set status=case when delivery_attempts>=20 then 'DEAD' else 'PENDING' end,
-      available_at=now()+interval '2 seconds',lease_owner=null,lease_expires_at=null,last_error_code=$3
+      available_at=now()+(case when delivery_attempts>=20 then 300
+        else least(60,power(2,least(delivery_attempts,6))::integer) end
+        + mod(abs(hashtext(message_id::text)::bigint),5)) * interval '1 second',
+      lease_owner=null,lease_expires_at=null,last_error_code=$3
       where message_id=$1 and status='CLAIMED' and lease_owner=$2`, [event.messageId, event.leaseOwner, code])
   }
 

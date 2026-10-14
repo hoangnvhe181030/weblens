@@ -11,11 +11,14 @@ import com.weblens.auth.repository.AuthSessionRepository;
 import com.weblens.auth.repository.UserRepository;
 import com.weblens.auth.security.JwtTokenService;
 import com.weblens.auth.security.RandomTokenService;
+import com.weblens.auth.security.RedisSessionStore;
 import com.weblens.auth.security.TokenHashingService;
 import com.weblens.auth.security.TokenPair;
 import com.weblens.common.exception.ApiException;
 import com.weblens.common.exception.ConflictException;
 import com.weblens.common.exception.UnauthorizedException;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -24,7 +27,10 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 @Transactional(readOnly = true)
@@ -38,7 +44,13 @@ public class AuthenticationService {
     private final JwtTokenService jwtTokens;
     private final TokenHashingService hashes;
     private final RandomTokenService randomTokens;
+    private final RedisSessionStore liveSessions;
     private final Clock clock;
+    private final TransactionTemplate loginRead;
+    private final TransactionTemplate loginWrite;
+    private final Timer loginReadTime;
+    private final Timer passwordTime;
+    private final Timer sessionTime;
 
     public AuthenticationService(
             UserRepository users,
@@ -47,7 +59,10 @@ public class AuthenticationService {
             JwtTokenService jwtTokens,
             TokenHashingService hashes,
             RandomTokenService randomTokens,
-            Clock clock
+            RedisSessionStore liveSessions,
+            Clock clock,
+            PlatformTransactionManager transactionManager,
+            MeterRegistry metrics
     ) {
         this.users = users;
         this.sessions = sessions;
@@ -55,24 +70,35 @@ public class AuthenticationService {
         this.jwtTokens = jwtTokens;
         this.hashes = hashes;
         this.randomTokens = randomTokens;
+        this.liveSessions = liveSessions;
         this.clock = clock;
+        this.loginRead = new TransactionTemplate(transactionManager);
+        this.loginRead.setReadOnly(true);
+        this.loginWrite = new TransactionTemplate(transactionManager);
+        this.loginReadTime = metrics.timer("weblens.auth.login.stage", "stage", "lookup");
+        this.passwordTime = metrics.timer("weblens.auth.login.stage", "stage", "password");
+        this.sessionTime = metrics.timer("weblens.auth.login.stage", "stage", "session");
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.NEVER)
     public IssuedAuthentication register(RegisterRequest request) {
         requireBcryptCompatible(request.password(), false);
         EmailAddress email = EmailAddress.of(request.email());
-        if (users.existsByNormalizedEmail(email.value())) {
+        if (Boolean.TRUE.equals(loginRead.execute(status -> users.existsByNormalizedEmail(email.value())))) {
             throw emailConflict();
         }
+        String encodedPassword = passwords.encode(request.password());
+        return activate(loginWrite.execute(status -> registerUser(request, email, encodedPassword)));
+    }
 
+    private SessionIssuance registerUser(RegisterRequest request, EmailAddress email, String encodedPassword) {
         Instant now = clock.instant();
         UserEntity user = new UserEntity(
                 UUID.randomUUID(),
                 email.value(),
                 email.value(),
                 request.displayName().strip(),
-                passwords.encode(request.password()),
+                encodedPassword,
                 UserStatus.ACTIVE,
                 now,
                 now
@@ -85,19 +111,41 @@ public class AuthenticationService {
         return createSession(user, now);
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.NEVER)
     public IssuedAuthentication login(LoginRequest request) {
         requireBcryptCompatible(request.password(), true);
         EmailAddress email = EmailAddress.of(request.email());
-        UserEntity user = users.findByNormalizedEmail(email.value())
-                .orElseThrow(this::invalidCredentials);
-        if (user.getStatus() != UserStatus.ACTIVE || !passwords.matches(request.password(), user.getPasswordHash())) {
+        LoginCredential credential = loginReadTime.record(() -> loginRead.execute(status -> {
+            UserEntity user = users.findByNormalizedEmail(email.value()).orElseThrow(this::invalidCredentials);
+            if (user.getStatus() != UserStatus.ACTIVE) {
+                throw invalidCredentials();
+            }
+            return new LoginCredential(user.getId(), user.getPasswordHash(), user.getVersion());
+        }));
+        if (!passwordTime.record(() -> passwords.matches(request.password(), credential.passwordHash()))) {
             throw invalidCredentials();
         }
-        return createSession(user, clock.instant());
+        // Re-read under the existing user lock: credentials may change while bcrypt runs.
+        return activate(sessionTime.record(() -> loginWrite.execute(status -> {
+            UserEntity user = users.findByIdForUpdate(credential.id()).orElseThrow(this::invalidCredentials);
+            if (user.getStatus() != UserStatus.ACTIVE
+                    || user.getVersion() != credential.version()
+                    || !user.getPasswordHash().equals(credential.passwordHash())
+                    || !user.getNormalizedEmail().equals(email.value())) {
+                throw invalidCredentials();
+            }
+            return createSession(user, clock.instant());
+        })));
     }
 
-    @Transactional
+    private record LoginCredential(UUID id, String passwordHash, long version) {
+        @Override
+        public String toString() {
+            return "LoginCredential[redacted]";
+        }
+    }
+
+    @Transactional(propagation = Propagation.NEVER)
     public IssuedAuthentication refresh(String refreshToken, String csrfToken) {
         if (refreshToken == null || refreshToken.isBlank()) {
             throw invalidRefresh();
@@ -106,7 +154,21 @@ public class AuthenticationService {
         UUID sessionId = uuidClaim(refreshJwt.getClaimAsString(JwtTokenService.SESSION_ID));
         UUID userId = uuidClaim(refreshJwt.getSubject());
         String tokenId = refreshJwt.getId();
+        String oldHash = hashes.hash(tokenId);
+        if (!liveSessions.matchesRefresh(sessionId, userId, oldHash)) {
+            throw invalidRefresh();
+        }
 
+        SessionIssuance next = loginWrite.execute(status -> rotateSession(sessionId, userId, tokenId, csrfToken));
+        // Publication is after SQL commit. Compare-and-set cannot resurrect a logged-out session.
+        if (!liveSessions.rotate(sessionId, userId, oldHash,
+                hashes.hash(next.pair().refreshJti()), next.pair().refreshExpiresAt())) {
+            throw invalidRefresh();
+        }
+        return next.authentication();
+    }
+
+    private SessionIssuance rotateSession(UUID sessionId, UUID userId, String tokenId, String csrfToken) {
         AuthSessionEntity session = sessions.findByIdForUpdate(sessionId)
                 .orElseThrow(this::invalidRefresh);
         Instant now = clock.instant();
@@ -132,10 +194,10 @@ public class AuthenticationService {
                 pair.refreshExpiresAt(),
                 now
         );
-        return issued(user, pair, nextCsrf);
+        return new SessionIssuance(sessionId, pair, issued(user, pair, nextCsrf));
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.NEVER)
     public void logout(String refreshToken, String csrfToken) {
         if (refreshToken == null || refreshToken.isBlank()) {
             return;
@@ -143,21 +205,27 @@ public class AuthenticationService {
         try {
             Jwt refreshJwt = jwtTokens.decodeRefresh(refreshToken);
             UUID sessionId = uuidClaim(refreshJwt.getClaimAsString(JwtTokenService.SESSION_ID));
+            UUID userId = uuidClaim(refreshJwt.getSubject());
             String tokenId = refreshJwt.getId();
-            sessions.findByIdForUpdate(sessionId).ifPresent(session -> {
-                if (tokenId != null
-                        && csrfToken != null
-                        && hashes.matches(tokenId, session.getRefreshJtiHash())
-                        && hashes.matches(csrfToken, session.getCsrfTokenHash())) {
-                    session.revoke(clock.instant());
-                }
-            });
+            boolean valid = Boolean.TRUE.equals(loginRead.execute(status -> sessions.findById(sessionId)
+                    .map(session -> session.getUserId().equals(userId)
+                            && tokenId != null && csrfToken != null
+                            && hashes.matches(tokenId, session.getRefreshJtiHash())
+                            && hashes.matches(csrfToken, session.getCsrfTokenHash()))
+                    .orElse(false)));
+            if (valid) {
+                // Commit durable revocation first so restored Redis snapshots cannot revive this session.
+                loginWrite.executeWithoutResult(status -> sessions.findByIdForUpdate(sessionId)
+                        .filter(session -> session.getUserId().equals(userId))
+                        .ifPresent(session -> session.revoke(clock.instant())));
+                liveSessions.revoke(sessionId, userId);
+            }
         } catch (UnauthorizedException ignored) {
             // Logout deliberately does not reveal whether a session/token exists.
         }
     }
 
-    private IssuedAuthentication createSession(UserEntity user, Instant now) {
+    private SessionIssuance createSession(UserEntity user, Instant now) {
         UUID sessionId = UUID.randomUUID();
         TokenPair pair = jwtTokens.issue(user.getId(), sessionId);
         String csrfToken = randomTokens.create();
@@ -169,7 +237,20 @@ public class AuthenticationService {
                 pair.refreshExpiresAt(),
                 now
         ));
-        return issued(user, pair, csrfToken);
+        return new SessionIssuance(sessionId, pair, issued(user, pair, csrfToken));
+    }
+
+    private IssuedAuthentication activate(SessionIssuance issued) {
+        liveSessions.create(issued.sessionId(), issued.authentication().response().user().id(),
+                hashes.hash(issued.pair().refreshJti()), issued.pair().refreshExpiresAt());
+        return issued.authentication();
+    }
+
+    private record SessionIssuance(UUID sessionId, TokenPair pair, IssuedAuthentication authentication) {
+        @Override
+        public String toString() {
+            return "SessionIssuance[redacted]";
+        }
     }
 
     private IssuedAuthentication issued(UserEntity user, TokenPair pair, String csrfToken) {

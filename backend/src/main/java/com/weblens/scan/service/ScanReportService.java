@@ -19,41 +19,61 @@ import com.weblens.scan.dto.ScanPageFilter;
 import com.weblens.scan.dto.ScanReportSummaryResponse;
 import com.weblens.scan.dto.StructuredDataSummaryResponse;
 import com.weblens.scan.repository.ScanRepository;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.net.URI;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClientException;
 
 @Service
-@Transactional(readOnly = true)
+@Transactional(propagation = Propagation.NEVER)
 public class ScanReportService {
 
     private final ScanRepository scans;
     private final CurrentUserService currentUsers;
     private final CrawlerReportClient crawler;
     private final ObjectMapper objectMapper;
+    private final TransactionTemplate authorization;
+    private final Timer authorizationTime;
+    private final Timer remoteTime;
+    private final Semaphore reportSlots;
 
     public ScanReportService(
             ScanRepository scans,
             CurrentUserService currentUsers,
             CrawlerReportClient crawler,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            PlatformTransactionManager transactionManager,
+            MeterRegistry metrics,
+            @Value("${weblens.crawler.report-concurrency:8}") int reportConcurrency
     ) {
         this.scans = scans;
         this.currentUsers = currentUsers;
         this.crawler = crawler;
         this.objectMapper = objectMapper;
+        if (reportConcurrency < 1 || reportConcurrency > 64) {
+            throw new IllegalArgumentException("Report concurrency must be between 1 and 64");
+        }
+        this.reportSlots = new Semaphore(reportConcurrency);
+        this.authorization = new TransactionTemplate(transactionManager);
+        this.authorization.setReadOnly(true);
+        this.authorizationTime = metrics.timer("weblens.scan.report.stage", "stage", "authorization");
+        this.remoteTime = metrics.timer("weblens.scan.report.stage", "stage", "remote");
     }
 
     public ScanPagesResponse listPages(UUID userId, UUID scanId, int limit, String cursor, ScanPageFilter filter) {
-        currentUsers.requireActive(userId);
-        scans.findByIdAndRequestedByUserId(scanId, userId)
-                .orElseThrow(ScanReportService::notFound);
+        authorize(userId, scanId);
         if (filter.statusMin() != null && filter.statusMax() != null
                 && filter.statusMin() > filter.statusMax()) {
             throw new ApiException(
@@ -63,8 +83,9 @@ public class ScanReportService {
                     "statusMin must be less than or equal to statusMax."
             );
         }
+        acquireReportSlot();
         try {
-            CrawlerScanPagesContract report = crawler.listPages(userId, scanId, limit, cursor, filter);
+            CrawlerScanPagesContract report = remoteTime.record(() -> crawler.listPages(userId, scanId, limit, cursor, filter));
             if (report == null || report.state() == null || report.summary() == null || report.items() == null) {
                 throw unavailable(null);
             }
@@ -88,16 +109,20 @@ public class ScanReportService {
                     report.nextCursor()
             );
         } catch (HttpClientErrorException.NotFound exception) {
-            throw notFound();
+            throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "SCAN_REPORT_NOT_READY",
+                    "Scan report is not ready", "The accepted scan report is not available yet.", exception);
         } catch (RestClientException exception) {
             throw unavailable(exception);
+        } finally {
+            reportSlots.release();
         }
     }
 
     public ScanPageResponse getPage(UUID userId, UUID pageId) {
-        currentUsers.requireActive(userId);
+        authorize(userId, null);
+        acquireReportSlot();
         try {
-            CrawlerPageContract page = crawler.getPage(userId, pageId);
+            CrawlerPageContract page = remoteTime.record(() -> crawler.getPage(userId, pageId));
             if (page == null) {
                 throw unavailable(null);
             }
@@ -106,7 +131,25 @@ public class ScanReportService {
             throw notFound();
         } catch (RestClientException exception) {
             throw unavailable(exception);
+        } finally {
+            reportSlots.release();
         }
+    }
+
+    private void acquireReportSlot() {
+        if (!reportSlots.tryAcquire()) {
+            throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "SCAN_REPORT_BUSY",
+                    "Scan report is busy", "Report capacity is currently in use. Retry later.");
+        }
+    }
+
+    private void authorize(UUID userId, UUID scanId) {
+        authorizationTime.record(() -> authorization.executeWithoutResult(status -> {
+            currentUsers.requireActive(userId);
+            if (scanId != null && !scans.existsByIdAndRequestedByUserId(scanId, userId)) {
+                throw notFound();
+            }
+        }));
     }
 
     private ScanPageResponse toResponse(CrawlerPageContract page) {

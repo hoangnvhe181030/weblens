@@ -9,6 +9,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.slf4j.MDC;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
@@ -21,6 +23,7 @@ public class CorrelationIdFilter extends OncePerRequestFilter {
     public static final String HEADER = "X-Correlation-ID";
     public static final String ATTRIBUTE = CorrelationIdFilter.class.getName() + ".correlationId";
     private static final Pattern ALLOWED = Pattern.compile("[A-Za-z0-9._-]{1,64}");
+    private static final Logger ADMISSION = LoggerFactory.getLogger("com.weblens.scan.admission.http");
 
     @Override
     protected void doFilterInternal(
@@ -34,8 +37,17 @@ public class CorrelationIdFilter extends OncePerRequestFilter {
                 : UUID.randomUUID().toString();
         request.setAttribute(ATTRIBUTE, correlationId);
         response.setHeader(HEADER, correlationId);
+        boolean admission = "POST".equals(request.getMethod())
+                && request.getRequestURI().matches("/api/v1/websites/[0-9a-fA-F-]{36}/scans");
+        long started = System.nanoTime();
+        boolean completed = false;
         try (MDC.MDCCloseable ignored = MDC.putCloseable("correlationId", correlationId)) {
+            if (admission) ADMISSION.info("scan_admission_enter correlationId={}", correlationId);
             filterChain.doFilter(request, response);
+            completed = true;
+        } finally {
+            if (admission) ADMISSION.info("scan_admission_exit correlationId={} status={} completed={} elapsedMs={}",
+                    correlationId, response.getStatus(), completed, (System.nanoTime() - started) / 1_000_000.0);
         }
     }
 

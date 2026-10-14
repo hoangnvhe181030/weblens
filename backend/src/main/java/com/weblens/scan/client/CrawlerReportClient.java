@@ -6,6 +6,7 @@ import java.util.UUID;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
+import org.slf4j.MDC;
 
 @Component
 public class CrawlerReportClient {
@@ -23,6 +24,11 @@ public class CrawlerReportClient {
         requestFactory.setReadTimeout(properties.readTimeout());
         this.client = builder.clone()
                 .baseUrl(properties.reportBaseUrl().toString())
+                .requestInterceptor((request, body, execution) -> {
+                    String correlationId = MDC.get("correlationId");
+                    if (correlationId != null) request.getHeaders().set("X-Correlation-ID", correlationId);
+                    return execution.execute(request, body);
+                })
                 .requestFactory(requestFactory)
                 .build();
     }
