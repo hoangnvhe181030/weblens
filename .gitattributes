@@ -1,0 +1,2 @@
+# Capture stores raw migration checksums; preserve the CRLF bytes applied on the VPS.
+capture-worker/migrations/postgresql/*.sql text eol=crlf
