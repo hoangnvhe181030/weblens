@@ -12,6 +12,11 @@ import (
 )
 
 type Config struct {
+	CommandTransport       string
+	RabbitURL              string
+	RabbitUsername         string
+	RabbitPublisher        string
+	RabbitConcurrency      int
 	HTTPAddress            string
 	PostgresURL            string
 	ClickHouseAddress      string
@@ -36,10 +41,16 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	transport := value("WEBLENS_SCAN_COMMAND_TRANSPORT", "http")
+	rabbitTLS, rabbitTLSError := boolValue("WEBLENS_RABBITMQ_TLS", false)
 	migrateOnStart, migrateOnStartError := boolValue("CRAWLER_MIGRATE_ON_START", false)
 	localTargetsOnly, localTargetsOnlyError := boolValue("CRAWLER_LOCAL_TARGETS_ONLY", false)
 	clickHouseSecure, clickHouseSecureError := boolValue("CRAWLER_CLICKHOUSE_SECURE", false)
 	cfg := Config{
+		CommandTransport:       transport,
+		RabbitUsername:         value("CRAWLER_RABBITMQ_USERNAME", "weblens_crawler"),
+		RabbitPublisher:        value("WEBLENS_RABBITMQ_USERNAME", "weblens_control"),
+		RabbitConcurrency:      intValue("CRAWLER_RABBITMQ_CONCURRENCY", 4),
 		HTTPAddress:            value("CRAWLER_HTTP_ADDRESS", ":8081"),
 		PostgresURL:            strings.TrimSpace(os.Getenv("CRAWLER_POSTGRES_URL")),
 		ClickHouseAddress:      value("CRAWLER_CLICKHOUSE_ADDR", "localhost:19000"),
@@ -62,7 +73,25 @@ func Load() (Config, error) {
 		MigrateOnStart:         migrateOnStart,
 		LocalTargetsOnly:       localTargetsOnly,
 	}
+	var rabbitError error
+	if transport == "rabbitmq" {
+		host := value("WEBLENS_RABBITMQ_HOST", "127.0.0.1")
+		port := intValue("WEBLENS_RABBITMQ_PORT", 5672)
+		password := os.Getenv("CRAWLER_RABBITMQ_PASSWORD")
+		scheme := "amqp"
+		if rabbitTLS {
+			scheme = "amqps"
+		}
+		if port < 1 || port > 65535 || password == "" ||
+			(!rabbitTLS && host != "127.0.0.1" && host != "::1" && host != "localhost") {
+			rabbitError = errors.New("RabbitMQ requires credentials, a valid port, and TLS outside loopback")
+		}
+		endpoint := url.URL{Scheme: scheme, Host: net.JoinHostPort(host, strconv.Itoa(port)),
+			User: url.UserPassword(cfg.RabbitUsername, password), Path: "/" + value("WEBLENS_RABBITMQ_VHOST", "weblens")}
+		cfg.RabbitURL = endpoint.String()
+	}
 	return cfg, errors.Join(
+		rabbitTLSError, rabbitError,
 		migrateOnStartError,
 		localTargetsOnlyError,
 		clickHouseSecureError,
@@ -72,6 +101,12 @@ func Load() (Config, error) {
 
 func (c Config) Validate() error {
 	var problems []error
+	if c.CommandTransport != "" && c.CommandTransport != "http" && c.CommandTransport != "rabbitmq" {
+		problems = append(problems, errors.New("WEBLENS_SCAN_COMMAND_TRANSPORT must be http or rabbitmq"))
+	}
+	if c.CommandTransport == "rabbitmq" && (c.RabbitURL == "" || c.RabbitConcurrency < 1 || c.RabbitConcurrency > 16) {
+		problems = append(problems, errors.New("RabbitMQ requires an endpoint and 1..16 consumers"))
+	}
 	if c.ClickHouseReadMaxConns < 1 || c.ClickHouseReadMaxConns > 64 {
 		problems = append(problems, errors.New("CRAWLER_CLICKHOUSE_READ_MAX_CONNS must be between 1 and 64"))
 	}

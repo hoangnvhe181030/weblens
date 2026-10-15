@@ -1,5 +1,13 @@
 # Billing schema và IPN — execution revision 1
 
+## Production rollout authorization — 2026-10-15
+
+Yêu cầu mới của người dùng triển khai tất cả thay đổi lên VPS cho phép đưa V14
+hiện hữu vào rollout này, sau khi xác minh các gate bên dưới trên host thật.
+Không sửa SQL/checksum, không bật billing hoặc thanh toán LIVE. Ghi bằng chứng
+backup, restore drill, lock window và Flyway trong báo cáo triển khai VPS.
+Những ghi chú “production chưa được duyệt” bên dưới mô tả phạm vi ngày 13/10.
+
 Scope đã duyệt: workload/policy revision 1 và `credit_accounts`, `payment_orders`,
 `usage_reservations`, `credit_ledger`. Không sửa cấu trúc scans/users/websites,
 không thêm datastore hoặc deployable. Triển khai giai đoạn này là local persistence

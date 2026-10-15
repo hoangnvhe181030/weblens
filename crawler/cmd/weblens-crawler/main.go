@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/weblens-project/weblens-crawler/internal/analytics"
+	"github.com/weblens-project/weblens-crawler/internal/commands"
 	"github.com/weblens-project/weblens-crawler/internal/config"
 	"github.com/weblens-project/weblens-crawler/internal/contracts"
 	"github.com/weblens-project/weblens-crawler/internal/crawl"
@@ -29,6 +30,7 @@ type readyStore struct {
 	postgres          *postgres.Store
 	clickhouse        *analytics.Sink
 	maximumBacklogAge time.Duration
+	commandConsumer   *commands.Consumer
 }
 
 func (s readyStore) AcceptCommand(ctx context.Context, envelope contracts.ScanCommandEnvelope) (bool, error) {
@@ -40,6 +42,9 @@ func (s readyStore) AcceptCancellation(ctx context.Context, envelope contracts.S
 }
 
 func (s readyStore) Ping(ctx context.Context) error {
+	if s.commandConsumer != nil && !s.commandConsumer.Ready() {
+		return errors.New("scan command consumer unavailable")
+	}
 	if err := s.postgres.Ping(ctx); err != nil {
 		return err
 	}
@@ -134,11 +139,18 @@ func run(logger *slog.Logger, args []string) error {
 		store, cfg.ControlEventsURL, cfg.ServiceToken,
 		cfg.PublisherPollInterval, cfg.LeaseDuration, logger,
 	)
+	var commandConsumer *commands.Consumer
+	if cfg.CommandTransport == "rabbitmq" {
+		commandConsumer = commands.NewConsumer(cfg.RabbitURL, cfg.RabbitUsername, cfg.RabbitPublisher, cfg.RabbitConcurrency, store, logger)
+	}
 	api := httpapi.NewServer(
 		readyStore{
-			postgres: store, clickhouse: analyticsSink, maximumBacklogAge: cfg.AnalyticsBacklogAge,
+			postgres: store, clickhouse: analyticsSink, maximumBacklogAge: cfg.AnalyticsBacklogAge, commandConsumer: commandConsumer,
 		}, analyticsSink, cfg.ServiceToken, logger,
 	)
+	if commandConsumer != nil {
+		api.DisableHTTPCommands()
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddress,
 		Handler:           api.Handler(),
@@ -151,7 +163,11 @@ func run(logger *slog.Logger, args []string) error {
 	componentContext, cancelComponents := context.WithCancel(rootContext)
 	defer cancelComponents()
 	var components sync.WaitGroup
-	for _, run := range []func(context.Context){engine.Run, analyticsWorker.Run, eventPublisher.Run} {
+	runners := []func(context.Context){engine.Run, analyticsWorker.Run, eventPublisher.Run}
+	if commandConsumer != nil {
+		runners = append(runners, commandConsumer.Run)
+	}
+	for _, run := range runners {
 		components.Add(1)
 		go func() {
 			defer components.Done()

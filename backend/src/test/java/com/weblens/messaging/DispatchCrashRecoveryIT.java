@@ -189,7 +189,8 @@ public class DispatchCrashRecoveryIT {
             URI endpoint = URI.create(System.getenv("CRASH_ENDPOINT"));
             var properties = new CrawlerProperties(endpoint, endpoint, TOKEN,
                     Duration.ofMillis(100), Duration.ofSeconds(2), Duration.ofSeconds(15));
-            var dispatcher = new CrawlerCommandDispatcher(adapter, properties, RestClient.builder(), Clock.systemUTC(), 1);
+            var dispatcher = new CrawlerCommandDispatcher(adapter, properties, RestClient.builder(), Clock.systemUTC(), 1,
+                    new ScanCommandTransportProperties(ScanCommandTransportProperties.Transport.HTTP, null, 0, null, null, null, false));
             try {
                 dispatcher.dispatch();
                 if (!acknowledged.await(30, TimeUnit.SECONDS)) throw new IllegalStateException("CHILD_ACK_NOT_COMMITTED");

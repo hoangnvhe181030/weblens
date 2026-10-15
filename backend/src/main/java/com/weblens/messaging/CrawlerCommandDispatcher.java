@@ -25,18 +25,25 @@ public class CrawlerCommandDispatcher {
     private final RestClient client;
     private final Clock clock;
     private final CommandDispatchExecutor senders;
+    private final RabbitScanCommandPublisher rabbit;
 
     public CrawlerCommandDispatcher(
             ControlMessagingRepository messages,
             CrawlerProperties properties,
             RestClient.Builder restClientBuilder,
             Clock clock,
-            @Value("${weblens.crawler.dispatch-concurrency:4}") int concurrency
+            @Value("${weblens.crawler.dispatch-concurrency:4}") int concurrency,
+            ScanCommandTransportProperties transport
     ) {
         this.messages = messages;
         this.properties = properties;
         this.clock = clock;
-        CommandDispatchExecutor.validateLease(properties.connectTimeout(), properties.readTimeout(), properties.outboxLease());
+        this.rabbit = transport.transport() == ScanCommandTransportProperties.Transport.RABBITMQ
+                ? new RabbitScanCommandPublisher(transport) : null;
+        CommandDispatchExecutor.validateLease(
+                rabbit == null ? properties.connectTimeout() : RabbitScanCommandPublisher.SETUP_BUDGET,
+                rabbit == null ? properties.readTimeout() : RabbitScanCommandPublisher.CONFIRM_BUDGET,
+                properties.outboxLease());
         this.senders = new CommandDispatchExecutor("crawler-dispatch", concurrency);
         SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
         requestFactory.setConnectTimeout(properties.connectTimeout());
@@ -56,11 +63,15 @@ public class CrawlerCommandDispatcher {
     @PreDestroy
     public void close() {
         senders.close();
+        if (rabbit != null) rabbit.close();
     }
 
     private void dispatch(OutboxRecord message) {
         try {
-            client.post()
+            if (rabbit != null) {
+                rabbit.publish(message);
+            } else {
+                client.post()
                     .uri(properties.commandUrl())
                     .contentType(MediaType.APPLICATION_JSON)
                     .header("X-WebLens-Service-Token", properties.serviceToken())
@@ -69,6 +80,7 @@ public class CrawlerCommandDispatcher {
                     .body(message.payload())
                     .retrieve()
                     .toBodilessEntity();
+            }
             if (!messages.complete(message, clock.instant())) {
                 LOGGER.warn("Outbox acknowledgement lost its lease: messageId={}", message.messageId());
             }

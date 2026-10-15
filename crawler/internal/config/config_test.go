@@ -7,6 +7,7 @@ import (
 )
 
 func TestLoadUsesProductionCapacityDefaults(t *testing.T) {
+	t.Setenv("WEBLENS_SCAN_COMMAND_TRANSPORT", "http")
 	t.Setenv("CRAWLER_POSTGRES_URL", "postgres://crawler:password@localhost/crawler")
 	t.Setenv("CRAWLER_SERVICE_TOKEN", strings.Repeat("x", 32))
 	t.Setenv("CRAWLER_WORKER_CONCURRENCY", "")
@@ -23,6 +24,31 @@ func TestLoadUsesProductionCapacityDefaults(t *testing.T) {
 	}
 	if cfg.LocalTargetsOnly {
 		t.Fatal("local-only network policy was enabled by default")
+	}
+}
+
+func TestRabbitConfig(t *testing.T) {
+	t.Setenv("CRAWLER_POSTGRES_URL", "postgres://crawler:password@localhost/crawler")
+	t.Setenv("CRAWLER_SERVICE_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("WEBLENS_SCAN_COMMAND_TRANSPORT", "rabbitmq")
+	t.Setenv("WEBLENS_RABBITMQ_HOST", "127.0.0.1")
+	t.Setenv("WEBLENS_RABBITMQ_TLS", "false")
+	t.Setenv("CRAWLER_RABBITMQ_PASSWORD", "local-only")
+	cfg, err := Load()
+	if err != nil || cfg.CommandTransport != "rabbitmq" || cfg.RabbitConcurrency != 4 {
+		t.Fatal("valid RabbitMQ config rejected")
+	}
+	t.Setenv("WEBLENS_RABBITMQ_HOST", "broker.example")
+	if _, err := Load(); err == nil {
+		t.Fatal("plaintext remote broker accepted")
+	}
+	t.Setenv("WEBLENS_RABBITMQ_TLS", "true")
+	if _, err := Load(); err != nil {
+		t.Fatal("TLS remote broker rejected")
+	}
+	t.Setenv("WEBLENS_SCAN_COMMAND_TRANSPORT", "typo")
+	if _, err := Load(); err == nil {
+		t.Fatal("unknown transport accepted")
 	}
 }
 

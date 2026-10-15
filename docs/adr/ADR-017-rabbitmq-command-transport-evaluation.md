@@ -1,7 +1,51 @@
 # Đánh giá RabbitMQ cho đường giao lệnh scan
 
-Status: Proposed  
+Status: Accepted for implementation; controlled single-node VPS rollout authorized
 Date: 2026-10-03
+
+## Revision 3 — 2026-10-15
+
+Người dùng yêu cầu triển khai tất cả thay đổi hiện tại lên VPS, bao gồm bật
+RabbitMQ. Cho phép rollout có kiểm soát trên một node Windows Server 2019:
+RabbitMQ 4.3.6 / Erlang 28.5, fresh credential và ACL riêng, mọi listener chỉ
+loopback. Ba deployable và service ownership không đổi. Giữ billing tắt.
+
+Revision này cho phép cutover sau backup/restore drill, đối chiếu không còn lệnh
+chờ, health và smoke tạo/hủy scan; không xem benchmark local là capacity proof.
+Chấp nhận giới hạn broker đơn không HA; các gate performance 150/300/500 bên
+dưới vẫn chưa hoàn tất. Phải đối chiếu inbox thay vì coi publisher confirm là
+scan đã tiếp nhận. Khi rollback phải phục hồi cả environment và service dependency.
+Kết quả triển khai được ghi riêng trong báo cáo VPS sau kiểm chứng thực tế.
+
+## Revision 2 — 2026-10-15
+
+Người dùng chọn triển khai RabbitMQ cho command tạo/hủy scan. Mặc định runtime
+vẫn là HTTP để release mới không tự chuyển transport của môi trường hiện hữu.
+`WEBLENS_SCAN_COMMAND_TRANSPORT=rabbitmq` phải được bật ở cả Control Plane và
+Crawler sau khi provision broker. Không fallback hoặc dual-publish tự động.
+
+Adapter giữ PostgreSQL outbox/inbox và contract JSON hiện hữu, không đổi schema.
+`DELIVERED` ở chế độ RabbitMQ nghĩa là broker đã confirm/routing thành công;
+chỉ inbox Crawler chứng minh command đã được commit. Progress/terminal event,
+Capture, Clone và report vẫn dùng REST.
+
+Queue quorum có giới hạn byte và `reject-publish`; producer dùng persistent,
+mandatory, publisher confirms. Consumer ACK sau commit; lỗi tạm thời retry với
+backoff và bộ đếm header tối đa 8 lần, rồi publish có confirm sang dead queue.
+Poison/collision được chuyển thẳng sang dead queue. Không ACK bản gốc nếu việc
+publish retry/dead thất bại. Delivery limit của broker đặt -1 để reconnect không
+làm broker tự bỏ command; crash trong handoff có thể tạo duplicate cùng ID.
+Dead queue không có TTL hoặc consumer tự động; đầy thì giữ công việc chưa ACK
+và cần operator xử lý. Đây là admission retry, không retry toàn bộ crawl.
+
+Thêm RabbitMQ Java client (version theo Spring Boot BOM) và client Go chính thức
+`amqp091-go`: đây là dependency giao thức AMQP cho hai runtime. Broker local chỉ
+bind loopback, credential demo riêng cho producer/consumer; production cần secret,
+vhost/ACL riêng và TLS ngoài loopback. Một broker local không chứng minh HA.
+
+Phần benchmark dưới đây là evidence lịch sử. Các gate production và quy trình
+đối chiếu trước cutover/rollback vẫn áp dụng; chấp thuận implementation không
+đồng nghĩa đã vượt performance gate hoặc đã deploy VPS.
 
 ## Context
 
@@ -42,10 +86,11 @@ Chi tiết phương pháp và bằng chứng:
 3. **Kafka:** chỉ xem xét khi có workload yêu cầu lưu/replay luồng sự kiện và nhiều
    nhóm tiêu thụ độc lập. Hiện chưa có yêu cầu này để ưu tiên Kafka.
 
-## Decision
+## Decision ban đầu — evidence ngày 2026-10-03
 
 Đề xuất tiếp tục đánh giá phương án 1 và 2 trên **handler và PostgreSQL thật**.
-Thử nghiệm transport cục bộ đã hoàn thành, chưa có adapter RabbitMQ trong runtime.
+Tại thời điểm 2026-10-03, thử nghiệm transport cục bộ đã hoàn thành, chưa có
+adapter RabbitMQ trong runtime. Revision 2 ở đầu tài liệu thay thế trạng thái này.
 
 Kết quả ở 500 lệnh tổng hợp, trung vị p95 của ba lần chạy:
 
@@ -59,7 +104,7 @@ RabbitMQ nhanh hơn HTTP 4 luồng khoảng 23,7% trong mẫu 500 này. Ở mẫ
 RabbitMQ chậm hơn HTTP 4 luồng. Không khẳng định ưu thế ổn định, mức tăng thông
 lượng crawl hoặc capacity 500 người dựa trên thử nghiệm này.
 
-### Thiết kế adapter thử nghiệm tiếp theo
+### Thiết kế adapter được triển khai trong revision 2
 
 - Phạm vi đầu là SCAN_REQUESTED và SCAN_CANCEL_REQUESTED giữa Control và Crawler.
   Public HTTP admission và report API tiếp tục cần được đo riêng.
@@ -106,11 +151,13 @@ lượng crawl hoặc capacity 500 người dựa trên thử nghiệm này.
 
 ## Consequences
 
-Đánh giá mới thêm dependency AMQP Java **chỉ trong công cụ thử nghiệm độc lập**,
-khớp phiên bản 5.25.0 được BOM Spring Boot 3.5.16 của backend quản lý. Không có
-dependency RabbitMQ trong artifact production hiện tại.
+Đánh giá ngày 2026-10-03 chỉ thêm dependency AMQP Java trong công cụ thử nghiệm
+độc lập. Revision 2 thêm client Java 5.25.0 theo BOM Spring Boot 3.5.16 vào backend
+và `amqp091-go` 1.11.0 vào Crawler; runtime có adapter tùy chọn. Revision 3 cho
+phép rollout VPS có kiểm soát. Xem [runbook](../../infra/rabbitmq/README.md) và
+[TASK-020](../../tasks/TASK-020-rabbitmq-scan-command-transport.md).
 
-Việc áp dụng broker sẽ cần thư viện client cho Java và Go, theo dõi broker, quyền
+Việc vận hành broker cần theo dõi broker, quyền
 truy cập và thao tác đối chiếu mới. Broker không làm nhanh query ClickHouse hay
 transaction claim page; các đường này vẫn cần tối ưu nếu giới hạn pages/s tồn tại.
 

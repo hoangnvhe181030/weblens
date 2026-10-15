@@ -36,7 +36,8 @@ foreach ($name in @(
     'com.weblens.persistence.FoundationPersistenceIT',
     'com.weblens.scan.service.ScanCancellationIT',
     'com.weblens.messaging.ControlMessagingRepositoryIT',
-    'com.weblens.messaging.DispatchCrashRecoveryIT'
+    'com.weblens.messaging.DispatchCrashRecoveryIT',
+    'com.weblens.messaging.RabbitScanCommandPublisherIT'
 )) {
     $path = Join-Path $Reports "TEST-$name.xml"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing integration evidence: $name" }

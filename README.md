@@ -25,13 +25,18 @@ V1/V1.5 tập trung vào đăng ký website, chạy bounded scan, theo dõi ti�
 
 Kiến trúc được duyệt trong [ADR-005](docs/adr/ADR-005-tach-crawler-thanh-microservice.md) có ba deployable chính: Spring Boot Control Plane, Go Crawler Service và Playwright Capture Worker. [ADR-006](docs/adr/ADR-006-tich-hop-clickhouse-cho-analytics.md) bổ sung ClickHouse làm analytical store; PostgreSQL vẫn sở hữu workflow và S3/MinIO sở hữu artifact lớn. Control Plane giữ modular boundaries nội bộ; mỗi service có database/role riêng. [ADR-019](docs/adr/ADR-019-redis-jwt-session-lifecycle.md) thêm Redis cho phiên JWT; Kafka, Kubernetes và Redis cho workflow chưa thuộc phạm vi.
 
+RabbitMQ tùy chọn cho lệnh tạo/hủy scan đã có theo
+[ADR-017](docs/adr/ADR-017-rabbitmq-command-transport-evaluation.md).
+Giữ PostgreSQL outbox/inbox; mặc định transport vẫn là HTTP. Hướng dẫn bật ở cả
+backend/Crawler, theo dõi và chuyển đổi tại [RabbitMQ runbook](infra/rabbitmq/README.md).
+
 ## Repository structure
 
 - `backend/`: Spring Boot foundation đang được chuyển thành Control Plane và migration Flyway thuộc ownership của service này
 - `frontend/`: React/TypeScript product frontend dùng Control Plane API
 - `crawler/`: deployable Go mang giấy phép AGPL-3.0, provenance CrawlObserver và migration thuộc Crawler
 - `capture-worker/`: Playwright/TypeScript deployable, migration PostgreSQL và ClickHouse thuộc ownership của Capture Worker
-- `infra/`: ba PostgreSQL workflow database, ClickHouse, MinIO và Capture Worker local bằng Compose
+- `infra/`: ba PostgreSQL workflow database, ClickHouse, MinIO, Capture Worker và profile RabbitMQ local bằng Compose
 - `docs/`: product and engineering sources of truth
 - `docs/adr/`: architecture decision records
 - `tasks/`: scoped implementation specifications

@@ -72,7 +72,8 @@ class CrawlerCommandDispatcherTest {
             URI endpoint = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/commands");
             var properties = new CrawlerProperties(endpoint, endpoint, "test-service-token-at-least-32-bytes",
                     Duration.ofMillis(500), Duration.ofSeconds(2), Duration.ofSeconds(30));
-            var dispatcher = new CrawlerCommandDispatcher(messages, properties, RestClient.builder(), Clock.systemUTC(), concurrency);
+            var dispatcher = new CrawlerCommandDispatcher(messages, properties, RestClient.builder(), Clock.systemUTC(), concurrency,
+                    new ScanCommandTransportProperties(ScanCommandTransportProperties.Transport.HTTP, null, 0, null, null, null, false));
             try {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
                 while (completed.getCount() > 0 && System.nanoTime() < deadline) {

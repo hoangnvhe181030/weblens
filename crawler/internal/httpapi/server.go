@@ -42,12 +42,16 @@ type reportReader interface {
 }
 
 type Server struct {
-	store         commandStore
-	reports       reportReader
-	serviceDigest [32]byte
-	logger        *slog.Logger
-	mux           *http.ServeMux
+	store            commandStore
+	reports          reportReader
+	serviceDigest    [32]byte
+	logger           *slog.Logger
+	mux              *http.ServeMux
+	commandsDisabled bool
 }
+
+// Called before serving requests; prevent accidental dual transport during rollout.
+func (s *Server) DisableHTTPCommands() { s.commandsDisabled = true }
 
 func NewServer(store commandStore, reports reportReader, serviceToken string, logger *slog.Logger) *Server {
 	server := &Server{store: store, reports: reports, serviceDigest: sha256.Sum256([]byte(serviceToken)), logger: logger, mux: http.NewServeMux()}
@@ -356,6 +360,10 @@ func (s *Server) ready(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) acceptScan(response http.ResponseWriter, request *http.Request) {
+	if s.commandsDisabled {
+		writeProblem(response, request, http.StatusServiceUnavailable, "COMMAND_TRANSPORT_DISABLED", "Scan commands use RabbitMQ on this instance.")
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(request.Body, maxCommandBody+1))
 	var maximumBytesError *http.MaxBytesError
 	if errors.As(err, &maximumBytesError) || len(body) > maxCommandBody {

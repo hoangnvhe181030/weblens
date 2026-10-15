@@ -70,6 +70,7 @@ $loopbackApi = Get-ChildItem -LiteralPath (Join-Path $repository 'frontend\dist\
 if ($loopbackApi) { throw 'Frontend production bundle contains a loopback API URL' }
 Copy-Item -Path (Join-Path $repository 'frontend\dist\*') -Destination (Join-Path $staging 'frontend') -Recurse
 Copy-Item -Path (Join-Path $repository 'infra\production-windows\*') -Destination (Join-Path $staging 'infra\production-windows') -Recurse
+Copy-Item -LiteralPath (Join-Path $repository 'infra\rabbitmq') -Destination (Join-Path $staging 'infra\rabbitmq') -Recurse
 
 $components = @{
     backendSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $staging 'backend\weblens-backend.jar')).Hash.ToLowerInvariant()

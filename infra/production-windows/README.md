@@ -102,3 +102,27 @@ Caddy serves `jobnext.top` and `www.jobnext.top` on port 443 with a publicly
 trusted certificate. Direct IP and loopback access keep an internal certificate
 for deployment health checks. Port 80 remains owned by the existing application,
 so WebLens does not install HTTP-to-HTTPS redirects.
+
+## Local RabbitMQ command transport
+
+`install-local-rabbitmq.ps1 -Action install` provisions the inspected VPS only.
+It verifies official RabbitMQ 4.3.6/Erlang 28.5 package hashes, creates fresh
+private credentials, imports `infra/rabbitmq/definitions.json`, and registers
+`WebLensRabbitMQ`. AMQP, management, distribution and EPMD bind only loopback.
+Broker state and credentials live in the protected ProgramData RabbitMQ directory.
+This single-node deployment has no broker HA.
+
+After the command drain and database backup/restore gates, call `deploy.ps1`
+with `-ActivateRabbitMq` for the coordinated cutover. It checks broker readiness,
+backs up the environment/dependencies privately, switches both services together,
+and restores that configuration before restarting the previous release on failure.
+Existing PostgreSQL, Redis and cloud settings are preserved; billing stays off.
+Broker confirmation means handoff, so verify Crawler inbox acceptance separately.
+Run `powershell.exe -NoProfile -File tools/test-windows-rabbit-cutover.ps1` to
+check environment preservation and rollback without touching production services.
+Never switch back to HTTP while RabbitMQ commands remain ready, unacknowledged
+or unresolved in the dead queue. See `infra/rabbitmq/README.md` for reconciliation.
+
+For a manually uploaded release, disable `WebLensDeployPoll` before cutover.
+Enable it only after the published deployment release includes the deployed
+source; otherwise the poller can replace the manual release with an older build.

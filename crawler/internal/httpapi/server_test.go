@@ -23,6 +23,24 @@ import (
 
 const testServiceToken = "test-service-token-that-is-at-least-32-bytes"
 
+func TestRabbitModeDisablesHTTPCommandAcceptance(t *testing.T) {
+	store := &fakeCommandStore{}
+	server := NewServer(store, store, testServiceToken, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server.DisableHTTPCommands()
+	req := httptest.NewRequest(http.MethodPost, "/internal/v1/commands/scans", strings.NewReader("{}"))
+	req.Header.Set("X-WebLens-Service-Token", testServiceToken)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, req)
+	if response.Code != http.StatusServiceUnavailable || store.called {
+		t.Fatal("HTTP command reached persistence in RabbitMQ mode")
+	}
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health/live", nil))
+	if response.Code != http.StatusOK {
+		t.Fatal("RabbitMQ mode disabled HTTP health")
+	}
+}
+
 type fakeCommandStore struct {
 	called bool
 }

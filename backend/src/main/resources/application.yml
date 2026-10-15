@@ -87,6 +87,14 @@ springdoc:
     tags-sorter: alpha
 
 weblens:
+  scan-commands:
+    transport: ${WEBLENS_SCAN_COMMAND_TRANSPORT:http}
+    host: ${WEBLENS_RABBITMQ_HOST:127.0.0.1}
+    port: ${WEBLENS_RABBITMQ_PORT:5672}
+    virtual-host: ${WEBLENS_RABBITMQ_VHOST:weblens}
+    username: ${WEBLENS_RABBITMQ_USERNAME:weblens_control}
+    password: ${WEBLENS_RABBITMQ_PASSWORD:}
+    tls: ${WEBLENS_RABBITMQ_TLS:false}
   billing:
     # Enable only with an external sandbox profile/catalog; scan charging is not wired yet.
     enabled: ${WEBLENS_BILLING_ENABLED:false}

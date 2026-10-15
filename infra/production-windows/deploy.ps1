@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$ReleaseZip,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{7,40}$')][string]$Commit,
-    [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ReleaseSha256
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ReleaseSha256,
+    [switch]$ActivateRabbitMq
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,46 @@ $current = Join-Path $root 'current'
 $release = Join-Path $releases $Commit
 $serviceNames = 'WebLensCrawler', 'WebLensCapture', 'WebLensBackend', 'WebLensCaddy'
 $mutex = [Threading.Mutex]::new($false, 'Global\WebLensDeployment')
+$environmentFile = 'C:\ProgramData\WebLens\weblens.env'
+$environmentBackup = $null
+$previousDependencies = @{}
+
+function Enable-RabbitTransport {
+    $credentials = Get-Content -LiteralPath 'C:\ProgramData\WebLens\rabbitmq\credentials.json' -Raw | ConvertFrom-Json
+    $settings = @{
+        WEBLENS_SCAN_COMMAND_TRANSPORT='rabbitmq'; WEBLENS_RABBITMQ_HOST='127.0.0.1'
+        WEBLENS_RABBITMQ_PORT='5672'; WEBLENS_RABBITMQ_VHOST='weblens'; WEBLENS_RABBITMQ_TLS='false'
+        WEBLENS_RABBITMQ_USERNAME='weblens_control'; WEBLENS_RABBITMQ_PASSWORD=$credentials.weblens_control
+        CRAWLER_RABBITMQ_USERNAME='weblens_crawler'; CRAWLER_RABBITMQ_PASSWORD=$credentials.weblens_crawler
+        CRAWLER_RABBITMQ_CONCURRENCY='4'; WEBLENS_BILLING_ENABLED='false'
+    }
+    foreach ($key in @('WEBLENS_RABBITMQ_PASSWORD','CRAWLER_RABBITMQ_PASSWORD')) {
+        if ($settings[$key] -notmatch '^[0-9a-f]{64}$') { throw 'Invalid production RabbitMQ credentials' }
+    }
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($line in [IO.File]::ReadAllLines($environmentFile)) {
+        if ($line -match '^([^#=]+)=' -and $settings.ContainsKey($Matches[1])) { continue }
+        $lines.Add($line)
+    }
+    foreach ($key in ($settings.Keys | Sort-Object)) { $lines.Add($key + '=' + $settings[$key]) }
+    # Writing in place preserves the protected environment file's existing service ACLs.
+    [IO.File]::WriteAllLines($environmentFile, $lines, [Text.UTF8Encoding]::new($false))
+    foreach ($name in @('WebLensBackend','WebLensCrawler')) {
+        $dependencies = @($previousDependencies[$name]) + 'WebLensRabbitMQ' | Select-Object -Unique
+        & sc.exe config $name depend= ($dependencies -join '/') | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not configure RabbitMQ dependency: $name" }
+    }
+}
+
+function Restore-TransportConfiguration {
+    if (-not $environmentBackup) { return }
+    [IO.File]::WriteAllBytes($environmentFile, [IO.File]::ReadAllBytes($environmentBackup))
+    foreach ($name in $previousDependencies.Keys) {
+        $dependencies = @($previousDependencies[$name]) -join '/'
+        & sc.exe config $name depend= $dependencies | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not restore service dependencies: $name" }
+    }
+}
 
 function Set-CurrentRelease([string]$Target) {
     $resolvedRoot = [IO.Path]::GetFullPath($releases) + [IO.Path]::DirectorySeparatorChar
@@ -127,13 +168,26 @@ try {
             throw
         }
     }
+    if ($ActivateRabbitMq) {
+        & (Join-Path $release 'infra\production-windows\install-local-rabbitmq.ps1') -Action verify
+        $backupDirectory = 'C:\ProgramData\WebLens\backups\transport-' + [guid]::NewGuid().ToString('N')
+        New-Item -ItemType Directory -Path $backupDirectory | Out-Null
+        & icacls.exe $backupDirectory /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Transport backup ACL failed' }
+        $environmentBackup = Join-Path $backupDirectory 'weblens.env'
+        Copy-Item -LiteralPath $environmentFile -Destination $environmentBackup
+        foreach ($name in @('WebLensBackend','WebLensCrawler')) {
+            $previousDependencies[$name] = @((Get-Service $name).ServicesDependedOn | Select-Object -ExpandProperty Name)
+        }
+        $previousDependencies | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupDirectory 'dependencies.json') -Encoding ascii
+    }
     $stopOrder = @($serviceNames)
     [array]::Reverse($stopOrder)
     foreach ($name in $stopOrder) { Stop-Service -Name $name -Force -ErrorAction SilentlyContinue }
     Stop-BackendProcesses
-    Set-CurrentRelease $release
-
     try {
+        if ($ActivateRabbitMq) { Enable-RabbitTransport }
+        Set-CurrentRelease $release
         & (Join-Path $current 'infra\production-windows\run-service.ps1') 'crawler-migrate-postgres'
         if ($LASTEXITCODE -ne 0) { throw 'Crawler PostgreSQL migration failed' }
         foreach ($name in $serviceNames) { Start-Service -Name $name }
@@ -144,6 +198,7 @@ try {
     } catch {
         foreach ($name in $stopOrder) { Stop-Service -Name $name -Force -ErrorAction SilentlyContinue }
         Stop-BackendProcesses
+        Restore-TransportConfiguration
         if ($previous -and (Test-Path -LiteralPath $previous)) {
             Set-CurrentRelease $previous
             foreach ($name in $serviceNames) { Start-Service -Name $name -ErrorAction SilentlyContinue }

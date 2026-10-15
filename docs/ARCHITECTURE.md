@@ -5,6 +5,15 @@ ngày 2026-09-14.
 
 ## Trạng thái hiện tại
 
+Ngày 2026-10-15, [ADR-017 revision 3](adr/ADR-017-rabbitmq-command-transport-evaluation.md)
+thêm RabbitMQ tùy chọn cho lệnh tạo/hủy scan từ Control Plane tới Crawler.
+Hai service chọn `WEBLENS_SCAN_COMMAND_TRANSPORT=rabbitmq`; mặc định vẫn là HTTP.
+Outbox/inbox PostgreSQL, contract JSON, dedup và lease/fencing được giữ nguyên.
+Broker confirm chỉ chứng minh bàn giao cho broker; consumer ACK sau khi inbox và
+execution commit. Event, report, Capture và Clone vẫn dùng REST. Kiểm thử local
+không thay thế benchmark production; người dùng đã cho phép rollout VPS một node
+có kiểm soát, với backup/restore và smoke gate. Xem [runbook](../infra/rabbitmq/README.md).
+
 Ngày 2026-10-05, [ADR-019](adr/ADR-019-redis-jwt-session-lifecycle.md) bổ sung Redis
 cho vòng đời JWT của Control Plane theo yêu cầu người dùng. Access token cần
 session còn hiệu lực trong Redis và kiểm tra thu hồi bền vững trong `auth_sessions`;
@@ -50,7 +59,9 @@ flowchart TB
     UI[React + TypeScript] -->|HTTPS / JSON| CP[Spring Boot Control Plane]
     CP -->|JDBC / local transaction| CPDB[(Control Plane PostgreSQL)]
     CP -->|JWT session validation| AUTHREDIS[(Redis auth sessions)]
-    CP -->|Versioned REST, idempotency| CR[Go Crawler Service]
+    CP -->|Scan command HTTP mặc định, report REST| CR[Go Crawler Service]
+    CP -.->|Scan command RabbitMQ tùy chọn| MQ[(RabbitMQ quorum queue)]
+    MQ -.->|ACK sau inbox commit| CR
     CR -->|Crawler-owned transaction| CRDB[(Crawler PostgreSQL)]
     CR -->|Batched analytical facts| CHC[(ClickHouse Crawl Analytics)]
     CR -->|Bounded HTTP(S)| TARGET[Website được phép scan]
@@ -166,8 +177,10 @@ watermark và reconciliation.
 1. React gửi request có idempotency key tới Control Plane.
 2. Control Plane authorize website, enforce quota và persist public scan ở
    `QUEUED` cùng dispatch outbox trong một local transaction.
-3. Dispatcher gửi command có version và `scan_id` tới Crawler Service. Timeout
-   không chứng minh command thất bại; dispatcher retry cùng idempotency key.
+3. Dispatcher gửi command có version và `scan_id` qua HTTP hoặc RabbitMQ theo
+   cấu hình. Timeout không chứng minh command thất bại; dispatcher retry cùng
+   message ID. Với RabbitMQ, outbox `DELIVERED` ghi nhận broker confirm/routing;
+   inbox Crawler mới chứng minh acceptance commit.
 4. Crawler inbox/dedup tạo execution đúng một lần về mặt logic, dù command được
    nhận at-least-once.
 5. Crawler claim page work bằng lease/fencing, fetch ngoài transaction rồi commit
@@ -210,7 +223,8 @@ watermark và reconciliation.
 
 ## Giao tiếp và consistency contract
 
-- V1/V1.5 dùng REST nội bộ + PostgreSQL outbox/inbox. Redis chỉ phục vụ auth theo ADR-019.
+- V1/V1.5 dùng REST nội bộ + PostgreSQL outbox/inbox; scan command có adapter
+  RabbitMQ tùy chọn theo ADR-017. Redis chỉ phục vụ auth theo ADR-019.
 - Command/event có `message_id`, contract version, aggregate ID, sequence/version,
   correlation ID và timestamp; payload có giới hạn kích thước.
 - Delivery là at-least-once. Consumer phải dedup và xử lý transactionally với

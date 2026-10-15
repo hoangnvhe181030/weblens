@@ -63,15 +63,22 @@ jobs:
       WEBLENS_TEST_CLICKHOUSE_ADDR: localhost:9000
       WEBLENS_TEST_CLICKHOUSE_USERNAME: weblens_test
       WEBLENS_TEST_CLICKHOUSE_PASSWORD: test-only-password
+      WEBLENS_TEST_RABBITMQ_URL: amqp://weblens_admin:weblens-admin-local-only@127.0.0.1:5672/weblens
+      WEBLENS_TEST_RABBITMQ_MANAGEMENT_URL: http://127.0.0.1:15672
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: crawler/go.mod
           cache-dependency-path: crawler/go.sum
+      - name: Start isolated RabbitMQ command broker
+        run: docker compose -p weblens-ci-rabbit -f infra/compose.yml --profile rabbitmq up -d --wait rabbitmq
       - name: Test and vet crawler
         working-directory: crawler
         run: go test -race ./... && go vet ./...
+      - name: Stop test RabbitMQ
+        if: always()
+        run: docker compose -p weblens-ci-rabbit -f infra/compose.yml --profile rabbitmq down
 
   capture-worker:
     runs-on: ubuntu-latest
@@ -146,6 +153,7 @@ jobs:
       - name: Build Windows release
         shell: pwsh
         run: |
+          .\tools\test-windows-rabbit-cutover.ps1
           Push-Location backend
           .\mvnw.cmd -B -DskipTests package
           Pop-Location
