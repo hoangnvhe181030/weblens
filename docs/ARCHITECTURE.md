@@ -14,6 +14,12 @@ execution commit. Event, report, Capture và Clone vẫn dùng REST. Kiểm th�
 không thay thế benchmark production; người dùng đã cho phép rollout VPS một node
 có kiểm soát, với backup/restore và smoke gate. Xem [runbook](../infra/rabbitmq/README.md).
 
+VPS đã bật RabbitMQ ngày 2026-10-15 cho command tạo/hủy scan; 4 consumer, inbox
+reconciliation và owned-fixture scan/report/Capture/auth smoke đạt. Xem
+[báo cáo triển khai](testing/VPS_RABBITMQ_DEPLOYMENT_2026-10-15.md) để biết commit,
+backup/migration, cấu hình broker một node và auto deploy poll đang tắt tránh
+downgrade. Chưa có capacity/HA benchmark cho runtime này.
+
 Ngày 2026-10-05, [ADR-019](adr/ADR-019-redis-jwt-session-lifecycle.md) bổ sung Redis
 cho vòng đời JWT của Control Plane theo yêu cầu người dùng. Access token cần
 session còn hiệu lực trong Redis và kiểm tra thu hồi bền vững trong `auth_sessions`;

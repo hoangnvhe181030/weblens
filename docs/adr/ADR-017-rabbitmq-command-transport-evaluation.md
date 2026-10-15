@@ -17,6 +17,9 @@ dưới vẫn chưa hoàn tất. Phải đối chiếu inbox thay vì coi publis
 scan đã tiếp nhận. Khi rollback phải phục hồi cả environment và service dependency.
 Kết quả triển khai được ghi riêng trong báo cáo VPS sau kiểm chứng thực tế.
 
+Rollout đã đạt ngày 2026-10-15; xem [evidence VPS](../testing/VPS_RABBITMQ_DEPLOYMENT_2026-10-15.md).
+Quyết định này không thay các giới hạn capacity/HA nêu trên.
+
 ## Revision 2 — 2026-10-15
 
 Người dùng chọn triển khai RabbitMQ cho command tạo/hủy scan. Mặc định runtime
