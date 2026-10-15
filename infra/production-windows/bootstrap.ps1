@@ -56,6 +56,11 @@ foreach ($serviceName in $databaseClients) {
     if ($serviceName -eq 'WebLensBackend' -and (Get-Service -Name WebLensRedis -ErrorAction SilentlyContinue)) {
         $dependencies += '/WebLensRedis'
     }
+    if ($serviceName -in @('WebLensBackend','WebLensCrawler') -and
+        (Select-String -LiteralPath (Join-Path $programData 'weblens.env') -Pattern '^WEBLENS_SCAN_COMMAND_TRANSPORT=rabbitmq$' -Quiet)) {
+        if (-not (Get-Service WebLensRabbitMQ -ErrorAction SilentlyContinue)) { throw 'RabbitMQ transport requires WebLensRabbitMQ' }
+        $dependencies += '/WebLensRabbitMQ'
+    }
     & sc.exe config $serviceName depend= $dependencies
     if ($LASTEXITCODE -ne 0) { throw "Could not add the PostgreSQL dependency to $serviceName" }
 }

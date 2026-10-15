@@ -18,10 +18,12 @@ try {
     $tokens = $null; $parseErrors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../infra/production-windows/deploy.ps1'), [ref]$tokens, [ref]$parseErrors)
     if ($parseErrors) { throw 'Deploy script syntax invalid' }
-    foreach ($name in @('Enable-RabbitTransport','Restore-TransportConfiguration')) {
+    foreach ($name in @('Enable-RabbitTransport','Restore-TransportConfiguration','Stop-BackendProcesses')) {
         $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
         if (-not $definition) { throw "Missing function: $name" }
-        Invoke-Expression ($definition.Extent.Text.Replace('C:\ProgramData\WebLens\rabbitmq\credentials.json', $credentialsFile))
+        $functionText = $definition.Extent.Text.Replace('C:\ProgramData\WebLens\rabbitmq\credentials.json', $credentialsFile)
+        $functionText = $functionText.Replace('[Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()', '@()')
+        Invoke-Expression $functionText
     }
     Enable-RabbitTransport
     $actual = [IO.File]::ReadAllText($environmentFile)
@@ -33,9 +35,19 @@ try {
     Restore-TransportConfiguration
     if ([IO.File]::ReadAllText($environmentFile) -cne $original) { throw 'Rollback did not restore the exact environment bytes' }
     if ($script:commands.Count -ne 4 -or $script:commands[2] -notlike '*WebLensPostgres*' -or $script:commands[3] -notlike '*WebLensPostgres*' -or ($script:commands[2..3] -join '') -like '*WebLensRabbitMQ*') { throw 'Rollback did not restore dependencies' }
+    $script:stopped = @(); $script:unexpectedOwner = $false
+    function netstat.exe { $global:LASTEXITCODE=0; '  TCP    127.0.0.1:8080    0.0.0.0:0    LISTENING    4242' }
+    function Get-Process { param($Id,$ErrorAction) if ($script:unexpectedOwner) { @{Path='C:\unrelated\java.exe'} } else { @{Path=(Join-Path $root 'runtime\jre21\bin\java.exe')} } }
+    function Stop-Process { param($Id,[switch]$Force,$ErrorAction) $script:stopped += $Id }
+    function Wait-Process { param($Id,$Timeout,$ErrorAction) }
+    Stop-BackendProcesses
+    if ($script:stopped.Count -ne 1 -or $script:stopped[0] -ne 4242) { throw 'Backend listener owner was not stopped' }
+    $script:unexpectedOwner = $true; $refused = $false
+    try { Stop-BackendProcesses } catch { $refused = $true }
+    if (-not $refused -or $script:stopped.Count -ne 1) { throw 'Unrelated listener owner was not protected' }
     Write-Output 'PASS: RabbitMQ cutover preserves existing settings/dependencies; rollback restores environment and dependencies'
 } finally {
-    Remove-Item Function:\sc.exe -ErrorAction SilentlyContinue
+    foreach ($name in @('sc.exe','netstat.exe','Get-Process','Stop-Process','Wait-Process')) { Remove-Item -LiteralPath "Function:\$name" -ErrorAction SilentlyContinue }
     $resolved = [IO.Path]::GetFullPath($root)
     if (-not $resolved.StartsWith(([IO.Path]::GetFullPath([IO.Path]::GetTempPath())), [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $resolved -Leaf) -notlike 'weblens-cutover-test-*') { throw 'Unsafe test cleanup target' }
     Remove-Item -LiteralPath $resolved -Recurse -Force

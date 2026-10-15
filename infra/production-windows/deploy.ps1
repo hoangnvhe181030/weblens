@@ -89,16 +89,20 @@ function Wait-Health([string]$Url, [int]$Attempts = 30) {
 function Stop-BackendProcesses {
     # WinSW stops the PowerShell wrapper, but its Java child can survive a deployment.
     $javaPath = Join-Path $root 'runtime\jre21\bin\java.exe'
-    Get-CimInstance Win32_Process -Filter "Name='java.exe'" |
-        Where-Object {
-            $_.ExecutablePath -eq $javaPath -and
-            $_.CommandLine -match '(?i)(^|\s)-jar\s+weblens-backend\.jar(\s|$)'
-        } |
-        ForEach-Object {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
-            Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
-        }
-    if (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue) {
+    # Native netstat avoids the VPS's stalled WMI network/process providers.
+    $connections = & netstat.exe -ano -p tcp
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Backend listener' }
+    $owners = @($connections | ForEach-Object {
+        if ($_ -match '^\s*TCP\s+\S+:8080\s+\S+\s+LISTENING\s+(\d+)\s*$') { [int]$Matches[1] }
+    } | Select-Object -Unique)
+    foreach ($owner in $owners) {
+        $process = Get-Process -Id $owner -ErrorAction Stop
+        if ($process.Path -ne $javaPath) { throw 'Port 8080 belongs to an unexpected process' }
+        Stop-Process -Id $owner -Force -ErrorAction Stop
+        Wait-Process -Id $owner -Timeout 10 -ErrorAction SilentlyContinue
+    }
+    $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    if (@($listeners | Where-Object Port -eq 8080).Count -gt 0) {
         throw 'Port 8080 is still occupied after stopping WebLens Backend'
     }
 }

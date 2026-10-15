@@ -56,11 +56,12 @@ function Verify {
         Start-Sleep -Seconds 2
     }
     if(-not $ready){throw 'RabbitMQ management health/alarms check failed'}
+    $activeListeners=[Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
     foreach($port in @(5672,15672,4369,25672)){
-        $listeners=@(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+        $listeners=@($activeListeners | Where-Object Port -eq $port)
         if($listeners.Count -eq 0){throw "RabbitMQ listener missing: $port"}
         foreach($listener in $listeners){
-            if(-not [Net.IPAddress]::IsLoopback([Net.IPAddress]::Parse($listener.LocalAddress))){throw "Non-loopback RabbitMQ listener: $port"}
+            if(-not [Net.IPAddress]::IsLoopback($listener.Address)){throw "Non-loopback RabbitMQ listener: $port"}
         }
     }
     $queues=Invoke-RestMethod -Uri 'http://127.0.0.1:15672/api/queues/weblens' -Headers @{Authorization="Basic $auth"} -TimeoutSec 10
