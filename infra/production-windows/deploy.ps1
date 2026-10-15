@@ -114,14 +114,16 @@ try {
     $previous = $null
     if (Test-Path -LiteralPath $current) { $previous = (Get-Item -LiteralPath $current).Target }
     if (-not (Test-Path -LiteralPath $release)) {
-        $unpacked = Join-Path $releases "$Commit-$([guid]::NewGuid().ToString('N')).extracting"
+        $unpacked = Join-Path $releases ('stage-' + [guid]::NewGuid().ToString('N').Substring(0,16))
         $resolvedReleases = [IO.Path]::GetFullPath($releases) + [IO.Path]::DirectorySeparatorChar
         if (-not ([IO.Path]::GetFullPath($unpacked)).StartsWith($resolvedReleases, [StringComparison]::OrdinalIgnoreCase)) {
             throw 'Release staging path is outside the releases directory'
         }
         New-Item -ItemType Directory -Path $unpacked | Out-Null
         try {
-            Expand-Archive -LiteralPath $ReleaseZip -DestinationPath $unpacked
+            # Keep staging paths short for Windows tooling; Server 2019 includes bsdtar.
+            & tar.exe -xf $ReleaseZip -C $unpacked
+            if ($LASTEXITCODE -ne 0) { throw 'Release archive extraction failed' }
             $metadata = Get-Content -LiteralPath (Join-Path $unpacked 'release.json') -Raw | ConvertFrom-Json
             if ($metadata.commit -ne $Commit -or -not (Test-Path -LiteralPath (Join-Path $unpacked 'frontend\release.json') -PathType Leaf)) {
                 throw 'Release archive content is incomplete'
