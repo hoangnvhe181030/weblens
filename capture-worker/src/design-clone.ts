@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto'
 import { parse } from 'parse5'
 
-export const DESIGN_CLONE_POLICY_VERSION = 'design-clone-v1'
+export const DESIGN_CLONE_POLICY_VERSION = 'design-clone-v2'
 export const LAYOUT_FINGERPRINT_VERSION = 'dom-structure-v1'
+const languageNames = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' })
 
 export type SemanticRole =
   | 'HOME'
@@ -382,6 +383,7 @@ function normalizeLocale(value: string | null | undefined): string | null {
 
 function isLocale(value: string): boolean {
   return /^[a-z]{2,3}(?:-[a-z]{2}|-[0-9]{3})?$/iu.test(value)
+    && languageNames.of(value.toLowerCase().split('-')[0]!) !== undefined
 }
 
 function sameOriginCanonical(rawCanonical: string, origin: string): string | null {

@@ -105,6 +105,31 @@ test('tạo ZIP bounded và manifest trung thực cho partial clone', async () =
   }
 })
 
+test('site bundles keep partial results and budgets without creating a page ZIP', async () => {
+  const resources = [
+    input('https://example.com/app.css', 'stylesheet', 'text/css', 'body{background:url(logo.png)}'),
+    input('https://example.com/logo.png', 'image', 'image/png', 'image'),
+    { ...input('https://example.com/missing.js', 'script', 'application/javascript', ''),
+      body: null, skipReason: 'REQUEST_FAILED' },
+  ]
+  const plan = planStaticClone('https://example.com/', resources, 100, { contentAddressedResources: true })
+  const result = await buildStaticClone(plan, Buffer.from('<main>Bundle</main>'), { bundleOnly: true })
+  assert.equal(result.status, 'PARTIAL')
+  assert.equal(result.archivePath, null)
+  assert.equal(result.archiveBytes, null)
+  assert.equal(result.temporaryDirectory, null)
+  assert.equal(result.packagedCount, 3)
+  assert.equal(result.skippedCount, 1)
+  assert.deepEqual(result.siteBundle?.resourceGaps?.map((gap) => gap.reason), ['REQUEST_FAILED'])
+  assert.equal(result.siteBundle?.files.find((file) => file.contentType === 'text/css')?.body.toString(),
+    'body{background:url(logo.png)}')
+
+  const largeHtml = await buildStaticClone(plan, Buffer.alloc(52_428_801), { bundleOnly: true })
+  assert.equal(largeHtml.status, 'FAILED')
+  assert.equal(largeHtml.failureCode, 'CLONE_INPUT_BUDGET_EXCEEDED')
+  assert.equal(largeHtml.siteBundle, null)
+})
+
 function input(
   sourceUrl: string,
   resourceType: string,

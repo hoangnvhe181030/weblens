@@ -291,7 +291,7 @@ export class SiteCloneWorker {
           verifyBytes(value, reference.bytes, reference.sha256Hex)
           return value
         },
-        { maxPages: job.payload.maxPages, maxInputBytes: job.payload.maxInputBytes },
+        { maxPages: job.payload.maxPages, maxInputBytes: job.payload.maxInputBytes, signal: attempt.signal },
       )
       const archiveBuild = build
       for (const part of archiveBuild.parts) {

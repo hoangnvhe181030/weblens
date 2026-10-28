@@ -81,6 +81,37 @@ test('locale khác, canonical duplicate và query variant không được chọn
   )
 })
 
+test('ordinary short routes are not locales or home pages', () => {
+  const paths = ['/app', '/faq', '/go']
+  const selection = selectDesignPages('https://example.com/', [
+    page('root', 'https://example.com/'),
+    ...paths.map((path) => page(path, `https://example.com${path}`)),
+    { ...page('french', 'https://example.com/fr/pricing'), htmlLang: 'fr' },
+  ])
+  assert.deepEqual(selection.rejected.map((item) => [item.page.id, item.reason]), [
+    ['french', 'ALTERNATE_LOCALE'],
+  ])
+  for (const path of paths) {
+    assert.ok(selection.selected.some((item) => item.page.id === path))
+    assert.equal(classifySemanticRole(`https://example.com${path}`), 'MARKETING_LANDING')
+  }
+})
+
+test('recognized three-letter and regional locales still select the root language', () => {
+  for (const locale of ['fil', 'pt-br', 'es-419']) {
+    const root = { ...page('root', `https://example.com/${locale}/`), htmlLang: locale }
+    const selection = selectDesignPages(root.url, [
+      root,
+      { ...page('pricing', `https://example.com/${locale}/pricing`), htmlLang: locale },
+      page('english', 'https://example.com/en/pricing'),
+    ])
+    assert.equal(selection.locale, locale)
+    assert.equal(selection.selected.length, 2)
+    assert.equal(selection.rejected[0]?.reason, 'ALTERNATE_LOCALE')
+    assert.equal(classifySemanticRole(root.url), 'HOME')
+  }
+})
+
 test('locale có thể suy ra từ canonical hoặc hreflang self-reference', () => {
   const root = page('root', 'https://example.com/')
   root.htmlLang = ''

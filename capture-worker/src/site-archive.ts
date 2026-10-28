@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { posix } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -46,6 +46,8 @@ interface RepresentativePage {
   publicFinalUrl: string
   design: SitePageBundle['design']
   resourceGaps: NonNullable<SitePageBundle['resourceGaps']>
+  files: Array<Omit<SiteBundleFile, 'body'> & { diskPath: string; bytes: number; hash: string }>
+  aliases: Map<string, string>
 }
 
 export function sitePagePath(rootUrl: string, targetUrl: string, pageId: string): string {
@@ -172,7 +174,7 @@ export async function buildSiteArchives(
   maxShardBytes: number,
   maxArchiveBytes: number,
   loadBundle: (reference: SitePageBundleReference) => Promise<Buffer>,
-  budgets?: { maxPages: number; maxInputBytes: number },
+  budgets?: { maxPages: number; maxInputBytes: number; signal?: AbortSignal },
 ): Promise<SiteArchiveBuild> {
   const temporaryDirectory = await mkdtemp(posix.join(tmpdir().replaceAll('\\', '/'), 'weblens-site-clone-'))
   const written = new Map<string, string>()
@@ -189,41 +191,62 @@ export async function buildSiteArchives(
       parts.push(await closeShard(current, maxShardBytes))
       current = null
     }
-    if (!current) current = openShard(temporaryDirectory, parts.length + 1, archiveLabel)
+    if (!current) current = openShard(temporaryDirectory, parts.length + 1, archiveLabel, budgets?.signal)
     return current
   }
 
   try {
+    const bundleDirectory = posix.join(temporaryDirectory, 'bundles')
+    await mkdir(bundleDirectory)
     const indexed: RepresentativePage[] = []
+    let cachedInputBytes = 0
     for (const reference of bundles) {
+      budgets?.signal?.throwIfAborted()
       const bundle = decodeSiteBundle(await loadBundle(reference), reference.pageId)
+      const files: RepresentativePage['files'] = []
+      for (const { body, ...file } of bundle.files) {
+        budgets?.signal?.throwIfAborted()
+        cachedInputBytes += body.length
+        if (budgets && cachedInputBytes > budgets.maxInputBytes) throw new Error('SITE_INPUT_BUDGET_EXCEEDED')
+        const diskPath = posix.join(bundleDirectory, randomUUID())
+        await writeFile(diskPath, body, { flag: 'wx' })
+        files.push({ ...file, diskPath, bytes: body.length, hash: createHash('sha256').update(body).digest('hex') })
+      }
       indexed.push({
         reference,
         sourceFinalUrl: bundle.sourceFinalUrl,
         publicFinalUrl: bundle.publicFinalUrl,
         design: bundle.design,
         resourceGaps: bundle.resourceGaps ?? [],
+        files,
+        aliases: new Map(),
       })
     }
     const representatives = selectRepresentatives(indexed)
     const sourceUrlToLocalPath = new Map<string, string>()
-    for (const { reference } of representatives.selected) {
-      const bundle = decodeSiteBundle(await loadBundle(reference), reference.pageId)
-      for (const file of bundle.files) {
+    for (const page of representatives.selected) {
+      for (const file of page.files) {
+        budgets?.signal?.throwIfAborted()
         if (file.kind !== 'RESOURCE') continue
-        const path = safeArchivePath(file.localPath)
-        const hash = createHash('sha256').update(file.body).digest('hex')
+        if (isStylesheet(file)) {
+          // Equal CSS bytes can resolve relative URLs differently at different source URLs.
+          const contextHash = createHash('sha256').update(`${file.hash}\n${normalizeSourceUrl(file.sourceUrl)}`).digest('hex')
+          const contextualPath = `assets/${contextHash}.css`
+          page.aliases.set(file.localPath.toLowerCase(), contextualPath)
+          file.localPath = contextualPath
+        }
+        const path = file.localPath
         const representation = posix.extname(path).toLowerCase()
           || file.contentType.split(';')[0]?.trim().toLowerCase()
           || 'application/octet-stream'
-        const contentKey = `${hash}\n${representation}`
-        const canonical = canonicalResourcePath.get(contentKey)
+        const contentKey = `${file.hash}\n${representation}`
+        const canonical = isStylesheet(file) ? undefined : canonicalResourcePath.get(contentKey)
         let effectivePath: string
         if (canonical && canonical.toLowerCase() !== path.toLowerCase()) {
           resourceAliases.set(path.toLowerCase(), canonical)
           effectivePath = canonical
         } else {
-          canonicalResourcePath.set(contentKey, path)
+          if (!isStylesheet(file)) canonicalResourcePath.set(contentKey, path)
           effectivePath = path
         }
         // Map source URL → local archive path for CSS rewrite during assembly.
@@ -234,6 +257,39 @@ export async function buildSiteArchives(
         }
       }
     }
+    // Resolve CSS against the complete resource map before comparing its content.
+    for (const page of representatives.selected) {
+      for (const file of page.files) {
+        budgets?.signal?.throwIfAborted()
+        if (file.kind !== 'RESOURCE' || !isStylesheet(file)) continue
+        const body = rewriteCssWithSourceUrls(await readFile(file.diskPath), file.contentType, file.sourceUrl,
+          file.localPath, sourceUrlToLocalPath, resourceAliases)
+        file.hash = createHash('sha256').update(body).digest('hex')
+        file.bytes = body.length
+        await writeFile(file.diskPath, body)
+      }
+    }
+    // A duplicate imported stylesheet can make its parents identical as well.
+    let cssAliasesChanged: boolean
+    do {
+      cssAliasesChanged = false
+      const cssPaths = new Map<string, string>()
+      for (const page of representatives.selected) {
+        for (const file of page.files) {
+          budgets?.signal?.throwIfAborted()
+          if (file.kind !== 'RESOURCE' || !isStylesheet(file) || resourceAliases.has(file.localPath.toLowerCase())) continue
+          const body = rewriteCssResourceAliases(await readFile(file.diskPath), file.contentType, file.localPath, resourceAliases)
+          file.hash = createHash('sha256').update(body).digest('hex')
+          file.bytes = body.length
+          await writeFile(file.diskPath, body)
+          const canonical = cssPaths.get(file.hash)
+          if (canonical && canonical !== file.localPath) {
+            resourceAliases.set(file.localPath.toLowerCase(), canonical)
+            cssAliasesChanged = true
+          } else cssPaths.set(file.hash, file.localPath)
+        }
+      }
+    } while (cssAliasesChanged)
     const keptPaths = new Set(representatives.selected.map(({ reference }) => reference.localPath))
     const routeMap = new Map(
       routes.filter((route) => keptPaths.has(route.localPath))
@@ -244,20 +300,23 @@ export async function buildSiteArchives(
       routeMap.set(rawUrlHash(selected.publicFinalUrl).toString('hex'), selected.reference.localPath)
     }
 
-    for (const { reference } of representatives.selected) {
-      const bundle = decodeSiteBundle(await loadBundle(reference), reference.pageId)
-      for (const file of bundle.files) {
+    for (const page of representatives.selected) {
+      const { reference } = page
+      for (const file of page.files) {
+        budgets?.signal?.throwIfAborted()
         const path = safeArchivePath(file.kind === 'DOCUMENT' ? reference.localPath : file.localPath)
         if (file.kind === 'RESOURCE' && resourceAliases.has(path.toLowerCase())) continue
-        const body = file.kind === 'DOCUMENT'
-          ? rewriteSiteNavigation(
-              rewriteSiteResourceAliases(file.body, path, resourceAliases),
-              bundle.sourceFinalUrl,
-              path,
-              routeMap,
-            )
-          : rewriteCssWithSourceUrls(file.body, file.contentType, file.sourceUrl, path, sourceUrlToLocalPath, resourceAliases)
-        const hash = createHash('sha256').update(body).digest('hex')
+        if (file.kind === 'DOCUMENT' || isStylesheet(file)) {
+          const original = await readFile(file.diskPath)
+          const body = file.kind === 'DOCUMENT'
+            ? rewriteSiteNavigation(rewriteSiteResourceAliases(original, path, resourceAliases, page.aliases),
+                page.sourceFinalUrl, path, routeMap)
+            : rewriteCssResourceAliases(original, file.contentType, path, resourceAliases)
+          file.hash = createHash('sha256').update(body).digest('hex')
+          file.bytes = body.length
+          await writeFile(file.diskPath, body)
+        }
+        const hash = file.hash
         const existing = written.get(path.toLowerCase())
         if (existing) {
           if (existing !== hash) {
@@ -270,16 +329,17 @@ export async function buildSiteArchives(
           continue
         }
         written.set(path.toLowerCase(), hash)
-        totalArchiveInput += body.length
+        totalArchiveInput += file.bytes
         if (totalArchiveInput > maxArchiveBytes) throw new Error('SITE_ARCHIVE_BUDGET_EXCEEDED')
-        const estimatedBytes = body.length + zipEntryOverhead(path)
+        const estimatedBytes = file.bytes + zipEntryOverhead(path)
         const shard = await ensureShard(estimatedBytes)
-        shard.zip.addBuffer(body, path, { compress: shouldCompress(file.contentType, path) })
+        shard.zip.addFile(file.diskPath, path, { compress: shouldCompress(file.contentType, path) })
         shard.inputBytes += estimatedBytes
       }
     }
     if (current) parts.push(await closeShard(current, maxShardBytes))
     if (parts.length === 0) throw new Error('SITE_ARCHIVE_EMPTY')
+    await rm(bundleDirectory, { recursive: true, force: true })
 
     const manifestPages = outcomes.map((page) => {
       const layoutDuplicate = representatives.rejected.get(page.pageId)
@@ -365,6 +425,7 @@ export async function buildSiteArchives(
     }, null, 2), 'utf8')
     return { temporaryDirectory, parts, manifest }
   } catch (error) {
+    await abortShard(current)
     await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => undefined)
     throw error
   }
@@ -411,15 +472,26 @@ interface OpenShard {
   logicalFilename: string
   zip: ZipFile
   completion: Promise<void>
+  abort: AbortController
   inputBytes: number
 }
 
-function openShard(directory: string, shardNumber: number, archiveLabel: string): OpenShard {
+async function abortShard(shard: OpenShard | null): Promise<void> {
+  if (!shard) return
+  shard.abort.abort()
+  await shard.completion.catch(() => undefined)
+}
+
+function openShard(directory: string, shardNumber: number, archiveLabel: string, signal?: AbortSignal): OpenShard {
   const logicalFilename = `weblens-site-clone-${archiveLabel}.part-${String(shardNumber).padStart(4, '0')}.zip`
   const path = posix.join(directory, `${randomUUID()}.zip`)
   const zip = new ZipFile()
-  const completion = pipeline(zip.outputStream, createWriteStream(path, { flags: 'wx' }))
-  return { shardNumber, path, logicalFilename, zip, completion, inputBytes: 0 }
+  const abort = new AbortController()
+  const completion = pipeline(zip.outputStream, createWriteStream(path, { flags: 'wx' }), {
+    signal: signal ? AbortSignal.any([abort.signal, signal]) : abort.signal,
+  })
+  void completion.catch(() => undefined)
+  return { shardNumber, path, logicalFilename, zip, completion, abort, inputBytes: 0 }
 }
 
 async function closeShard(shard: OpenShard, maxShardBytes: number): Promise<SiteArchivePart> {
@@ -445,6 +517,10 @@ function shouldCompress(contentType: string, path: string): boolean {
     || /\.(?:css|html?|js|json|svg|xml)$/iu.test(path)
 }
 
+function isStylesheet(file: Pick<SiteBundleFile, 'contentType' | 'localPath'>): boolean {
+  return file.contentType.split(';')[0]?.trim().toLowerCase() === 'text/css' || /\.css$/iu.test(file.localPath)
+}
+
 function visit(node: HtmlNode, action: (node: HtmlNode) => void): void {
   action(node)
   node.childNodes?.forEach((child) => visit(child, action))
@@ -454,26 +530,27 @@ function rewriteSiteResourceAliases(
   html: Buffer,
   sourcePath: string,
   aliases: ReadonlyMap<string, string>,
+  pageAliases?: ReadonlyMap<string, string>,
 ): Buffer {
-  if (aliases.size === 0) return html
+  if (aliases.size === 0 && !pageAliases?.size) return html
   const document = parse(html.toString('utf8')) as unknown as HtmlNode
   visit(document, (node) => {
     for (const attribute of node.attrs ?? []) {
       const name = attribute.name.toLowerCase()
       if (name === 'src' || name === 'poster' || (name === 'href' && node.tagName !== 'a' && node.tagName !== 'area')) {
-        attribute.value = rewriteArchiveReference(attribute.value, sourcePath, aliases)
+        attribute.value = rewriteArchiveReference(attribute.value, sourcePath, aliases, pageAliases)
       } else if (name === 'srcset') {
         attribute.value = attribute.value.split(',').map((candidate) => {
           const [raw, ...descriptor] = candidate.trim().split(/\s+/u)
-          return raw ? [rewriteArchiveReference(raw, sourcePath, aliases), ...descriptor].join(' ') : ''
+          return raw ? [rewriteArchiveReference(raw, sourcePath, aliases, pageAliases), ...descriptor].join(' ') : ''
         }).filter(Boolean).join(', ')
       } else if (name === 'style') {
-        attribute.value = rewriteCssText(attribute.value, sourcePath, aliases)
+        attribute.value = rewriteCssText(attribute.value, sourcePath, aliases, pageAliases)
       }
     }
     if (node.tagName === 'style') {
       for (const child of node.childNodes ?? []) {
-        if (typeof child.value === 'string') child.value = rewriteCssText(child.value, sourcePath, aliases)
+        if (typeof child.value === 'string') child.value = rewriteCssText(child.value, sourcePath, aliases, pageAliases)
       }
     }
   })
@@ -491,12 +568,13 @@ function rewriteCssResourceAliases(
   return Buffer.from(rewriteCssText(body.toString('utf8'), sourcePath, aliases), 'utf8')
 }
 
-function rewriteCssText(css: string, sourcePath: string, aliases: ReadonlyMap<string, string>): string {
+function rewriteCssText(css: string, sourcePath: string, aliases: ReadonlyMap<string, string>,
+  pageAliases?: ReadonlyMap<string, string>): string {
   const urls = css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/giu, (_match, quote: string, raw: string) => (
-    `url(${quote}${rewriteArchiveReference(raw, sourcePath, aliases)}${quote})`
+    `url(${quote}${rewriteArchiveReference(raw, sourcePath, aliases, pageAliases)}${quote})`
   ))
   return urls.replace(/@import\s+(['"])(.*?)\1/giu, (_match, quote: string, raw: string) => (
-    `@import ${quote}${rewriteArchiveReference(raw, sourcePath, aliases)}${quote}`
+    `@import ${quote}${rewriteArchiveReference(raw, sourcePath, aliases, pageAliases)}${quote}`
   ))
 }
 
@@ -504,6 +582,7 @@ function rewriteArchiveReference(
   raw: string,
   sourcePath: string,
   aliases: ReadonlyMap<string, string>,
+  pageAliases?: ReadonlyMap<string, string>,
 ): string {
   if (!raw || raw.startsWith('#') || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/iu.test(raw)) return raw
   const match = /^([^?#]*)([?#].*)?$/u.exec(raw)
@@ -513,11 +592,23 @@ function rewriteArchiveReference(
     const resolved = safeArchivePath(path.startsWith('/')
       ? path
       : posix.join(posix.dirname(sourcePath), path))
-    const canonical = aliases.get(resolved.toLowerCase())
+    const contextual = pageAliases?.get(resolved.toLowerCase())
+    const canonical = contextual ? resolveResourceAlias(contextual, aliases)
+      : aliases.has(resolved.toLowerCase()) ? resolveResourceAlias(resolved, aliases) : undefined
     return canonical ? relativeArchivePath(sourcePath, canonical) + (match?.[2] ?? '') : raw
   } catch {
     return raw
   }
+}
+
+function resolveResourceAlias(path: string, aliases: ReadonlyMap<string, string>): string {
+  const seen = new Set<string>()
+  while (aliases.has(path.toLowerCase())) {
+    if (seen.has(path.toLowerCase())) throw new Error('SITE_ARCHIVE_PATH_COLLISION')
+    seen.add(path.toLowerCase())
+    path = aliases.get(path.toLowerCase())!
+  }
+  return path
 }
 
 function safeArchivePath(value: string): string {

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, readdir, stat } from 'node:fs/promises'
 import { test } from 'node:test'
 import { inflateRawSync } from 'node:zlib'
+import { posix } from 'node:path'
 import {
   buildSiteArchives,
   cleanupSiteArchives,
@@ -11,6 +12,73 @@ import {
   rewriteSiteNavigation,
 } from './site-archive.js'
 import type { SitePageBundle } from './types.js'
+
+for (const sameImage of [false, true]) {
+ for (const imported of [false, true]) {
+  test(`identical CSS at different base URLs keeps correct images (same image: ${sameImage}, import: ${imported})`, async () => {
+    const values = ['a', 'b'].map((base) => {
+      const value = bundle(base, `https://example.com/${base}/`, `pages/${base}.html`, base)
+      value.files = [
+        { ...value.files[0]!, body: Buffer.from('<link rel="stylesheet" href="../assets/shared.css">') },
+        { kind: 'RESOURCE', localPath: 'assets/shared.css', sourceUrl: `https://example.com/${base}/main.css`,
+          contentType: 'text/css', body: Buffer.from(imported ? '@import "theme.css";' : '.hero{background:url(logo.png)}') },
+        { kind: 'RESOURCE', localPath: `assets/${base}.png`, sourceUrl: `https://example.com/${base}/logo.png`,
+          contentType: 'image/png', body: Buffer.from(sameImage ? 'shared image' : `image ${base}`) },
+      ]
+      if (imported) value.files.push({
+        kind: 'RESOURCE', localPath: 'assets/shared-theme.css', sourceUrl: `https://example.com/${base}/theme.css`,
+        contentType: 'text/css', body: Buffer.from('.hero{background:url(logo.png)}'),
+      })
+      return value
+    })
+    const encoded = new Map(values.map((value) => [value.pageId, encodeSiteBundle(value)]))
+    const references = values.map((value, ordinal) => ({
+      pageId: value.pageId, ordinal, publicUrl: value.publicFinalUrl, localPath: value.mainPath,
+      bucket: 'test', key: value.pageId, bytes: encoded.get(value.pageId)!.length, sha256Hex: '0'.repeat(64),
+    }))
+    const reads = new Map<string, number>()
+    const build = await buildSiteArchives('https://example.com/', references, [], [], 50_000, 100_000,
+      async (reference) => {
+        reads.set(reference.pageId, (reads.get(reference.pageId) ?? 0) + 1)
+        return encoded.get(reference.pageId)!
+      })
+    try {
+      const entries = zipEntries(await readFile(build.parts[0]!.path))
+      assert.equal([...entries.keys()].filter((path) => path.endsWith('.css')).length, (sameImage ? 1 : 2) * (imported ? 2 : 1))
+      for (const base of ['a', 'b']) {
+        const html = entries.get(`pages/${base}.html`)!.toString('utf8')
+        const href = /href="([^"]+)"/u.exec(html)![1]!
+        let cssPath = posix.normalize(posix.join('pages', href))
+        let css = entries.get(cssPath)!.toString('utf8')
+        if (imported) {
+          const importPath = /@import "([^"]+)"/u.exec(css)![1]!
+          cssPath = posix.normalize(posix.join(posix.dirname(cssPath), importPath))
+          css = entries.get(cssPath)!.toString('utf8')
+        }
+        const imagePath = /url\(([^)]+)\)/u.exec(css)![1]!
+        const image = entries.get(posix.normalize(posix.join(posix.dirname(cssPath), imagePath)))!
+        assert.equal(image.toString(), sameImage ? 'shared image' : `image ${base}`)
+        assert.equal(reads.get(base), 1, 'each bundle is downloaded and decoded once')
+      }
+    } finally {
+      await cleanupSiteArchives(build)
+    }
+  })
+ }
+}
+
+test('cached assembly preserves cancellation and the total input budget', async () => {
+  const value = bundle('page', 'https://example.com/', 'index.html', 'A')
+  const encoded = encodeSiteBundle(value)
+  const reference = { pageId: 'page', ordinal: 0, publicUrl: value.publicFinalUrl, localPath: value.mainPath,
+    bucket: 'test', key: 'page', bytes: encoded.length, sha256Hex: '0'.repeat(64) }
+  const abort = new AbortController()
+  await assert.rejects(buildSiteArchives('https://example.com/', [reference], [], [], 50_000, 100_000,
+    async () => { abort.abort(); return encoded },
+    { maxPages: 1, maxInputBytes: 100_000, signal: abort.signal }), { name: 'AbortError' })
+  await assert.rejects(buildSiteArchives('https://example.com/', [reference], [], [], 50_000, 100_000,
+    async () => encoded, { maxPages: 1, maxInputBytes: 1 }), /SITE_INPUT_BUDGET_EXCEEDED/u)
+})
 
 test('rewriteSiteNavigation chỉ tạo link local cho page thực sự có route', () => {
   const routes = new Map([
@@ -73,6 +141,7 @@ test('buildSiteArchives deduplicate asset và giữ mỗi shard dưới budget',
   )
 
   try {
+    assert.deepEqual((await readdir(build.temporaryDirectory)).sort(), build.parts.map((part) => posix.basename(part.path)).sort())
     assert.ok(build.parts.length >= 2)
     assert.equal(new Set(build.parts.map((part) => part.logicalFilename)).size, build.parts.length)
     assert.ok(build.parts.every((part, index) => new RegExp(
@@ -203,7 +272,7 @@ test('buildSiteArchives rewrites shared CSS using resources from all pages', asy
     for (const part of build.parts) {
       for (const entry of zipEntries(await readFile(part.path))) entries.set(...entry)
     }
-    const cssContent = entries.get(`assets/${cssHash}.css`)?.toString('utf8') ?? ''
+    const cssContent = [...entries].find(([path]) => path.endsWith('.css'))?.[1].toString('utf8') ?? ''
     // CSS should reference both local image paths (assembled from both pages)
     assert.match(cssContent, new RegExp(imgAHash, 'u'), 'CSS should contain reference to img-a')
     assert.match(cssContent, new RegExp(imgBHash, 'u'), 'CSS should contain reference to img-b')
@@ -277,7 +346,7 @@ test('assembly chỉ giữ một representative cho cùng role, template và fin
       pages: Array<{ pageId: string; localPath: string | null; reason: string | null }>
     }
     assert.deepEqual(manifest.counts, { discovered: 2, rejected: 1, grouped: 1, rendered: 2, packaged: 1 })
-    assert.equal(loadCount, 4)
+    assert.equal(loadCount, 2)
     assert.equal(manifest.rejected.reasonCounts['LAYOUT_DUPLICATE'], 1)
     assert.equal(manifest.pages.find((page) => page.pageId === 'page-2')?.localPath, null)
   } finally {
