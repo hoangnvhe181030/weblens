@@ -95,6 +95,7 @@ export function planStaticClone(
 export async function buildStaticClone(
   plan: StaticClonePlan,
   rewrittenHtml: Buffer,
+  options: { bundleOnly?: boolean } = {},
 ): Promise<ReconstructionBuild> {
   const discoveredCount = 1 + plan.resources.length
   if (rewrittenHtml.length > STATIC_CLONE_MAX_INPUT_BYTES) {
@@ -180,6 +181,44 @@ export async function buildStaticClone(
     files,
   }, null, 2), 'utf8')
 
+  const result: ReconstructionBuild = {
+    status,
+    engineVersion: STATIC_CLONE_ENGINE_VERSION,
+    discoveredCount,
+    packagedCount: contentFileCount,
+    skippedCount,
+    inputBytes,
+    archiveBytes: null,
+    completenessCode,
+    failureCode: null,
+    archivePath: null,
+    temporaryDirectory: null,
+    manifest,
+    siteBundle: {
+      schemaVersion: 1,
+      sourceFinalUrl: plan.finalUrl,
+      publicFinalUrl: redactUrl(plan.finalUrl),
+      mainPath: plan.mainPath,
+      capturedAt: new Date().toISOString(),
+      ...(resourceGaps.length > 0 ? { resourceGaps } : {}),
+      files: [
+        {
+          kind: 'DOCUMENT', localPath: plan.mainPath, sourceUrl: plan.finalUrl,
+          contentType: 'text/html; charset=utf-8', body: rewrittenHtml,
+        },
+        ...selected.map(({ resource, body }) => ({
+          kind: 'RESOURCE' as const,
+          localPath: resource.localPath!,
+          sourceUrl: resource.sourceUrl,
+          contentType: resource.mimeType || 'application/octet-stream',
+          // Preserve original CSS for assembly with the complete resource map.
+          body: resource.resourceType === 'stylesheet' ? resource.body! : body,
+        })),
+      ],
+    },
+  }
+  if (options.bundleOnly) return result
+
   const temporaryDirectory = await mkdtemp(posix.join(tmpdir().replaceAll('\\', '/'), 'weblens-clone-'))
   const archivePath = posix.join(temporaryDirectory, `${randomUUID()}.zip`)
   try {
@@ -194,44 +233,7 @@ export async function buildStaticClone(
       await rm(temporaryDirectory, { recursive: true, force: true })
       return failed(discoveredCount, 'CLONE_ARCHIVE_BUDGET_EXCEEDED')
     }
-    return {
-      status,
-      engineVersion: STATIC_CLONE_ENGINE_VERSION,
-      discoveredCount,
-      packagedCount: contentFileCount,
-      skippedCount,
-      inputBytes,
-      archiveBytes,
-      completenessCode,
-      failureCode: null,
-      archivePath,
-      temporaryDirectory,
-      manifest,
-      siteBundle: {
-        schemaVersion: 1,
-        sourceFinalUrl: plan.finalUrl,
-        publicFinalUrl: redactUrl(plan.finalUrl),
-        mainPath: plan.mainPath,
-        capturedAt: new Date().toISOString(),
-        ...(resourceGaps.length > 0 ? { resourceGaps } : {}),
-        files: [
-          {
-            kind: 'DOCUMENT', localPath: plan.mainPath, sourceUrl: plan.finalUrl,
-            contentType: 'text/html; charset=utf-8', body: rewrittenHtml,
-          },
-          ...selected.map(({ resource, body }) => ({
-            kind: 'RESOURCE' as const,
-            localPath: resource.localPath!,
-            sourceUrl: resource.sourceUrl,
-            contentType: resource.mimeType || 'application/octet-stream',
-            // For stylesheets: store original body so multi-page assembly can
-            // rewrite CSS once with the complete resource map from all pages.
-            // Single-page static clone ZIP already uses the rewritten `body`.
-            body: resource.resourceType === 'stylesheet' ? resource.body! : body,
-          })),
-        ],
-      },
-    }
+    return { ...result, archiveBytes, archivePath, temporaryDirectory }
   } catch {
     await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => undefined)
     return failed(discoveredCount, 'CLONE_ARCHIVE_WRITE_FAILED')

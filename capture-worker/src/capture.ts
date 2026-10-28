@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Browser, BrowserContext, Request, Response } from 'playwright'
+import type { Browser, BrowserContext, Page, Request, Response } from 'playwright'
 import {
   browserContextSizeOptions,
   launchCaptureBrowser,
@@ -93,6 +93,13 @@ export async function capturePage(
   const candidates: ResponseCandidate[] = []
   const candidatesByRequest = new Map<Request, ResponseCandidate>()
   const failedCloneInputs: CloneInputResource[] = []
+  const pendingRequests = new Set<Request>()
+  const networkActivity = { pending: 0, lastActivity: Date.now() }
+  const finishRequest = (request: Request) => {
+    if (!pendingRequests.delete(request)) return
+    networkActivity.pending = pendingRequests.size
+    networkActivity.lastActivity = Date.now()
+  }
   let bodyCandidateCount = 0
   let sequence = 0
   let totalTransferBytes = 0
@@ -143,8 +150,12 @@ export async function capturePage(
 
   page.on('request', (request) => {
     if (requestStarted.size >= command.maxNetworkRequests) return
+    pendingRequests.add(request)
+    networkActivity.pending = pendingRequests.size
+    networkActivity.lastActivity = Date.now()
     requestStarted.set(request, { started: Date.now(), sequence: sequence++ })
   })
+  page.on('requestfinished', finishRequest)
   page.on('response', (response) => {
     const request = response.request()
     const tracked = requestStarted.get(request)
@@ -191,6 +202,7 @@ export async function capturePage(
     }
   })
   page.on('requestfailed', (request) => {
+    finishRequest(request)
     const tracked = requestStarted.get(request)
     if (!tracked) return
     const failureCode = capText(request.failure()?.errorText ?? 'REQUEST_FAILED', 64)
@@ -229,8 +241,12 @@ export async function capturePage(
 
     await page.goto(command.targetUrl, { waitUntil: 'load', timeout: operationTimeoutMillis(deadline) })
     await withinDeadline(settleDynamicContent(page, deadline), deadline)
-    const remaining = remainingMillis(deadline)
-    if (remaining > 0) await page.waitForTimeout(Math.min(5000, remaining))
+    if (options.includeSiteBundle) {
+      await withinDeadline(waitForDesignStability(page, networkActivity, deadline - RECONSTRUCTION_RESERVE_MILLIS), deadline)
+    } else {
+      const remaining = remainingMillis(deadline)
+      if (remaining > 0) await page.waitForTimeout(Math.min(5000, remaining))
+    }
     if (Date.now() >= deadline) throw new Error('CAPTURE_TIMEOUT')
 
     const observedAt = new Date().toISOString()
@@ -301,6 +317,44 @@ const expansionLabels = [
   'load more', 'show more', 'view more', 'see more', 'expand',
   'xem thêm', 'tải thêm', 'hiển thị thêm', 'mở rộng',
 ]
+
+interface DesignStabilityState {
+  lastMutation: number
+  observer: MutationObserver
+}
+
+export async function waitForDesignStability(
+  page: Page,
+  network: { pending: number; lastActivity: number },
+  deadline: number,
+): Promise<void> {
+  const until = Math.min(Date.now() + 5_000, deadline)
+  if (Date.now() >= until) return
+  await page.evaluate(() => {
+    const state: DesignStabilityState = {
+      lastMutation: performance.now(),
+      observer: new MutationObserver(() => { state.lastMutation = performance.now() }),
+    }
+    state.observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true })
+    ;(window as unknown as { __weblensDesignStability?: DesignStabilityState }).__weblensDesignStability = state
+  })
+  try {
+    while (Date.now() < until) {
+      const domStable = await page.evaluate(() => {
+        const state = (window as unknown as { __weblensDesignStability?: DesignStabilityState }).__weblensDesignStability
+        return state !== undefined && performance.now() - state.lastMutation >= 500
+      })
+      if (domStable && network.pending === 0 && Date.now() - network.lastActivity >= 500) return
+      await page.waitForTimeout(Math.min(100, remainingMillis(until)))
+    }
+  } finally {
+    await page.evaluate(() => {
+      const target = window as unknown as { __weblensDesignStability?: DesignStabilityState }
+      target.__weblensDesignStability?.observer.disconnect()
+      delete target.__weblensDesignStability
+    }).catch(() => undefined)
+  }
+}
 const unsafeActionLabels = [
   'delete', 'remove', 'logout', 'sign out', 'purchase', 'buy', 'checkout', 'pay',
   'xóa', 'đăng xuất', 'mua', 'thanh toán',
@@ -620,7 +674,7 @@ async function createReconstruction(
       ),
       deadline,
     ), 'utf8')
-    return await buildStaticClone(plan, cloneHtml)
+    return await buildStaticClone(plan, cloneHtml, { bundleOnly: options.includeSiteBundle === true })
   } catch (error) {
     return {
       status: 'FAILED', engineVersion: 'weblens-1/pagesource-0.1.2@f59ed61',

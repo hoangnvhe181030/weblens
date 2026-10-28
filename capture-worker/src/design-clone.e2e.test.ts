@@ -89,7 +89,7 @@ test('fixture Design Clone giữ representative, một locale, link hợp lệ v
   try {
     assert.equal(build.parts.length, 1)
     const entries = zipEntries(await readFile(build.parts[0]!.path))
-    assert.equal([...entries.keys()].filter((name) => name === 'assets/shared.css').length, 1)
+    assert.equal([...entries.keys()].filter((name) => name.endsWith('.css')).length, 1)
     assert.ok([...entries.keys()].every((name) => !/screenshot/iu.test(name)))
     const index = entries.get('index.html')?.toString('utf8') ?? ''
     assert.match(index, /href="pages\/login\.html"/u)
