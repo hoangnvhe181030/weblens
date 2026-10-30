@@ -122,7 +122,8 @@ jobs:
         run: npm ci && npm run lint && npm test && npm run build
 
   release:
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # The CV repository runs CI; production releases belong to the deployment repository.
+    if: github.repository == 'hoangptkd/weblens' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: [backend, crawler, capture-worker, frontend]
     runs-on: windows-latest
     timeout-minutes: 45
@@ -191,7 +192,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not publish deployment release' }
 
   deploy:
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.repository == 'hoangptkd/weblens' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 45

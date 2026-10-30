@@ -1,5 +1,13 @@
 # WebLens
 
+- **Website:** https://jobnext.top/
+- **GitHub trong CV:** https://github.com/hoangnvhe181030/weblens
+- **Repository trên tài khoản GitHub mới:** https://github.com/hoangptkd/weblens
+
+Repository này giữ nguyên đường dẫn trong CV và đã hợp nhất các cập nhật mã nguồn
+ngày 30/10/2026, gồm thanh toán VNPAY, phiên đăng nhập Redis, RabbitMQ, công cụ
+kiểm thử chịu tải và các sửa lỗi Design Clone. Mã nguồn nằm trực tiếp trên `main`.
+
 WebLens là nền tảng hỗ trợ kỹ sư đăng ký website, chạy lượt quét có giới hạn và xem bằng chứng kỹ thuật theo từng trang. Kiến trúc V1/V1.5 gồm frontend React/TypeScript, Java 21/Spring Boot Control Plane, Go Crawler Service dựa trên bản fork CrawlObserver, PostgreSQL tự triển khai cho workflow, ClickHouse tự triển khai cho analytics và Playwright Capture Worker cô lập.
 
 ## Status
@@ -16,6 +24,18 @@ adapter, kèm manifest và thời hạn tải 7 ngày. Frontend chỉ dùng Cont
 runtime không còn mock mode hoặc dữ liệu scan mô phỏng.
 Capture Worker dùng Camoufox mặc định theo ADR-015 trên local và VPS; Chromium
 còn như lựa chọn thủ công. Không bảo đảm vượt mọi CAPTCHA/Cloudflare.
+
+Các phần backend và kiểm thử đã có trong `main`:
+
+- **Redis:** quản lý phiên JWT, refresh rotation và thu hồi phiên khi đăng xuất.
+- **RabbitMQ:** adapter giao lệnh tạo/hủy scan, publisher confirms, ACK sau commit,
+  retry/dead queue và kiểm thử tích hợp với PostgreSQL.
+- **VNPAY:** đơn thanh toán, số dư, sổ giao dịch, xác minh chữ ký IPN và xử lý
+  thông báo trùng; có kiểm thử crash/retry. Billing mặc định tắt, chưa nhận tiền thật.
+- **Kiểm thử:** k6, kiểm thử tích hợp, khôi phục dữ liệu và báo cáo hiệu năng trong
+  [`tools/load`](tools/load/) và [`docs/testing`](docs/testing/).
+- **CI/CD:** GitHub Actions kiểm tra các thành phần; bộ công cụ phát hành Windows
+  VPS qua HTTPS có checksum, health check và rollback.
 
 ## V1 goal
 
