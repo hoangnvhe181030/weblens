@@ -21,11 +21,13 @@ export interface StaticClonePlan {
   mainPath: string
   resources: PlannedResource[]
   replacements: Record<string, string>
+  allowExternalVisualResources: boolean
 }
 
 export interface StaticClonePlanOptions {
   mainPath?: string
   contentAddressedResources?: boolean
+  allowExternalVisualResources?: boolean
 }
 
 interface ManifestFile {
@@ -61,7 +63,8 @@ export function planStaticClone(
   let plannedBytes = htmlBytes
   const planned = resources.map((resource): PlannedResource => {
     if (resource.skipReason || !resource.body) return { ...resource, localPath: null }
-    if (!isSameOrigin(resource.sourceUrl, finalUrl)) {
+    if (!isSameOrigin(resource.sourceUrl, finalUrl)
+      && !(options.allowExternalVisualResources && isExternalVisualResource(resource))) {
       return { ...resource, localPath: null, skipReason: 'EXTERNAL_ORIGIN' }
     }
     const bodyHash = sha256(resource.body)
@@ -89,7 +92,20 @@ export function planStaticClone(
     plannedBytes += resource.body.length
     return { ...resource, localPath }
   })
-  return { finalUrl, mainPath, resources: planned, replacements }
+  return { finalUrl, mainPath, resources: planned, replacements,
+    allowExternalVisualResources: options.allowExternalVisualResources === true }
+}
+
+function isExternalVisualResource(resource: CloneInputResource): boolean {
+  try {
+    const url = new URL(resource.sourceUrl)
+    if (url.protocol !== 'https:' || url.username || url.password) return false
+  } catch { return false }
+  const mime = resource.mimeType.split(';')[0]?.trim().toLowerCase() ?? ''
+  return (resource.resourceType === 'stylesheet' && mime === 'text/css')
+    || (resource.resourceType === 'image' && /^image\/(?:avif|bmp|gif|jpeg|png|svg\+xml|webp|x-icon|vnd\.microsoft\.icon)$/u.test(mime))
+    || (resource.resourceType === 'font' && (/^font\/(?:woff2?|ttf|otf|collection)$/u.test(mime)
+      || ['application/font-woff', 'application/x-font-ttf', 'application/x-font-opentype', 'application/vnd.ms-fontobject'].includes(mime)))
 }
 
 export async function buildStaticClone(
@@ -172,7 +188,8 @@ export async function buildStaticClone(
     engine: { name: 'pagesource-adapter', version: STATIC_CLONE_ENGINE_VERSION },
     generatedAt: new Date().toISOString(),
     policy: {
-      sameOriginOnly: true,
+      sameOriginOnly: !plan.allowExternalVisualResources,
+      externalResourceTypes: plan.allowExternalVisualResources ? ['stylesheet', 'image', 'font'] : [],
       maxFiles: STATIC_CLONE_MAX_FILES,
       maxInputBytes: STATIC_CLONE_MAX_INPUT_BYTES,
       maxArchiveBytes: STATIC_CLONE_MAX_ARCHIVE_BYTES,

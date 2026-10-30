@@ -232,8 +232,10 @@ export async function capturePage(
     }
   })
 
+    // A static export cannot replay scroll animations after source JavaScript is disabled.
+    if (options.includeSiteBundle) await page.emulateMedia({ reducedMotion: 'reduce' })
     await page.goto(command.targetUrl, { waitUntil: 'load', timeout: operationTimeoutMillis(deadline) })
-    await withinDeadline(settleDynamicContent(page, deadline), deadline)
+    await withinDeadline(settleDynamicContent(page, deadline, options.includeSiteBundle === true), deadline)
     if (options.includeSiteBundle) {
       await withinDeadline(waitForDesignStability(page, networkActivity, deadline - RECONSTRUCTION_RESERVE_MILLIS), deadline)
     } else {
@@ -272,11 +274,20 @@ export async function capturePage(
     if (requestBudgetExceeded) throw new Error('CAPTURE_REQUEST_BUDGET_EXCEEDED')
     if (totalTransferBytes > command.maxTotalBytes) throw new Error('CAPTURE_TRANSFER_BUDGET_EXCEEDED')
     const sourceFinalUrl = (await assertPublicHttpUrl(page.url())).toString()
+    const cloneInputs = [...collected.cloneInputs, ...failedCloneInputs]
+    const collectedSequences = new Set(cloneInputs.map(resource => resource.sequence))
+    // Requests without response headers are absent from body candidates but still leave a gap.
+    for (const [request, tracked] of requestStarted) {
+      if (collectedSequences.has(tracked.sequence) || !bodyResourceTypes.has(request.resourceType())) continue
+      cloneInputs.push({ sequence: tracked.sequence, sourceUrl: request.url(), publicUrl: sanitizeUrl(request.url()),
+        resourceType: request.resourceType(), mimeType: '', body: null, wasTruncated: false,
+        skipReason: pendingRequests.has(request) ? 'RESOURCE_TIMEOUT' : 'BODY_UNAVAILABLE' })
+    }
     const reconstruction = await createReconstruction(
       page,
       sourceFinalUrl,
       html,
-      [...collected.cloneInputs, ...failedCloneInputs].sort((left, right) => left.sequence - right.sequence),
+      cloneInputs.sort((left, right) => left.sequence - right.sequence),
       options,
       deadline,
     )
@@ -358,7 +369,8 @@ export function isSafeExpansionLabel(rawLabel: string): boolean {
     && !unsafeActionLabels.some((candidate) => label.includes(candidate))
 }
 
-async function settleDynamicContent(page: import('playwright').Page, deadline: number): Promise<void> {
+async function settleDynamicContent(page: import('playwright').Page, deadline: number, designClone: boolean): Promise<void> {
+  deadline = Math.min(deadline - 2 * RECONSTRUCTION_RESERVE_MILLIS, Date.now() + 8_000)
   let expansionClicks = 0
   const hoverTargets = page.locator('[aria-haspopup="true"], nav a, [role="navigation"] a')
   const hoverCount = Math.min(await hoverTargets.count(), 8)
@@ -371,15 +383,19 @@ async function settleDynamicContent(page: import('playwright').Page, deadline: n
   for (let iteration = 0; iteration < 10 && stableIterations < 2 && remainingMillis(deadline) > 500; iteration++) {
     if (expansionClicks < 3) {
       const controls = page.locator('button, [role="button"], summary')
-      const count = Math.min(await controls.count(), 100)
-      for (let index = 0; index < count && expansionClicks < 3; index++) {
-        const control = controls.nth(index)
-        const candidate = await control.evaluate((element) => ({
-          label: element.getAttribute('aria-label') || element.textContent || '',
+      // Read bounded candidates in one browser round trip, rather than 100 per scroll.
+      const candidates = await controls.evaluateAll((elements) => elements.slice(0, 100).map((element, index) => {
+        const label = element.getAttribute('aria-label') || element.textContent || ''
+        return { index,
+          label: label.length <= 512 ? label : '',
           disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true',
           insideForm: element.closest('form') !== null,
-        })).catch(() => null)
-        if (!candidate || candidate.disabled || candidate.insideForm || !isSafeExpansionLabel(candidate.label)) continue
+        }
+      })).catch(() => [])
+      for (const candidate of candidates) {
+        if (expansionClicks >= 3 || remainingMillis(deadline) <= 500) break
+        if (candidate.disabled || candidate.insideForm || !isSafeExpansionLabel(candidate.label)) continue
+        const control = controls.nth(candidate.index)
         const visible = await control.isVisible().catch(() => false)
         if (!visible) continue
         await control.click({ timeout: Math.max(1, Math.min(750, remainingMillis(deadline))) }).catch(() => undefined)
@@ -387,20 +403,27 @@ async function settleDynamicContent(page: import('playwright').Page, deadline: n
       }
     }
 
-    const height = await page.evaluate(() => {
-      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' })
+    const { height, atBottom } = await page.evaluate(({ step, eagerImages }) => {
+      // Horizontal carousels may never bring every native lazy image into the viewport.
+      if (eagerImages) {
+        const images = document.querySelectorAll<HTMLImageElement>('img[loading="lazy"]')
+        for (const image of Array.from(images).slice(0, 100)) image.loading = 'eager'
+      }
+      // Visit intermediate viewports so lazy images and reveal observers can run.
+      window.scrollTo({ top: step * window.innerHeight, behavior: 'instant' })
       const scrollables = document.querySelectorAll<HTMLElement>('*')
       for (let index = 0; index < Math.min(scrollables.length, 2_000); index++) {
         const element = scrollables[index]!
         const style = getComputedStyle(element)
         if ((style.overflowY === 'auto' || style.overflowY === 'scroll')
             && element.scrollHeight > element.clientHeight + 32) {
-          element.scrollTop = element.scrollHeight
+          element.scrollTop = Math.min(step * element.clientHeight, element.scrollHeight)
         }
       }
-      return document.documentElement.scrollHeight
-    })
-    stableIterations = height <= previousHeight ? stableIterations + 1 : 0
+      return { height: document.documentElement.scrollHeight,
+        atBottom: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 1 }
+    }, { step: iteration, eagerImages: designClone })
+    stableIterations = atBottom && height <= previousHeight ? stableIterations + 1 : 0
     previousHeight = Math.max(previousHeight, height)
     await page.waitForTimeout(Math.min(350, remainingMillis(deadline)))
   }
@@ -650,7 +673,10 @@ async function createReconstruction(
 ): Promise<CaptureResult['reconstruction']> {
   try {
     if (remainingMillis(deadline) <= 0) throw new Error('CAPTURE_TIMEOUT')
-    const planOptions: import('./static-clone.js').StaticClonePlanOptions = {}
+    // These bodies already passed the browser's SSRF/egress guard and capture budgets.
+    const planOptions: import('./static-clone.js').StaticClonePlanOptions = {
+      allowExternalVisualResources: options.includeSiteBundle === true,
+    }
     if (options.mainPath !== undefined) planOptions.mainPath = options.mainPath
     if (options.contentAddressedResources !== undefined) {
       planOptions.contentAddressedResources = options.contentAddressedResources
@@ -713,6 +739,41 @@ async function rewriteRenderedHtml(
       (_match, quote: string, raw: string) => `url(${quote}${redactOrReplace(raw)}${quote})`,
     )
     const clone = document.documentElement.cloneNode(true) as HTMLElement
+    // CSS-in-JS can populate CSSOM while leaving the style element text empty.
+    const originalStyles = document.querySelectorAll<HTMLStyleElement>('style')
+    let serializedStyleCharacters = 0
+    clone.querySelectorAll<HTMLStyleElement>('style').forEach((element, index) => {
+      const sheet = originalStyles[index]?.sheet
+      if (!sheet) return
+      if (sheet.disabled) element.setAttribute('media', 'not all')
+      let rules: CSSRuleList
+      try { rules = sheet.cssRules } catch { return }
+      const css: string[] = []
+      for (const rule of rules) {
+        serializedStyleCharacters += rule.cssText.length
+        if (serializedStyleCharacters > 52_428_800) throw new Error('CLONE_INPUT_BUDGET_EXCEEDED')
+        css.push(rule.cssText.replaceAll('<', '\\3c '))
+      }
+      element.textContent = css.join('\n')
+    })
+    // Reuse the captured responsive candidate when another viewport requests an unobserved URL.
+    const retainCapturedCandidates = (element: Element, attribute: string): void => {
+      const available = (element.getAttribute(attribute) ?? '').split(',').filter((value) => {
+        const raw = value.trim().split(/\s+/u)[0]
+        try { return !!raw && !!paths[new URL(raw, document.baseURI || baseUrl).toString()] } catch { return false }
+      }).join(',')
+      if (available) element.setAttribute(attribute, available)
+      else element.removeAttribute(attribute)
+    }
+    const originalImages = document.querySelectorAll<HTMLImageElement>('img')
+    clone.querySelectorAll<HTMLImageElement>('img').forEach((image, index) => {
+      const current = originalImages[index]?.currentSrc
+      if (!current || !paths[current]) return
+      image.setAttribute('src', current)
+      const candidates = [image, ...(image.closest('picture')?.querySelectorAll('source') ?? [])]
+      for (const candidate of candidates) retainCapturedCandidates(candidate, 'srcset')
+    })
+    clone.querySelectorAll('link[imagesrcset]').forEach((link) => retainCapturedCandidates(link, 'imagesrcset'))
     clone.querySelectorAll('base').forEach((element) => element.remove())
     clone.querySelectorAll<HTMLInputElement>('input').forEach((element) => {
       const type = element.type.toLowerCase()
@@ -727,9 +788,10 @@ async function rewriteRenderedHtml(
         const raw = element.getAttribute(attribute)
         if (raw !== null) element.setAttribute(attribute, redactOrReplace(raw))
       }
-      const srcset = element.getAttribute('srcset')
-      if (srcset !== null) {
-        element.setAttribute('srcset', srcset.split(',').map((candidate) => {
+      for (const attribute of ['srcset', 'imagesrcset']) {
+        const srcset = element.getAttribute(attribute)
+        if (srcset === null) continue
+        element.setAttribute(attribute, srcset.split(',').map((candidate) => {
           const [raw, ...descriptor] = candidate.trim().split(/\s+/u)
           return raw ? [redactOrReplace(raw), ...descriptor].join(' ') : ''
         }).filter(Boolean).join(', '))

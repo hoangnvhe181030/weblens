@@ -61,6 +61,49 @@ test('content-addressed resources giữ extension và chỉ deduplicate represen
   assert.match(plan.resources[3]?.localPath ?? '', /^assets\/[0-9a-f]{64}\.css$/u)
 })
 
+test('Design Clone admits only observed HTTPS visual resources with matching MIME', async () => {
+  const resources = [
+    input('https://cdn.example.net/styles/site.css?token=private', 'stylesheet', 'text/css',
+      '@font-face{font-family:fixture;src:url(../fonts/site.woff2?token=secret)}'),
+    input('https://cdn.example.net/fonts/site.woff2?token=secret', 'font', 'font/woff2', 'font'),
+    input('https://images.example.net/hero.webp', 'image', 'image/webp', 'image'),
+    input('https://cdn.example.net/analytics.js', 'script', 'application/javascript', 'script'),
+    input('https://cdn.example.net/fake-image', 'image', 'text/html', 'html'),
+    input('https://cdn.example.net/fake-style', 'stylesheet', 'application/javascript', 'script'),
+    input('http://cdn.example.net/insecure.png', 'image', 'image/png', 'image'),
+    input('https://user:password@cdn.example.net/private.png', 'image', 'image/png', 'image'),
+    { ...input('https://cdn.example.net/missing.png', 'image', 'image/png', ''), body: null,
+      skipReason: 'REQUEST_FAILED' },
+  ]
+  const legacy = planStaticClone('https://example.com/', resources)
+  assert.ok(legacy.resources.every(resource => resource.localPath === null))
+  const plan = planStaticClone('https://example.com/', resources, 20,
+    { contentAddressedResources: true, allowExternalVisualResources: true })
+  assert.ok(plan.resources.slice(0, 3).every(resource => resource.localPath !== null))
+  assert.ok(plan.resources.slice(3).every(resource => resource.localPath === null))
+  assert.equal(plan.resources.at(-1)?.skipReason, 'REQUEST_FAILED')
+  const css = rewriteCss(resources[0]!.body!.toString(), resources[0]!.sourceUrl, plan.resources[0]!.localPath!, plan)
+  assert.doesNotMatch(css, /secret|private|https:/u)
+  assert.match(css, /url\([a-f0-9]+\.woff2\)/u)
+  const build = await buildStaticClone(plan, Buffer.from('<main>Design</main>'), { bundleOnly: true })
+  assert.equal(build.packagedCount, 4)
+  const manifest = JSON.parse(build.manifest!.toString())
+  assert.equal(manifest.policy.sameOriginOnly, false)
+  assert.deepEqual(manifest.policy.externalResourceTypes, ['stylesheet', 'image', 'font'])
+  assert.doesNotMatch(build.manifest!.toString(), /token=(?:secret|private)|user:password/u)
+})
+
+test('external visual resources share the existing file and byte ceilings', () => {
+  const resources = Array.from({ length: 100 }, (_, index) =>
+    input(`https://cdn.example.net/${index}.png`, 'image', 'image/png', String(index)))
+  const options = { contentAddressedResources: true, allowExternalVisualResources: true }
+  const plan = planStaticClone('https://example.com/', resources, 0, options)
+  assert.equal(plan.resources.filter(resource => resource.localPath).length, 99)
+  assert.equal(plan.resources.at(-1)?.skipReason, 'FILE_COUNT_BUDGET_EXCEEDED')
+  const byteLimited = planStaticClone('https://example.com/', resources.slice(0, 1), 52_428_800, options)
+  assert.equal(byteLimited.resources[0]?.skipReason, 'CLONE_INPUT_BUDGET_EXCEEDED')
+})
+
 test('tạo ZIP bounded và manifest trung thực cho partial clone', async () => {
   const resources = [
     input('https://example.com/styles/site?theme=private', 'stylesheet', 'text/css',

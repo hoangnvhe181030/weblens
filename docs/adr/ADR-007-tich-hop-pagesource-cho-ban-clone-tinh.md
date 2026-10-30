@@ -9,6 +9,37 @@ database/runtime được người dùng chấp thuận triển khai ngày 2026-
 Design Clone được chấp thuận qua TASK-018 ngày 2026-09-20.
 Ngày: 2026-09-13
 
+## Amendment 2026-10-29 — Asset CDN cho Design Clone
+
+Người dùng đã đồng ý tiếp tục hoàn thiện ảnh/font/CSS ngoài origin sau kiểm thử
+`luyentu.com`. Ngoại lệ này áp dụng cho Design Clone; clone tĩnh một trang độc lập
+giữ mặc định same-origin. Không thay đổi deployable hoặc schema.
+
+- Trang HTML/discovery vẫn cùng origin. Trường command `sameOriginOnly: true`
+  tiếp tục giới hạn phạm vi trang; không mở crawl sang website khác.
+- Chỉ nhận body HTTPS của image/font/stylesheet mà trình duyệt thực sự đã tải
+  trong cùng phiên capture. MIME phải phù hợp loại tài nguyên; không nhận script
+  ngoài origin, HTML/API/fetch body hoặc URL chứa userinfo.
+- Không fetch bổ sung hoặc truy lại URL từ CSS sau capture. Mọi kết nối, DNS và
+  redirect vẫn qua route guard và SafeProxy; giữ giới hạn request, body, byte,
+  thời gian và file hiện hành. Không đổi cookie/session hoặc bypass CSP.
+- Asset được content-address/deduplicate và rewrite HTML/CSS như asset nội bộ.
+  Query value không đi vào filename/manifest; resource thiếu hoặc lỗi vẫn được
+  ghi rõ và không được công bố là đã đóng gói.
+- Manifest phân biệt `sameOriginPagesOnly: true` với `sameOriginOnly: false`,
+  liệt kê `externalResourceTypes` và policy `observed-https-visual-v1`.
+- Renderer tiếp tục tối đa 10 vòng scroll theo ADR-011, nhưng đi qua viewport
+  trung gian để kích hoạt lazy image/reveal thay vì nhảy thẳng cuối trang.
+- Design Clone bật `prefers-reduced-motion: reduce` trước navigation để website
+  có thể hiện nội dung tĩnh thay cho hiệu ứng scroll cần JavaScript replay.
+  Website không hỗ trợ preference này vẫn có thể thiếu trạng thái reveal.
+- Mỗi vòng đổi tối đa 100 ảnh `loading="lazy"` có sẵn trong DOM sang `eager`,
+  để browser thu cả ảnh nằm ngoài viewport ngang. Request vẫn đi qua cùng guard
+  và budget; không đọc URL từ script hoặc tự fetch tài nguyên sau capture.
+
+Các giới hạn same-origin resource trong revision cũ bên dưới là lịch sử; ngoại lệ
+ở đây chỉ thay phần đóng gói tài nguyên hiển thị của Design Clone.
+
 ## Amendment revision 3 — Design Clone
 
 Site-wide workflow của revision 2 mặc định tạo **Design Clone**, không còn cố

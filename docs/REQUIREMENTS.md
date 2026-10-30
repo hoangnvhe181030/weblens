@@ -201,6 +201,12 @@ thời gian job 7 ngày, archive 7 ngày, metadata 30 ngày, chỉ same-origin. 
 nhất một page thành công thì cancellation/lỗi phần còn lại có thể phát hành
 `PARTIAL`; không có page thành công thì `FAILED` hoặc `CANCELLED`.
 
+Ngoại lệ resource theo amendment ADR-007 ngày 2026-10-29: Design Clone được đóng
+gói image/font/stylesheet HTTPS ngoài origin đã quan sát trong phiên capture,
+MIME phù hợp, cùng SSRF/redirect guard và budget hiện hữu. Giới hạn same-origin
+vẫn áp dụng cho trang/discovery; script ngoài origin tiếp tục bị loại. Clone một
+trang độc lập không mở rộng policy. Manifest phân biệt phạm vi trang và resource.
+
 ## CAP-006 — Phiên đăng nhập tạm thời và DOM động cho Design Clone
 
 **Mô tả:** Owner có thể mở một browser session do WebLens quản lý, tự nhập thông

@@ -54,6 +54,17 @@ dùng nhập URL; WebLens tự tạo scan mới, chọn representative determini
 bằng Capture Worker, deduplicate asset xuyên page và tạo archive download-only
 không chứa screenshot. Người dùng không phải chọn scan. Baseline workload, schema
 và runtime đã được phê duyệt trong TASK-015; TASK-018 không đổi database schema.
+HTML xuất ra giữ DOM sau render và CSS tạo qua CSSOM; JavaScript nguồn vẫn có
+trong ZIP nhưng không tự thực thi, để SPA không ghi đè giao diện hoặc route local.
+Link tới trang đã đóng gói hoạt động bằng navigation HTML; thao tác cần JavaScript
+hoặc backend nguồn không được khôi phục. Manifest ghi rõ chính sách thực thi này.
+Theo amendment ADR-007 ngày 2026-10-29, Design Clone nhận thêm ảnh/font/CSS HTTPS
+ngoài origin đã được trình duyệt tải qua guard hiện hữu, cùng budget hiện hành.
+Trang HTML vẫn cùng origin; script ngoài origin không được đóng gói.
+Design Clone dùng chế độ giảm chuyển động, cuộn qua các viewport trung gian và
+đổi ảnh native lazy trong DOM sang eager theo giới hạn ADR-007/ADR-011, để giảm
+nội dung trống khi mở bản tĩnh. Website không hỗ trợ giảm chuyển động hoặc tài
+nguyên chưa tải xong trong budget vẫn có thể tạo kết quả PARTIAL.
 Tuyên bố sức chứa production vẫn phải dựa trên benchmark phần cứng thực tế.
 Từ 2026-09-22, ADR-011 bổ sung phiên browser đăng nhập tạm thời cho Design Clone
 và bounded scroll/click/hover. Phiên chỉ nằm trong RAM, một phiên trên worker,

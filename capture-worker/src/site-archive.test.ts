@@ -3,6 +3,8 @@ import { readFile, readdir, stat } from 'node:fs/promises'
 import { test } from 'node:test'
 import { inflateRawSync } from 'node:zlib'
 import { posix } from 'node:path'
+import { createServer } from 'node:http'
+import { chromium } from 'playwright'
 import {
   buildSiteArchives,
   cleanupSiteArchives,
@@ -94,6 +96,99 @@ test('rewriteSiteNavigation chỉ tạo link local cho page thực sự có rout
   assert.match(result, /href="pages\/about\.html#team"/u)
   assert.match(result, /href="https:\/\/example\.com\/missing\?secret=%5BREDACTED%5D"/u)
   assert.doesNotMatch(result, /secret=1/u)
+})
+
+test('Design Clone preserves rendered SPA pages without restarting source scripts or routing', async (t) => {
+  const pages = [bundle('home', 'https://example.com/', 'index.html', 'Home'),
+    bundle('login', 'https://example.com/login', 'pages/login.html', 'Login')]
+  for (const page of pages) {
+    page.files[0]!.body = Buffer.from('<!doctype html><html><head>'
+      + `<link rel="stylesheet" href="${page.mainPath === 'index.html' ? '' : '../'}assets/layout.css">`
+      + '<link rel="modulepreload" href="/assets/missing-module.js">'
+      + '<link rel="preload" as="script" href="/assets/missing-preload.js">'
+      + '<meta http-equiv="refresh" content="0;url=https://example.com/redirect">'
+      + '</head><body onload="document.body.textContent=\'restarted\'">'
+      + `<h1>${page.pageId === 'home' ? 'Home' : 'Login'}</h1>`
+      + '<a id="login" href="/login">Login</a><a id="home" href="/">Home</a>'
+      + '<form action="https://example.com/submit"><input name="email"><button>Submit</button></form>'
+      + '<button id="mutate" onclick="document.querySelector(\'h1\').textContent=\'mutated\'">Action</button>'
+      + '<script src="assets/shared.js"></script>'
+      + '<script type="module">document.body.textContent="restarted";import("/assets/missing.js")</script>'
+      + '<script>document.body.textContent="restarted"</script>'
+      + '<script type="application/ld+json">{"@type":"WebPage"}</script></body></html>')
+    page.files.push({ kind: 'RESOURCE', localPath: 'assets/layout.css', sourceUrl: 'https://example.com/layout.css',
+      contentType: 'text/css', body: Buffer.from('h1{color:rgb(1,2,3)}@media(max-width:500px){h1{color:rgb(4,5,6)}}') })
+  }
+  const encoded = new Map(pages.map((page) => [page.pageId, encodeSiteBundle(page)]))
+  const references = pages.map((page, ordinal) => ({ pageId: page.pageId, ordinal,
+    publicUrl: page.publicFinalUrl, localPath: page.mainPath, bucket: 'fixture', key: page.pageId,
+    bytes: encoded.get(page.pageId)!.length, sha256Hex: '0'.repeat(64) }))
+  const routes = pages.map((page) => ({ urlSha256Hex: rawUrlHash(page.sourceFinalUrl).toString('hex'), localPath: page.mainPath }))
+  const build = await buildSiteArchives('https://example.com/', references, [], routes, 50_000, 100_000,
+    async (reference) => encoded.get(reference.pageId)!)
+  try {
+    const entries = zipEntries(await readFile(build.parts[0]!.path))
+    for (const page of pages) {
+      const html = entries.get(page.mainPath)!.toString()
+      assert.match(html, /script-src 'none'/u)
+      assert.match(html, /type="application\/x-weblens-inert"/u)
+      assert.match(html, /data-weblens-original-type="module"/u)
+      assert.match(html, /type="application\/ld\+json"/u)
+      assert.doesNotMatch(html, /modulepreload|as="script"|http-equiv="refresh"|onload=|onclick=/u)
+    }
+    assert.ok(entries.has('assets/shared.js'), 'original JS remains available for editing')
+    assert.equal(JSON.parse(build.manifest.toString()).policy.javascriptExecution, 'disabled-rendered-snapshot')
+    await t.test('archive reopens with CSS, local navigation and no source JS requests', {
+      skip: process.env.WEBLENS_BROWSER_SMOKE !== 'true', timeout: 20_000,
+    }, async () => {
+      const server = createServer((request, response) => {
+        const pathname = new URL(request.url!, 'http://localhost').pathname
+        const filename = pathname === '/' ? 'index.html' : pathname.slice(1)
+        const body = entries.get(filename)
+        response.writeHead(body ? 200 : 404, { 'Content-Type': filename.endsWith('.css') ? 'text/css' : 'text/html' })
+        response.end(body ?? 'missing archive entry')
+      })
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const address = server.address()
+      assert.ok(address && typeof address !== 'string')
+      const origin = `http://127.0.0.1:${address.port}`
+      const browser = await chromium.launch({ headless: true })
+      try {
+        const context = await browser.newContext({ serviceWorkers: 'block' })
+        context.setDefaultTimeout(3_000)
+        const requests: string[] = [], failures: string[] = []
+        await context.route('**/*', (route) => {
+          requests.push(route.request().url())
+          return new URL(route.request().url()).origin === origin ? route.continue() : route.abort()
+        })
+        const tab = await context.newPage()
+        tab.on('pageerror', (error) => failures.push(error.message))
+        for (const width of [1365, 390]) {
+          await tab.setViewportSize({ width, height: 844 })
+          await tab.goto(origin, { waitUntil: 'networkidle' })
+          assert.equal(await tab.locator('h1').innerText(), 'Home')
+          assert.equal(await tab.locator('h1').evaluate((node) => getComputedStyle(node).color),
+            width === 390 ? 'rgb(4, 5, 6)' : 'rgb(1, 2, 3)')
+          await tab.locator('#mutate').click()
+          assert.equal(await tab.locator('h1').innerText(), 'Home')
+          await tab.locator('#login').click()
+          assert.equal(new URL(tab.url()).pathname, '/pages/login.html')
+          assert.equal(await tab.locator('h1').innerText(), 'Login')
+          await tab.locator('#home').click()
+          assert.equal(await tab.locator('h1').innerText(), 'Home')
+        }
+        await tab.locator('button', { hasText: 'Submit' }).click({ noWaitAfter: true })
+        assert.equal(new URL(tab.url()).pathname, '/index.html')
+        assert.deepEqual(failures, [])
+        assert.ok(requests.every((url) => new URL(url).origin === origin))
+        assert.ok(requests.every((url) => !url.endsWith('.js')))
+      } finally {
+        await browser.close()
+        server.closeAllConnections()
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+      }
+    })
+  } finally { await cleanupSiteArchives(build) }
 })
 
 test('buildSiteArchives deduplicate asset và giữ mỗi shard dưới budget', async () => {

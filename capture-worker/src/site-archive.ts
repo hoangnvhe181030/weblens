@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { posix } from 'node:path'
 import { pipeline } from 'node:stream/promises'
-import { parse, serialize } from 'parse5'
+import { parse, parseFragment, serialize } from 'parse5'
 import { ZipFile } from 'yazl'
 import { sanitizeUrl } from './capture.js'
 import { DESIGN_CLONE_POLICY_VERSION, LAYOUT_FINGERPRINT_VERSION } from './design-clone.js'
@@ -309,7 +309,7 @@ export async function buildSiteArchives(
         if (file.kind === 'DOCUMENT' || isStylesheet(file)) {
           const original = await readFile(file.diskPath)
           const body = file.kind === 'DOCUMENT'
-            ? rewriteSiteNavigation(rewriteSiteResourceAliases(original, path, resourceAliases, page.aliases),
+            ? rewriteSiteNavigation(rewriteDesignDocument(original, path, resourceAliases, page.aliases),
                 page.sourceFinalUrl, path, routeMap)
             : rewriteCssResourceAliases(original, file.contentType, path, resourceAliases)
           file.hash = createHash('sha256').update(body).digest('hex')
@@ -365,15 +365,19 @@ export async function buildSiteArchives(
       kind: 'DESIGN_SITE_ARCHIVE',
       engine: {
         name: 'pagesource-adapter',
-        version: 'weblens-site-2/pagesource-0.1.2@f59ed61',
+        version: 'weblens-site-3/pagesource-0.1.2@f59ed61',
         policyVersion: DESIGN_CLONE_POLICY_VERSION,
       },
       generatedAt: new Date().toISOString(),
       rootUrl: sanitizeUrl(rootUrl),
       extraction: 'Tải tất cả shard ZIP và giải nén vào cùng một thư mục.',
       policy: {
-        sameOriginOnly: true,
+        sameOriginOnly: false,
+        sameOriginPagesOnly: true,
+        externalResourceTypes: ['stylesheet', 'image', 'font'],
+        externalResourcePolicy: 'observed-https-visual-v1',
         designClone: true,
+        javascriptExecution: 'disabled-rendered-snapshot',
         screenshot: false,
         maxPages: budgets?.maxPages ?? outcomes.length,
         maxInputBytes: budgets?.maxInputBytes ?? null,
@@ -526,20 +530,37 @@ function visit(node: HtmlNode, action: (node: HtmlNode) => void): void {
   node.childNodes?.forEach((child) => visit(child, action))
 }
 
-function rewriteSiteResourceAliases(
+function rewriteDesignDocument(
   html: Buffer,
   sourcePath: string,
   aliases: ReadonlyMap<string, string>,
   pageAliases?: ReadonlyMap<string, string>,
 ): Buffer {
-  if (aliases.size === 0 && !pageAliases?.size) return html
   const document = parse(html.toString('utf8')) as unknown as HtmlNode
   visit(document, (node) => {
+    // Rehydrating the source SPA would replace the captured DOM and local routes.
+    if (node.tagName === 'script') {
+      const type = node.attrs?.find((attribute) => attribute.name === 'type')
+      if (!/^application\/(?:ld\+)?json$/iu.test(type?.value.trim() ?? '')) {
+        if (type) {
+          node.attrs!.push({ name: 'data-weblens-original-type', value: type.value })
+          type.value = 'application/x-weblens-inert'
+        } else node.attrs!.push({ name: 'type', value: 'application/x-weblens-inert' })
+      }
+    }
+    if (node.attrs) node.attrs = node.attrs.filter((attribute) => !/^on/iu.test(attribute.name))
+    if (node.childNodes) node.childNodes = node.childNodes.filter((child) => {
+      const attr = (name: string) => child.attrs?.find((attribute) => attribute.name === name)?.value.toLowerCase()
+      if (child.tagName === 'meta' && attr('http-equiv') === 'refresh') return false
+      const relations = attr('rel')?.split(/\s+/u) ?? []
+      return child.tagName !== 'link' || (!relations.includes('modulepreload')
+        && !(relations.includes('preload') && attr('as') === 'script'))
+    })
     for (const attribute of node.attrs ?? []) {
       const name = attribute.name.toLowerCase()
       if (name === 'src' || name === 'poster' || (name === 'href' && node.tagName !== 'a' && node.tagName !== 'area')) {
         attribute.value = rewriteArchiveReference(attribute.value, sourcePath, aliases, pageAliases)
-      } else if (name === 'srcset') {
+      } else if (name === 'srcset' || name === 'imagesrcset') {
         attribute.value = attribute.value.split(',').map((candidate) => {
           const [raw, ...descriptor] = candidate.trim().split(/\s+/u)
           return raw ? [rewriteArchiveReference(raw, sourcePath, aliases, pageAliases), ...descriptor].join(' ') : ''
@@ -553,6 +574,10 @@ function rewriteSiteResourceAliases(
         if (typeof child.value === 'string') child.value = rewriteCssText(child.value, sourcePath, aliases, pageAliases)
       }
     }
+  })
+  const policy = parseFragment('<meta http-equiv="Content-Security-Policy" content="script-src \'none\'; object-src \'none\'; form-action \'none\'">')
+  visit(document, (node) => {
+    if (node.tagName === 'head') node.childNodes!.unshift(policy.childNodes[0] as unknown as HtmlNode)
   })
   return Buffer.from(serialize(document as never), 'utf8')
 }

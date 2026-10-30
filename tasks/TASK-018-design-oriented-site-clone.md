@@ -105,7 +105,7 @@ dù có cùng layout.
 3. Capture Worker thực hiện pre-filter URL/locale/semantic role trước Chromium.
 4. Chỉ render số ứng viên tối thiểu cần để tính layout fingerprint.
 5. Chọn representative set deterministic.
-6. Capture HTML và same-origin resource của representative set; không chụp
+6. Capture HTML và resource của representative set theo archive policy bên dưới; không chụp
    screenshot trong Design Clone.
 7. Deduplicate resource theo SHA-256 và kiểu biểu diễn trình duyệt xuyên tất cả
    representative page; không gộp MIME không tương thích vào cùng archive path.
@@ -125,6 +125,9 @@ Archive cuối chỉ giữ:
 
 - HTML của representative page.
 - Same-origin CSS, JavaScript, image, font và resource body được chọn.
+- Amendment ADR-007 ngày 2026-10-29 bổ sung image/font/stylesheet HTTPS ngoài
+  origin đã được browser tải qua SSRF guard, đúng MIME và trong budget hiện hữu;
+  không mở rộng discovery hoặc đóng gói script ngoài origin.
 - Một bản cho mỗi resource có cùng SHA-256 và kiểu biểu diễn trình duyệt tương thích.
 - `manifest.json`.
 

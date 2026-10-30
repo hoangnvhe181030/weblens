@@ -54,10 +54,38 @@ test('Design Clone waits for DOM and requests to settle, with a bounded wait', {
       } finally { await page.evaluate((id) => clearInterval(id), interval) }
     })
     await t.test('capture produces a rendered bundle without a screenshot or page ZIP', async () => {
-      const fixture = createServer((_request, response) => {
+      const requestedImages = new Set<string>()
+      const fixture = createServer((request, response) => {
+        if (request.url?.endsWith('/pending.png')) return
+        if (request.url?.endsWith('.png')) {
+          requestedImages.add(request.url)
+          response.writeHead(200, { 'Content-Type': 'image/png' })
+          response.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=', 'base64'))
+          return
+        }
         response.writeHead(200, { 'Content-Type': 'text/html' })
-        response.end('<title>Fixture</title><main>Ready</main><input value="private-fixture-value">'
-          + '<script>setTimeout(() => { document.querySelector("main").textContent = "Loaded" }, 300)</script>')
+        response.end('<title>Fixture</title>'
+          + '<link rel="preload" as="image" href="/large.png" imagesrcset="/small.png 320w, /large.png 1365w" imagesizes="100vw">'
+          + '<main>Ready</main><input value="private-fixture-value">'
+          + '<picture><source srcset="/small.png 320w, /large.png 1365w">'
+          + '<img src="/small.png" srcset="/small.png 320w, /large.png 1365w" sizes="100vw"></picture>'
+          + '<div style="width:100px;overflow:hidden"><img loading="lazy" src="/horizontal.png" style="margin-left:20000px"></div>'
+          + '<section id="middle" style="margin-top:1600px;opacity:0">Lazy content</section><div style="height:2500px"></div>'
+          + '<button disabled>ordinary control</button>'.repeat(95)
+          + '<script>const style = document.createElement("style"); document.head.append(style);'
+          + 'style.sheet.insertRule(".cssom-rule{color:rgb(1,2,3)}");'
+          + 'const disabled = document.createElement("style"); document.head.append(disabled);'
+          + 'disabled.sheet.insertRule("body{display:none}"); disabled.sheet.disabled = true;'
+          + 'const middle = document.querySelector("#middle");'
+          + 'new IntersectionObserver(entries => { for (const entry of entries) if (entry.isIntersecting)'
+          + 'entry.target.setAttribute("data-visited", "true"); }).observe(middle);'
+          + 'if (matchMedia("(prefers-reduced-motion: reduce)").matches) {'
+          + 'middle.setAttribute("data-revealed", "true"); middle.style.opacity = "1";'
+          + '} else new IntersectionObserver(entries => { for (const entry of entries) {'
+          + 'if (entry.isIntersecting) entry.target.setAttribute("data-revealed", "true");'
+          + 'else entry.target.removeAttribute("data-revealed"); }}).observe(middle);'
+          + 'setTimeout(() => { document.querySelector("main").textContent = "Loaded";'
+          + 'const pending = new Image(); pending.src = "/pending.png"; document.body.append(pending); }, 300)</script>')
       })
       await new Promise<void>((resolve) => fixture.listen(0, '127.0.0.1', resolve))
       const address = fixture.address()
@@ -81,6 +109,18 @@ test('Design Clone waits for DOM and requests to settle, with a bounded wait', {
         assert.equal(result.reconstruction.temporaryDirectory, null)
         const html = result.reconstruction.siteBundle!.files[0]!.body.toString()
         assert.match(html, /<main>Loaded<\/main>/u)
+        assert.match(html, /<style>\.cssom-rule\s*\{\s*color: rgb\(1, 2, 3\);\s*\}<\/style>/u)
+        assert.match(html, /<style media="not all">body\s*\{\s*display: none;\s*\}<\/style>/u)
+        assert.doesNotMatch(html, /small\.png/u)
+        assert.match(html, /<img[^>]+src="assets\/[a-f0-9]+\.png"/u)
+        assert.match(html, /imagesrcset="assets\/[a-f0-9]+\.png 1365w"/u)
+        assert.match(html, /id="middle"[^>]+data-revealed="true"/u)
+        assert.match(html, /id="middle"[^>]+data-visited="true"/u)
+        assert.equal([...requestedImages].some(url => url.endsWith('/horizontal.png')), true)
+        assert.doesNotMatch(html, /horizontal\.png/u)
+        assert.match(html, /loading="eager"/u)
+        assert.ok(result.reconstruction.siteBundle!.resourceGaps?.some(resource =>
+          resource.sourceUrl.endsWith('/pending.png') && resource.reason === 'RESOURCE_TIMEOUT'))
         assert.doesNotMatch(html, /private-fixture-value/u)
       } finally {
         await context.close()
