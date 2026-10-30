@@ -461,7 +461,8 @@ func (s *Store) ClaimPage(ctx context.Context, workerID uuid.UUID, leaseDuration
         JOIN LATERAL (
             SELECT correlation_id
             FROM inbox_messages
-            WHERE aggregate_id = ce.scan_id AND message_type = 'SCAN_REQUESTED'
+            WHERE aggregate_type = 'SCAN' AND aggregate_id = ce.scan_id
+              AND message_type = 'SCAN_REQUESTED'
             ORDER BY received_at, message_id
             LIMIT 1
         ) command ON true
@@ -530,13 +531,38 @@ func (s *Store) ExtendPageLease(ctx context.Context, lease model.PageLease, leas
 		return fmt.Errorf("begin page lease heartbeat: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	leaseUntil := time.Now().UTC().Add(leaseDuration)
+	// Acquire both locks before checking time: an unchanged tuple is not re-evaluated after a lock wait.
+	var locked bool
+	if err := tx.QueryRow(ctx, `
+		SELECT true FROM scan_pages
+		WHERE retention_month=$1 AND id=$2 AND status='LEASED'
+		  AND lease_owner=$3 AND lease_generation=$4 FOR UPDATE`,
+		lease.RetentionMonth, lease.PageID, lease.LeaseOwner, lease.LeaseGeneration,
+	).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrStaleLease
+		}
+		return fmt.Errorf("lock page before heartbeat: %w", err)
+	}
+	hostnameHash := crawl.URLHash(lease.Hostname)
+	if err := tx.QueryRow(ctx, `
+		SELECT true FROM host_leases
+		WHERE hostname_sha256=$1 AND hostname=$2 AND slot_no=$3
+		  AND lease_owner=$4 AND lease_generation=$5 FOR UPDATE`,
+		hostnameHash[:], lease.Hostname, lease.HostSlotNo, lease.LeaseOwner, lease.HostGeneration,
+	).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrStaleLease
+		}
+		return fmt.Errorf("lock host before heartbeat: %w", err)
+	}
 	commandTag, err := tx.Exec(ctx, `
 		UPDATE scan_pages
-		SET lease_expires_at = $1, updated_at = clock_timestamp()
+		SET lease_expires_at = clock_timestamp() + $1 * interval '1 millisecond', updated_at = clock_timestamp()
 		WHERE retention_month = $2 AND id = $3 AND status = 'LEASED'
-		  AND lease_owner = $4 AND lease_generation = $5`,
-		leaseUntil, lease.RetentionMonth, lease.PageID, lease.LeaseOwner, lease.LeaseGeneration,
+		  AND lease_owner = $4 AND lease_generation = $5
+		  AND lease_expires_at > clock_timestamp()`,
+		leaseDuration.Milliseconds(), lease.RetentionMonth, lease.PageID, lease.LeaseOwner, lease.LeaseGeneration,
 	)
 	if err != nil {
 		return fmt.Errorf("extend page lease: %w", err)
@@ -544,13 +570,13 @@ func (s *Store) ExtendPageLease(ctx context.Context, lease model.PageLease, leas
 	if commandTag.RowsAffected() != 1 {
 		return ErrStaleLease
 	}
-	hostnameHash := crawl.URLHash(lease.Hostname)
 	commandTag, err = tx.Exec(ctx, `
 		UPDATE host_leases
-		SET lease_expires_at = $1, updated_at = clock_timestamp()
+		SET lease_expires_at = clock_timestamp() + $1 * interval '1 millisecond', updated_at = clock_timestamp()
 		WHERE hostname_sha256 = $2 AND hostname = $3 AND slot_no = $4
-		  AND lease_owner = $5 AND lease_generation = $6`,
-		leaseUntil, hostnameHash[:], lease.Hostname, lease.HostSlotNo,
+		  AND lease_owner = $5 AND lease_generation = $6
+		  AND lease_expires_at > clock_timestamp()`,
+		leaseDuration.Milliseconds(), hostnameHash[:], lease.Hostname, lease.HostSlotNo,
 		lease.LeaseOwner, lease.HostGeneration)
 	if err != nil {
 		return fmt.Errorf("extend host lease: %w", err)
@@ -667,6 +693,7 @@ func (s *Store) CommitPageResult(ctx context.Context, lease model.PageLease, res
         FROM scan_pages
         WHERE retention_month = $1 AND id = $2 AND status = 'LEASED'
           AND lease_owner = $3 AND lease_generation = $4
+          AND lease_expires_at > clock_timestamp()
         FOR UPDATE`, lease.RetentionMonth, lease.PageID, lease.LeaseOwner, lease.LeaseGeneration,
 	).Scan(&attemptCount)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -678,16 +705,20 @@ func (s *Store) CommitPageResult(ctx context.Context, lease model.PageLease, res
 
 	now := time.Now().UTC()
 	if shouldRetryPage(result, attemptCount) {
-		if _, err := tx.Exec(ctx, `
+		requeued, err := tx.Exec(ctx, `
 			UPDATE scan_pages
 			SET status = 'QUEUED', lease_owner = NULL, lease_expires_at = NULL,
 				available_at = $1, last_error_code = NULLIF($2, ''),
 				last_error_message = NULLIF($3, ''), updated_at = $4
-			WHERE retention_month = $5 AND id = $6`,
+			WHERE retention_month = $5 AND id = $6 AND lease_expires_at > clock_timestamp()`,
 			now.Add(pageRetryDelay(attemptCount, lease.PageID)), result.ErrorCode,
 			boundedDatabaseMessage(result.ErrorMessage), now, lease.RetentionMonth, lease.PageID,
-		); err != nil {
+		)
+		if err != nil {
 			return fmt.Errorf("requeue transient page failure: %w", err)
+		}
+		if requeued.RowsAffected() != 1 {
+			return ErrStaleLease
 		}
 		hostnameHash := crawl.URLHash(lease.Hostname)
 		hostRelease, err := tx.Exec(ctx, `
@@ -731,9 +762,13 @@ func (s *Store) CommitPageResult(ctx context.Context, lease model.PageLease, res
             result_version = result_version + 1, last_error_code = NULLIF($3, ''),
             last_error_message = NULLIF($4, ''), updated_at = $2
 		WHERE retention_month = $5 AND id = $6
+		  AND lease_expires_at > clock_timestamp()
 		RETURNING result_version`, terminalStatus, now,
 		result.ErrorCode, boundedDatabaseMessage(result.ErrorMessage), lease.RetentionMonth, lease.PageID,
 	).Scan(&resultVersion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrStaleLease
+		}
 		return fmt.Errorf("stage page terminal result: %w", err)
 	}
 	hostnameHash := crawl.URLHash(lease.Hostname)
@@ -989,7 +1024,8 @@ func (s *Store) CompleteAnalytics(ctx context.Context, batch model.AnalyticsBatc
 	var correlationID uuid.UUID
 	if err := tx.QueryRow(ctx, `
         SELECT correlation_id FROM inbox_messages
-        WHERE aggregate_id = (SELECT scan_id FROM crawl_executions WHERE id = $1)
+        WHERE aggregate_type = 'SCAN'
+          AND aggregate_id = (SELECT scan_id FROM crawl_executions WHERE id = $1)
           AND message_type = 'SCAN_REQUESTED'
         ORDER BY received_at, message_id LIMIT 1`, batch.ExecutionID).Scan(&correlationID); err != nil {
 		return fmt.Errorf("read execution correlation ID: %w", err)
@@ -1253,7 +1289,8 @@ func (s *Store) ReclaimExpired(ctx context.Context) error {
 		var correlationID uuid.UUID
 		if err := tx.QueryRow(ctx, `
 			SELECT correlation_id FROM inbox_messages
-			WHERE aggregate_id = (SELECT scan_id FROM crawl_executions WHERE id = $1)
+			WHERE aggregate_type = 'SCAN'
+			  AND aggregate_id = (SELECT scan_id FROM crawl_executions WHERE id = $1)
 			  AND message_type = 'SCAN_REQUESTED'
 			ORDER BY received_at, message_id LIMIT 1`, executionID).Scan(&correlationID); err != nil {
 			return fmt.Errorf("read reclaimed execution correlation ID: %w", err)

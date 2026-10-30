@@ -1,11 +1,13 @@
 package com.weblens.messaging;
 
 import com.weblens.common.config.CaptureProperties;
+import jakarta.annotation.PreDestroy;
 import java.time.Clock;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -17,23 +19,25 @@ import org.springframework.web.client.RestClient;
 public class SiteCloneCommandDispatcher {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SiteCloneCommandDispatcher.class);
-    private static final int CLAIM_LIMIT = 10;
 
     private final ControlMessagingRepository messages;
     private final CaptureProperties properties;
     private final RestClient client;
     private final Clock clock;
-    private final UUID workerId = UUID.randomUUID();
+    private final CommandDispatchExecutor senders;
 
     public SiteCloneCommandDispatcher(
             ControlMessagingRepository messages,
             CaptureProperties properties,
             RestClient.Builder builder,
-            Clock clock
+            Clock clock,
+            @Value("${weblens.capture.dispatch-concurrency:2}") int concurrency
     ) {
         this.messages = messages;
         this.properties = properties;
         this.clock = clock;
+        CommandDispatchExecutor.validateLease(properties.connectTimeout(), properties.readTimeout(), properties.outboxLease());
+        this.senders = new CommandDispatchExecutor("site-clone-dispatch", concurrency);
         SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
         requestFactory.setConnectTimeout(properties.connectTimeout());
         requestFactory.setReadTimeout(properties.readTimeout());
@@ -42,11 +46,16 @@ public class SiteCloneCommandDispatcher {
 
     @Scheduled(fixedDelayString = "${weblens.capture.dispatch-poll-interval:PT0.5S}")
     public void dispatch() {
-        for (OutboxRecord message : messages.claimSiteClones(
-                workerId, CLAIM_LIMIT, properties.outboxLease(), clock.instant()
-        )) {
-            dispatch(message);
-        }
+        senders.poll(() -> {
+            var claimed = messages.claimSiteClones(UUID.randomUUID(), 1, properties.outboxLease(), clock.instant());
+            claimed.forEach(this::dispatch);
+            return !claimed.isEmpty();
+        });
+    }
+
+    @PreDestroy
+    public void close() {
+        senders.close();
     }
 
     private void dispatch(OutboxRecord message) {

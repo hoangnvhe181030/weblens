@@ -25,7 +25,6 @@ public class InternalServiceAuthenticationFilter extends OncePerRequestFilter {
 
     static final int MAX_INTERNAL_BODY_BYTES = 64 * 1024;
     private static final String INTERNAL_PREFIX = "/internal/v1/";
-    private static final String METRICS_PATH = "/actuator/metrics";
     private static final String TOKEN_HEADER = "X-WebLens-Service-Token";
 
     private final byte[] expectedTokenDigest;
@@ -45,10 +44,9 @@ public class InternalServiceAuthenticationFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        String path = request.getRequestURI();
+        String path = request.getRequestURI().substring(request.getContextPath().length());
         return !path.startsWith(INTERNAL_PREFIX)
-                && !path.equals(METRICS_PATH)
-                && !path.startsWith(METRICS_PATH + "/");
+                && !path.equals("/actuator/metrics") && !path.startsWith("/actuator/metrics/");
     }
 
     @Override

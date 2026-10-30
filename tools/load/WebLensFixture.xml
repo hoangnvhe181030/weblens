@@ -1,0 +1,13 @@
+<service>
+  <id>WebLensFixture</id>
+  <name>WebLens Performance Fixture</name>
+  <description>Temporary loopback-only synthetic website for WebLens performance testing</description>
+  <executable>C:\WebLens\runtime\node22\node.exe</executable>
+  <arguments>C:\ProgramData\WebLens\performance-fixture\fixture.mjs --host 127.0.0.1 --port 19090 --pages 1000 --fanout 10 --delay 2ms --body-bytes 4096 --base-path /__weblens-load --robots allow</arguments>
+  <workingdirectory>C:\ProgramData\WebLens\performance-fixture</workingdirectory>
+  <startmode>Manual</startmode>
+  <stoptimeout>15sec</stoptimeout>
+  <onfailure action="restart" delay="5 sec" />
+  <logpath>C:\ProgramData\WebLens\performance-fixture\runtime\service</logpath>
+  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>3</keepFiles></log>
+</service>

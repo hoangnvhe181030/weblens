@@ -2,6 +2,7 @@ package com.weblens.auth.repository;
 
 import com.weblens.auth.entity.AuthSessionEntity;
 import jakarta.persistence.LockModeType;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -10,6 +11,8 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 public interface AuthSessionRepository extends JpaRepository<AuthSessionEntity, UUID> {
+
+    boolean existsByIdAndUserIdAndRevokedAtIsNullAndExpiresAtAfter(UUID id, UUID userId, Instant now);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select session from AuthSessionEntity session where session.id = :id")

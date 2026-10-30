@@ -1,6 +1,34 @@
 name: ${COMPOSE_PROJECT_NAME:-weblens}
 
 services:
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    profiles: [rabbitmq]
+    hostname: weblens-rabbitmq
+    ports:
+      - "127.0.0.1:${WEBLENS_RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${WEBLENS_RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - weblens-rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:${WEBLENS_REDIS_PORT:-56379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   postgres:
     image: postgres:17.6-alpine
     environment:
@@ -149,6 +177,8 @@ services:
         condition: service_completed_successfully
 
 volumes:
+  weblens-rabbitmq-data:
+    name: ${WEBLENS_RABBITMQ_VOLUME:-weblens-rabbitmq-data}
   weblens-postgres-data:
     name: ${WEBLENS_POSTGRES_VOLUME:-weblens-postgres-data}
   weblens-crawler-postgres-data:

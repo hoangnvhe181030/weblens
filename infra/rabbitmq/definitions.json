@@ -1,0 +1,25 @@
+{
+  "vhosts": [{"name": "weblens"}],
+  "users": [
+    {"name": "weblens_control", "password_hash": "AQIDBPEh3Jl1i1niZ2qRIPBhjULsQuE3eMvjG/qz8xpTVrsd", "hashing_algorithm": "rabbit_password_hashing_sha256", "tags": []},
+    {"name": "weblens_crawler", "password_hash": "AQIDBPTWGZLuat1OfegMWN1dFz0eOY3L2488yIpygGNcq6OG", "hashing_algorithm": "rabbit_password_hashing_sha256", "tags": []},
+    {"name": "weblens_admin", "password_hash": "AQIDBPTp+YI7CtGM6YeI3dkYJBmMGOtfoo/UM9GoZxdQALrA", "hashing_algorithm": "rabbit_password_hashing_sha256", "tags": ["administrator"]}
+  ],
+  "permissions": [
+    {"user": "weblens_control", "vhost": "weblens", "configure": "^$", "write": "^weblens\\.scan\\.commands$", "read": "^$"},
+    {"user": "weblens_crawler", "vhost": "weblens", "configure": "^$", "write": "^weblens\\.scan\\.(commands|dead)$", "read": "^weblens\\.scan\\.commands\\.v1$"},
+    {"user": "weblens_admin", "vhost": "weblens", "configure": ".*", "write": ".*", "read": ".*"}
+  ],
+  "exchanges": [
+    {"name": "weblens.scan.commands", "vhost": "weblens", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {}},
+    {"name": "weblens.scan.dead", "vhost": "weblens", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {}}
+  ],
+  "queues": [
+    {"name": "weblens.scan.commands.v1", "vhost": "weblens", "durable": true, "auto_delete": false, "arguments": {"x-queue-type": "quorum", "x-delivery-limit": -1, "x-max-length-bytes": 67108864, "x-overflow": "reject-publish"}},
+    {"name": "weblens.scan.dead.v1", "vhost": "weblens", "durable": true, "auto_delete": false, "arguments": {"x-queue-type": "quorum", "x-delivery-limit": -1, "x-max-length-bytes": 67108864, "x-overflow": "reject-publish"}}
+  ],
+  "bindings": [
+    {"source": "weblens.scan.commands", "vhost": "weblens", "destination": "weblens.scan.commands.v1", "destination_type": "queue", "routing_key": "scan", "arguments": {}},
+    {"source": "weblens.scan.dead", "vhost": "weblens", "destination": "weblens.scan.dead.v1", "destination_type": "queue", "routing_key": "rejected", "arguments": {}}
+  ]
+}

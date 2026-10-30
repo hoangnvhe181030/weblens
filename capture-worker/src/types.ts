@@ -118,6 +118,7 @@ export interface SitePageBundle {
 }
 
 export interface CapturePageOptions {
+  signal?: AbortSignal
   mainPath?: string
   contentAddressedResources?: boolean
   includeSiteBundle?: boolean

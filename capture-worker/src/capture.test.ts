@@ -11,6 +11,15 @@ import {
   type ResponseCandidate,
 } from './capture.js'
 
+test('capture rejects an aborted lease before starting browser work', async () => {
+  const controller = new AbortController()
+  const error = new Error('STALE_CAPTURE_LEASE')
+  controller.abort(error)
+  await assert.rejects(capturePage({} as Parameters<typeof capturePage>[0], {
+    signal: controller.signal,
+  }), (actual: unknown) => actual === error)
+})
+
 test('Design Clone waits for DOM and requests to settle, with a bounded wait', {
   skip: process.env.WEBLENS_BROWSER_SMOKE !== 'true', timeout: 20_000,
 }, async (t) => {

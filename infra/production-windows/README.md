@@ -1,5 +1,62 @@
 # WebLens Windows-native production
 
+## Redis authentication prerequisite (ADR-019)
+
+The JWT session implementation requires a separately provisioned private Redis
+7.2+ endpoint before deploying this backend. The pinned personal-project VPS now
+uses local Redis 8.2.10 through `install-local-redis.ps1`. This is a community
+Cygwin port, not a vendor-supported Windows production distribution. Set `WEBLENS_REDIS_HOST`, `WEBLENS_REDIS_PORT`,
+`WEBLENS_REDIS_USERNAME`, `WEBLENS_REDIS_PASSWORD` and `WEBLENS_REDIS_SSL` in the
+protected service environment file. Use TLS and authentication across networks;
+never expose Redis publicly. Default connect/command timeouts are one second.
+The local instance binds only `127.0.0.1:6379`, uses ACL authentication, 128 MiB
+`noeviction`, AOF everysec and RDB. Backend depends on Postgres and Redis. Its
+connect/command overrides are two seconds. `verify` is a maintenance operation:
+it stops/restarts the dependent Backend as well as Redis, then checks persistence,
+TTL, permissions and readiness. Run the six-case installer lifecycle smoke test
+before changing this sequence. Backups and secrets remain Admin/SYSTEM-only.
+The previous Layerbase deployment overrode both to ten
+seconds using native Spring environment settings `SPRING_DATA_REDIS_CONNECT_TIMEOUT=10s`
+and `SPRING_DATA_REDIS_TIMEOUT=10s`; its initial TLS/Redis handshake exceeded the
+one-second budget in the first rollout attempt. Lettuce with a five-second command
+timeout passed a same-host TLS/hostname/authentication probe before retrying.
+
+```powershell
+powershell.exe -NoProfile -File infra/production-windows/install-local-redis.ps1 -Action selftest
+powershell.exe -NoProfile -File tools/load/redis-installer-smoke-test.ps1
+```
+
+`install` and `activate` are pinned to the inspected host and refuse conflicting
+service/data state. `rollback` verifies the full environment and backup hashes;
+restore later transport/pool environment changes first before attempting the
+Redis rollback. Neither action deletes the local Redis data or changes shared
+Layerbase persistence. Returning to the sleeping provider may not restore auth.
+
+Crawler runtime can use `CRAWLER_CLICKHOUSE_HTTP_URL` for the existing Cloud HTTPS
+origin. TLS validation and per-service credentials remain mandatory. No schema
+or database ownership changes. Keep `CRAWLER_MIGRATE_ON_START=false`; ClickHouse
+migration commands require the native endpoint with the HTTP override unset.
+The optional `CRAWLER_CLICKHOUSE_READ_MAX_CONNS` is bounded to 1..64 (default 7),
+with a separate fixed writer pool of 3. This does not change PostgreSQL pools.
+
+Prefer a bounded single primary with `maxmemory-policy noeviction`. Shared managed
+Redis is supported without changing its existing RDB/AOF settings: each access
+check also queries PostgreSQL by session primary key for owner, expiry and durable
+revocation. Logout commits PostgreSQL first, so restored Redis snapshots cannot
+revive revoked sessions. Redis data loss still requires login. Never restore the
+PostgreSQL auth ledger without separately invalidating previously issued tokens.
+For local development, `docker compose --env-file .env -f infra/compose.yml up -d redis`
+starts a loopback-only instance on port 56379. This local instance has no password
+and is not the production configuration.
+
+Drain previous backend instances on rollout; existing JWT sessions must log in
+again. Validate health and login → refresh → logout → old access rejected before
+accepting the deployment. Redis failure returns 503 without bypassing session
+validation. Rolling back to a JWT-only backend requires signing-secret rotation
+to prevent revoked JWTs from becoming usable again.
+
+## Existing Windows services
+
 This deployment preserves local Docker Compose but runs production as five
 Windows services. PostgreSQL runs on the VPS; ClickHouse Cloud and Cloudflare
 R2 remain external.
@@ -45,3 +102,27 @@ Caddy serves `jobnext.top` and `www.jobnext.top` on port 443 with a publicly
 trusted certificate. Direct IP and loopback access keep an internal certificate
 for deployment health checks. Port 80 remains owned by the existing application,
 so WebLens does not install HTTP-to-HTTPS redirects.
+
+## Local RabbitMQ command transport
+
+`install-local-rabbitmq.ps1 -Action install` provisions the inspected VPS only.
+It verifies official RabbitMQ 4.3.6/Erlang 28.5 package hashes, creates fresh
+private credentials, imports `infra/rabbitmq/definitions.json`, and registers
+`WebLensRabbitMQ`. AMQP, management, distribution and EPMD bind only loopback.
+Broker state and credentials live in the protected ProgramData RabbitMQ directory.
+This single-node deployment has no broker HA.
+
+After the command drain and database backup/restore gates, call `deploy.ps1`
+with `-ActivateRabbitMq` for the coordinated cutover. It checks broker readiness,
+backs up the environment/dependencies privately, switches both services together,
+and restores that configuration before restarting the previous release on failure.
+Existing PostgreSQL, Redis and cloud settings are preserved; billing stays off.
+Broker confirmation means handoff, so verify Crawler inbox acceptance separately.
+Run `powershell.exe -NoProfile -File tools/test-windows-rabbit-cutover.ps1` to
+check environment preservation and rollback without touching production services.
+Never switch back to HTTP while RabbitMQ commands remain ready, unacknowledged
+or unresolved in the dead queue. See `infra/rabbitmq/README.md` for reconciliation.
+
+For a manually uploaded release, disable `WebLensDeployPoll` before cutover.
+Enable it only after the published deployment release includes the deployed
+source; otherwise the poller can replace the manual release with an older build.

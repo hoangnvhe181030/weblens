@@ -6,6 +6,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repository = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$sourceCommit = (& git -C $repository rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve release source commit' }
+$requestedCommit = (& git -C $repository rev-parse --verify "$Commit^{commit}").Trim()
+if ($LASTEXITCODE -ne 0 -or $requestedCommit -ne $sourceCommit) {
+    throw 'Release commit must match the checked-out source commit'
+}
+$sourceChanges = & git -C $repository status --porcelain=v1 --untracked-files=normal
+if ($LASTEXITCODE -ne 0 -or $sourceChanges) {
+    throw 'Release packaging requires a clean, reviewed checkout; use a separate checkout to preserve local changes'
+}
 $staging = Join-Path ([IO.Path]::GetTempPath()) "weblens-$Commit-$([guid]::NewGuid().ToString('N'))"
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $staging, $output, (Join-Path $staging 'backend'), (Join-Path $staging 'crawler'), (Join-Path $staging 'capture-worker'), (Join-Path $staging 'frontend'), (Join-Path $staging 'infra\production-windows') | Out-Null
@@ -60,10 +70,16 @@ $loopbackApi = Get-ChildItem -LiteralPath (Join-Path $repository 'frontend\dist\
 if ($loopbackApi) { throw 'Frontend production bundle contains a loopback API URL' }
 Copy-Item -Path (Join-Path $repository 'frontend\dist\*') -Destination (Join-Path $staging 'frontend') -Recurse
 Copy-Item -Path (Join-Path $repository 'infra\production-windows\*') -Destination (Join-Path $staging 'infra\production-windows') -Recurse
+Copy-Item -LiteralPath (Join-Path $repository 'infra\rabbitmq') -Destination (Join-Path $staging 'infra\rabbitmq') -Recurse
 
-@{ commit = $Commit } | ConvertTo-Json -Compress |
+$components = @{
+    backendSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $staging 'backend\weblens-backend.jar')).Hash.ToLowerInvariant()
+    crawlerSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $staging 'crawler\weblens-crawler.exe')).Hash.ToLowerInvariant()
+    captureLockSha256 = $runtime.nodeModulesLockSha256
+}
+@{ commit = $sourceCommit; components = $components } | ConvertTo-Json -Compress |
     Set-Content -LiteralPath (Join-Path $staging 'frontend\release.json') -Encoding ascii
-@{ commit = $Commit; createdAt = [DateTime]::UtcNow.ToString('O'); platform = 'windows-amd64' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $staging 'release.json') -Encoding UTF8
+@{ commit = $sourceCommit; components = $components; createdAt = [DateTime]::UtcNow.ToString('O'); platform = 'windows-amd64' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $staging 'release.json') -Encoding UTF8
 Push-Location $staging
 try {
     Get-ChildItem -File -Recurse | Where-Object Name -ne 'SHA256SUMS' | Sort-Object FullName | ForEach-Object {

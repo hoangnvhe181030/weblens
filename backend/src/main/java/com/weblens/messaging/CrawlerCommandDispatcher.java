@@ -1,11 +1,13 @@
 package com.weblens.messaging;
 
 import com.weblens.common.config.CrawlerProperties;
+import jakarta.annotation.PreDestroy;
 import java.time.Clock;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -17,23 +19,32 @@ import org.springframework.web.client.RestClient;
 public class CrawlerCommandDispatcher {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CrawlerCommandDispatcher.class);
-    private static final int CLAIM_LIMIT = 25;
 
     private final ControlMessagingRepository messages;
     private final CrawlerProperties properties;
     private final RestClient client;
     private final Clock clock;
-    private final UUID workerId = UUID.randomUUID();
+    private final CommandDispatchExecutor senders;
+    private final RabbitScanCommandPublisher rabbit;
 
     public CrawlerCommandDispatcher(
             ControlMessagingRepository messages,
             CrawlerProperties properties,
             RestClient.Builder restClientBuilder,
-            Clock clock
+            Clock clock,
+            @Value("${weblens.crawler.dispatch-concurrency:4}") int concurrency,
+            ScanCommandTransportProperties transport
     ) {
         this.messages = messages;
         this.properties = properties;
         this.clock = clock;
+        this.rabbit = transport.transport() == ScanCommandTransportProperties.Transport.RABBITMQ
+                ? new RabbitScanCommandPublisher(transport) : null;
+        CommandDispatchExecutor.validateLease(
+                rabbit == null ? properties.connectTimeout() : RabbitScanCommandPublisher.SETUP_BUDGET,
+                rabbit == null ? properties.readTimeout() : RabbitScanCommandPublisher.CONFIRM_BUDGET,
+                properties.outboxLease());
+        this.senders = new CommandDispatchExecutor("crawler-dispatch", concurrency);
         SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
         requestFactory.setConnectTimeout(properties.connectTimeout());
         requestFactory.setReadTimeout(properties.readTimeout());
@@ -42,16 +53,25 @@ public class CrawlerCommandDispatcher {
 
     @Scheduled(fixedDelayString = "${weblens.crawler.dispatch-poll-interval:PT0.5S}")
     public void dispatch() {
-        for (OutboxRecord message : messages.claim(
-                workerId, CLAIM_LIMIT, properties.outboxLease(), clock.instant()
-        )) {
-            dispatch(message);
-        }
+        senders.poll(() -> {
+            var claimed = messages.claim(UUID.randomUUID(), 1, properties.outboxLease(), clock.instant());
+            claimed.forEach(this::dispatch);
+            return !claimed.isEmpty();
+        });
+    }
+
+    @PreDestroy
+    public void close() {
+        senders.close();
+        if (rabbit != null) rabbit.close();
     }
 
     private void dispatch(OutboxRecord message) {
         try {
-            client.post()
+            if (rabbit != null) {
+                rabbit.publish(message);
+            } else {
+                client.post()
                     .uri(properties.commandUrl())
                     .contentType(MediaType.APPLICATION_JSON)
                     .header("X-WebLens-Service-Token", properties.serviceToken())
@@ -60,6 +80,7 @@ public class CrawlerCommandDispatcher {
                     .body(message.payload())
                     .retrieve()
                     .toBodilessEntity();
+            }
             if (!messages.complete(message, clock.instant())) {
                 LOGGER.warn("Outbox acknowledgement lost its lease: messageId={}", message.messageId());
             }

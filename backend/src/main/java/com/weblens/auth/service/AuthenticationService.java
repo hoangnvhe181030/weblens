@@ -11,6 +11,7 @@ import com.weblens.auth.repository.AuthSessionRepository;
 import com.weblens.auth.repository.UserRepository;
 import com.weblens.auth.security.JwtTokenService;
 import com.weblens.auth.security.RandomTokenService;
+import com.weblens.auth.security.RedisSessionStore;
 import com.weblens.auth.security.TokenHashingService;
 import com.weblens.auth.security.TokenPair;
 import com.weblens.common.exception.ApiException;
@@ -43,6 +44,7 @@ public class AuthenticationService {
     private final JwtTokenService jwtTokens;
     private final TokenHashingService hashes;
     private final RandomTokenService randomTokens;
+    private final RedisSessionStore liveSessions;
     private final Clock clock;
     private final TransactionTemplate loginRead;
     private final TransactionTemplate loginWrite;
@@ -57,6 +59,7 @@ public class AuthenticationService {
             JwtTokenService jwtTokens,
             TokenHashingService hashes,
             RandomTokenService randomTokens,
+            RedisSessionStore liveSessions,
             Clock clock,
             PlatformTransactionManager transactionManager,
             MeterRegistry metrics
@@ -67,6 +70,7 @@ public class AuthenticationService {
         this.jwtTokens = jwtTokens;
         this.hashes = hashes;
         this.randomTokens = randomTokens;
+        this.liveSessions = liveSessions;
         this.clock = clock;
         this.loginRead = new TransactionTemplate(transactionManager);
         this.loginRead.setReadOnly(true);
@@ -84,10 +88,10 @@ public class AuthenticationService {
             throw emailConflict();
         }
         String encodedPassword = passwords.encode(request.password());
-        return loginWrite.execute(status -> registerUser(request, email, encodedPassword));
+        return activate(loginWrite.execute(status -> registerUser(request, email, encodedPassword)));
     }
 
-    private IssuedAuthentication registerUser(RegisterRequest request, EmailAddress email, String encodedPassword) {
+    private SessionIssuance registerUser(RegisterRequest request, EmailAddress email, String encodedPassword) {
         Instant now = clock.instant();
         UserEntity user = new UserEntity(
                 UUID.randomUUID(),
@@ -122,7 +126,7 @@ public class AuthenticationService {
             throw invalidCredentials();
         }
         // Re-read under the existing user lock: credentials may change while bcrypt runs.
-        return sessionTime.record(() -> loginWrite.execute(status -> {
+        return activate(sessionTime.record(() -> loginWrite.execute(status -> {
             UserEntity user = users.findByIdForUpdate(credential.id()).orElseThrow(this::invalidCredentials);
             if (user.getStatus() != UserStatus.ACTIVE
                     || user.getVersion() != credential.version()
@@ -131,7 +135,7 @@ public class AuthenticationService {
                 throw invalidCredentials();
             }
             return createSession(user, clock.instant());
-        }));
+        })));
     }
 
     private record LoginCredential(UUID id, String passwordHash, long version) {
@@ -141,7 +145,7 @@ public class AuthenticationService {
         }
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.NEVER)
     public IssuedAuthentication refresh(String refreshToken, String csrfToken) {
         if (refreshToken == null || refreshToken.isBlank()) {
             throw invalidRefresh();
@@ -150,7 +154,21 @@ public class AuthenticationService {
         UUID sessionId = uuidClaim(refreshJwt.getClaimAsString(JwtTokenService.SESSION_ID));
         UUID userId = uuidClaim(refreshJwt.getSubject());
         String tokenId = refreshJwt.getId();
+        String oldHash = hashes.hash(tokenId);
+        if (!liveSessions.matchesRefresh(sessionId, userId, oldHash)) {
+            throw invalidRefresh();
+        }
 
+        SessionIssuance next = loginWrite.execute(status -> rotateSession(sessionId, userId, tokenId, csrfToken));
+        // Publication is after SQL commit. Compare-and-set cannot resurrect a logged-out session.
+        if (!liveSessions.rotate(sessionId, userId, oldHash,
+                hashes.hash(next.pair().refreshJti()), next.pair().refreshExpiresAt())) {
+            throw invalidRefresh();
+        }
+        return next.authentication();
+    }
+
+    private SessionIssuance rotateSession(UUID sessionId, UUID userId, String tokenId, String csrfToken) {
         AuthSessionEntity session = sessions.findByIdForUpdate(sessionId)
                 .orElseThrow(this::invalidRefresh);
         Instant now = clock.instant();
@@ -176,10 +194,10 @@ public class AuthenticationService {
                 pair.refreshExpiresAt(),
                 now
         );
-        return issued(user, pair, nextCsrf);
+        return new SessionIssuance(sessionId, pair, issued(user, pair, nextCsrf));
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.NEVER)
     public void logout(String refreshToken, String csrfToken) {
         if (refreshToken == null || refreshToken.isBlank()) {
             return;
@@ -187,21 +205,27 @@ public class AuthenticationService {
         try {
             Jwt refreshJwt = jwtTokens.decodeRefresh(refreshToken);
             UUID sessionId = uuidClaim(refreshJwt.getClaimAsString(JwtTokenService.SESSION_ID));
+            UUID userId = uuidClaim(refreshJwt.getSubject());
             String tokenId = refreshJwt.getId();
-            sessions.findByIdForUpdate(sessionId).ifPresent(session -> {
-                if (tokenId != null
-                        && csrfToken != null
-                        && hashes.matches(tokenId, session.getRefreshJtiHash())
-                        && hashes.matches(csrfToken, session.getCsrfTokenHash())) {
-                    session.revoke(clock.instant());
-                }
-            });
+            boolean valid = Boolean.TRUE.equals(loginRead.execute(status -> sessions.findById(sessionId)
+                    .map(session -> session.getUserId().equals(userId)
+                            && tokenId != null && csrfToken != null
+                            && hashes.matches(tokenId, session.getRefreshJtiHash())
+                            && hashes.matches(csrfToken, session.getCsrfTokenHash()))
+                    .orElse(false)));
+            if (valid) {
+                // Commit durable revocation first so restored Redis snapshots cannot revive this session.
+                loginWrite.executeWithoutResult(status -> sessions.findByIdForUpdate(sessionId)
+                        .filter(session -> session.getUserId().equals(userId))
+                        .ifPresent(session -> session.revoke(clock.instant())));
+                liveSessions.revoke(sessionId, userId);
+            }
         } catch (UnauthorizedException ignored) {
             // Logout deliberately does not reveal whether a session/token exists.
         }
     }
 
-    private IssuedAuthentication createSession(UserEntity user, Instant now) {
+    private SessionIssuance createSession(UserEntity user, Instant now) {
         UUID sessionId = UUID.randomUUID();
         TokenPair pair = jwtTokens.issue(user.getId(), sessionId);
         String csrfToken = randomTokens.create();
@@ -213,7 +237,20 @@ public class AuthenticationService {
                 pair.refreshExpiresAt(),
                 now
         ));
-        return issued(user, pair, csrfToken);
+        return new SessionIssuance(sessionId, pair, issued(user, pair, csrfToken));
+    }
+
+    private IssuedAuthentication activate(SessionIssuance issued) {
+        liveSessions.create(issued.sessionId(), issued.authentication().response().user().id(),
+                hashes.hash(issued.pair().refreshJti()), issued.pair().refreshExpiresAt());
+        return issued.authentication();
+    }
+
+    private record SessionIssuance(UUID sessionId, TokenPair pair, IssuedAuthentication authentication) {
+        @Override
+        public String toString() {
+            return "SessionIssuance[redacted]";
+        }
     }
 
     private IssuedAuthentication issued(UserEntity user, TokenPair pair, String csrfToken) {

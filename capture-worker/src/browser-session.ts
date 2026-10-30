@@ -172,19 +172,23 @@ export class InteractiveBrowserSessionManager {
     return this.toStatus(session)
   }
 
-  async waitForReady(ownerId: string, siteCloneId: string, timeoutMillis: number): Promise<BrowserSessionHandle | null> {
+  async waitForReady(ownerId: string, siteCloneId: string, timeoutMillis: number, signal?: AbortSignal): Promise<BrowserSessionHandle | null> {
+    signal?.throwIfAborted()
     const session = this.owned(ownerId, siteCloneId)
     if (!session) return null
     if (session.status === 'READY') return this.handle(session)
     return new Promise((resolve) => {
       const finish = (handle: BrowserSessionHandle | null) => {
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
         session.waiters.delete(finish)
         resolve(handle)
       }
+      const abort = () => finish(null)
       const timer = setTimeout(() => finish(null), Math.max(1, Math.min(timeoutMillis, session.expiresAt - Date.now())))
       timer.unref()
       session.waiters.add(finish)
+      signal?.addEventListener('abort', abort, { once: true })
     })
   }
 

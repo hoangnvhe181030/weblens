@@ -6,16 +6,42 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	clickhouseDriver "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
 	"github.com/weblens-project/weblens-crawler/internal/model"
 )
 
 var ErrPageNotFound = errors.New("page report was not found")
+
+type reportCorrelationKey struct{}
+
+type nativeDialTraceKey struct{}
+
+type nativeDialTrace struct {
+	logger             *slog.Logger
+	operation, queryID string
+}
+
+var reportCorrelationPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+func WithReportCorrelation(ctx context.Context, correlationID string) context.Context {
+	if !reportCorrelationPattern.MatchString(correlationID) {
+		correlationID = uuid.NewString()
+	}
+	return context.WithValue(ctx, reportCorrelationKey{}, correlationID)
+}
+
+func ReportCorrelation(ctx context.Context) string {
+	correlationID, _ := ctx.Value(reportCorrelationKey{}).(string)
+	return correlationID
+}
 
 func (s *Sink) ListPages(
 	ctx context.Context,
@@ -106,7 +132,7 @@ func (s *Sink) ListPages(
 	}
 	query += " ORDER BY normalized_url, page_id LIMIT ?"
 	arguments = append(arguments, limit+1)
-	release, err := s.beginReport(ctx, "pages")
+	ctx, release, err := s.beginReport(ctx, "pages")
 	if err != nil {
 		return nil, false, err
 	}
@@ -225,7 +251,7 @@ func (s *Sink) ScanSummary(
 			WHERE page.owner_id = ? AND page.scan_id = ?
 		)`, quoteIdentifier(s.database), quoteIdentifier(s.database))
 	var summary model.ScanReportSummary
-	release, err := s.beginReport(ctx, "summary")
+	ctx, release, err := s.beginReport(ctx, "summary")
 	if err != nil {
 		return model.ScanReportSummary{}, err
 	}
@@ -257,7 +283,7 @@ const reportPageColumns = `page_id, scan_id, normalized_url, final_url, status_c
 	stylesheet_count, is_indexable, indexability_reason, observed_at`
 
 func (s *Sink) GetPage(ctx context.Context, ownerID, pageID uuid.UUID) (model.ReportPage, error) {
-	release, err := s.beginReport(ctx, "page_detail")
+	ctx, release, err := s.beginReport(ctx, "page_detail")
 	if err != nil {
 		return model.ReportPage{}, err
 	}
@@ -361,7 +387,7 @@ func (s *Sink) listFindings(ctx context.Context, ownerID, scanID, pageID uuid.UU
 }
 
 func (s *Sink) queryFindings(ctx context.Context, query string, arguments ...any) ([]pageFinding, error) {
-	release, err := s.beginReport(ctx, "findings")
+	ctx, release, err := s.beginReport(ctx, "findings")
 	if err != nil {
 		return nil, err
 	}
@@ -393,27 +419,35 @@ func (s *Sink) queryFindings(ctx context.Context, query string, arguments ...any
 	return findings, nil
 }
 
-func (s *Sink) beginReport(ctx context.Context, operation string) (func(), error) {
+func (s *Sink) beginReport(ctx context.Context, operation string) (context.Context, func(), error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	started := time.Now()
 	select {
 	case s.readSlots <- struct{}{}:
 	case <-ctx.Done():
 		s.logger.Info("ClickHouse report admission timeout", "operation", operation,
+			"correlationId", ReportCorrelation(ctx),
 			"admission_wait_ms", float64(time.Since(started))/float64(time.Millisecond))
-		return nil, ctx.Err()
+		return ctx, nil, ctx.Err()
 	}
 	queryStarted := time.Now()
+	queryID := uuid.NewString()
+	ctx = clickhouseDriver.Context(ctx, clickhouseDriver.WithQueryID(queryID))
+	ctx = context.WithValue(ctx, nativeDialTraceKey{}, nativeDialTrace{s.logger, operation, queryID})
+	s.logger.Debug("ClickHouse report query started", "operation", operation,
+		"correlationId", ReportCorrelation(ctx), "query_id", queryID)
 	var once sync.Once
-	return func() {
+	return ctx, func() {
 		once.Do(func() {
 			<-s.readSlots
 			duration := time.Since(started)
 			if duration >= 250*time.Millisecond || ctx.Err() != nil {
 				stats := s.readConnection.Stats()
 				s.logger.Info("ClickHouse report timing", "operation", operation,
+					"correlationId", ReportCorrelation(ctx),
+					"query_id", queryID,
 					"admission_wait_ms", float64(queryStarted.Sub(started))/float64(time.Millisecond),
 					// Includes native acquisition/dial, network, query and consumption.
 					"query_and_read_ms", float64(time.Since(queryStarted))/float64(time.Millisecond),

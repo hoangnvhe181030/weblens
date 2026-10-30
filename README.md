@@ -23,7 +23,12 @@ V1/V1.5 tập trung vào đăng ký website, chạy bounded scan, theo dõi ti�
 
 ## Architecture direction
 
-Kiến trúc được duyệt trong [ADR-005](docs/adr/ADR-005-tach-crawler-thanh-microservice.md) có ba deployable chính: Spring Boot Control Plane, Go Crawler Service và Playwright Capture Worker. [ADR-006](docs/adr/ADR-006-tich-hop-clickhouse-cho-analytics.md) bổ sung ClickHouse làm analytical store; PostgreSQL vẫn sở hữu workflow và S3/MinIO sở hữu artifact lớn. Control Plane giữ modular boundaries nội bộ; mỗi service có database/role riêng. Kafka, Redis, Kubernetes và service bổ sung chưa thuộc V1/V1.5.
+Kiến trúc được duyệt trong [ADR-005](docs/adr/ADR-005-tach-crawler-thanh-microservice.md) có ba deployable chính: Spring Boot Control Plane, Go Crawler Service và Playwright Capture Worker. [ADR-006](docs/adr/ADR-006-tich-hop-clickhouse-cho-analytics.md) bổ sung ClickHouse làm analytical store; PostgreSQL vẫn sở hữu workflow và S3/MinIO sở hữu artifact lớn. Control Plane giữ modular boundaries nội bộ; mỗi service có database/role riêng. [ADR-019](docs/adr/ADR-019-redis-jwt-session-lifecycle.md) thêm Redis cho phiên JWT; Kafka, Kubernetes và Redis cho workflow chưa thuộc phạm vi.
+
+RabbitMQ tùy chọn cho lệnh tạo/hủy scan đã có theo
+[ADR-017](docs/adr/ADR-017-rabbitmq-command-transport-evaluation.md).
+Giữ PostgreSQL outbox/inbox; mặc định transport vẫn là HTTP. Hướng dẫn bật ở cả
+backend/Crawler, theo dõi và chuyển đổi tại [RabbitMQ runbook](infra/rabbitmq/README.md).
 
 ## Repository structure
 
@@ -31,7 +36,7 @@ Kiến trúc được duyệt trong [ADR-005](docs/adr/ADR-005-tach-crawler-than
 - `frontend/`: React/TypeScript product frontend dùng Control Plane API
 - `crawler/`: deployable Go mang giấy phép AGPL-3.0, provenance CrawlObserver và migration thuộc Crawler
 - `capture-worker/`: Playwright/TypeScript deployable, migration PostgreSQL và ClickHouse thuộc ownership của Capture Worker
-- `infra/`: ba PostgreSQL workflow database, ClickHouse, MinIO và Capture Worker local bằng Compose
+- `infra/`: ba PostgreSQL workflow database, ClickHouse, MinIO, Capture Worker và profile RabbitMQ local bằng Compose
 - `docs/`: product and engineering sources of truth
 - `docs/adr/`: architecture decision records
 - `tasks/`: scoped implementation specifications
@@ -64,6 +69,13 @@ hoặc chạy HTML/JavaScript trong archive trên origin của ứng dụng.
 ## Chạy runtime production cục bộ
 
 Yêu cầu Java 21 và Docker. Sao chép `.env.example` thành `.env`, thay JWT secret/credential, rồi chạy:
+
+Redis auth chạy ở `127.0.0.1:56379` trong Compose local. Backend cần Redis để
+kiểm tra access token và refresh token. Logout vô hiệu hóa cả hai theo session;
+Redis lỗi trả 503, restart Redis yêu cầu đăng nhập lại. PostgreSQL vẫn giữ
+`auth_sessions` và khóa refresh rotation. Mỗi access check thêm một truy vấn thu hồi
+theo khóa session trong PostgreSQL để hỗ trợ Redis dùng chung có snapshot an toàn.
+Xem ADR-019 trước khi deploy hoặc rollback.
 
 ```powershell
 docker compose --env-file .env -f infra/compose.yml up -d

@@ -3,6 +3,9 @@ package com.weblens.auth.security;
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
 import com.nimbusds.jose.proc.SecurityContext;
 import com.weblens.common.config.JwtProperties;
+import com.weblens.common.exception.ApiException;
+import com.weblens.auth.repository.AuthSessionRepository;
+import java.time.Clock;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
@@ -12,6 +15,8 @@ import javax.crypto.spec.SecretKeySpec;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.dao.DataAccessException;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.DelegatingPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -22,6 +27,8 @@ import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.BadJwtException;
+import org.springframework.security.oauth2.jwt.JwtException;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.security.oauth2.jwt.JwtValidators;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
@@ -51,8 +58,28 @@ public class JwtConfig {
 
     @Bean
     @Primary
-    JwtDecoder jwtDecoder(SecretKey jwtSecretKey, JwtProperties properties) {
-        return decoder(jwtSecretKey, properties, "access");
+    JwtDecoder jwtDecoder(SecretKey jwtSecretKey, JwtProperties properties, RedisSessionStore sessions,
+                          AuthSessionRepository ledger, Clock clock) {
+        JwtDecoder signedTokens = decoder(jwtSecretKey, properties, "access");
+        return token -> {
+            Jwt jwt = signedTokens.decode(token);
+            try {
+                UUID sessionId = UUID.fromString(jwt.getClaimAsString(JwtTokenService.SESSION_ID));
+                UUID userId = UUID.fromString(jwt.getSubject());
+                // Shared Redis may restore stale snapshots; durable revocation must also permit access.
+                if (!sessions.isActive(sessionId, userId)
+                        || !ledger.existsByIdAndUserIdAndRevokedAtIsNullAndExpiresAtAfter(sessionId, userId, clock.instant())) {
+                    throw new BadJwtException("The authentication session is no longer active");
+                }
+            } catch (ApiException exception) {
+                throw new JwtException("The authentication session store is unavailable", exception);
+            } catch (DataAccessException exception) {
+                throw new JwtException("The authentication session ledger is unavailable",
+                        new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "AUTH_SESSION_STORE_UNAVAILABLE",
+                                "Authentication temporarily unavailable", "The authentication session store is unavailable.", exception));
+            }
+            return jwt;
+        };
     }
 
     @Bean("refreshJwtDecoder")

@@ -21,6 +21,7 @@ import (
 	clickhouseDriver "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/google/uuid"
+	"github.com/weblens-project/weblens-crawler/internal/config"
 	"github.com/weblens-project/weblens-crawler/internal/crawl"
 	"github.com/weblens-project/weblens-crawler/internal/model"
 	"github.com/weblens-project/weblens-crawler/migrations"
@@ -35,17 +36,25 @@ type Sink struct {
 }
 
 type Options struct {
-	Address  string
-	Database string
-	Username string
-	Password string
-	Secure   bool
-	Logger   *slog.Logger
+	Address            string
+	HTTPURL            string
+	ReadMaxConnections int
+	Database           string
+	Username           string
+	Password           string
+	Secure             bool
+	Logger             *slog.Logger
 }
 
 func Open(ctx context.Context, options Options) (*Sink, error) {
-	// Keep the existing total connection budget of ten, reserving ingestion
-	// capacity so report bursts cannot exhaust the writer's pool.
+	readLimit := options.ReadMaxConnections
+	if readLimit == 0 {
+		readLimit = 7
+	}
+	if readLimit < 1 || readLimit > 64 {
+		return nil, errors.New("ClickHouse read connection limit must be between 1 and 64")
+	}
+	// Retain three dedicated ingestion connections; reports cannot consume them.
 	connection, err := openConnection(options, options.Database, 3)
 	if err != nil {
 		return nil, err
@@ -54,7 +63,7 @@ func Open(ctx context.Context, options Options) (*Sink, error) {
 		_ = connection.Close()
 		return nil, fmt.Errorf("ping ClickHouse: %w", err)
 	}
-	readConnection, err := openConnection(options, options.Database, 7)
+	readConnection, err := openConnection(options, options.Database, readLimit)
 	if err != nil {
 		_ = connection.Close()
 		return nil, err
@@ -68,10 +77,14 @@ func Open(ctx context.Context, options Options) (*Sink, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Sink{connection: connection, readConnection: readConnection, readSlots: make(chan struct{}, 7), database: options.Database, logger: logger}, nil
+	return &Sink{connection: connection, readConnection: readConnection, readSlots: make(chan struct{}, readLimit), database: options.Database, logger: logger}, nil
 }
 
 func Migrate(ctx context.Context, options Options) error {
+	// Migration code relies on structured native exception codes; never parse HTTP error text as DDL success.
+	if options.HTTPURL != "" {
+		return errors.New("ClickHouse migrations require the native endpoint without CRAWLER_CLICKHOUSE_HTTP_URL")
+	}
 	connection, err := openConnection(options, "default", 10)
 	if err != nil {
 		return err
@@ -112,6 +125,31 @@ func openConnection(options Options, database string, limit int) (driver.Conn, e
 		DialTimeout: 5 * time.Second, MaxOpenConns: limit, MaxIdleConns: min(limit, 5),
 		ConnMaxLifetime: 30 * time.Minute,
 		Compression:     &clickhouseDriver.Compression{Method: clickhouseDriver.CompressionLZ4},
+		DialStrategy:    dialNativeWithContext,
+	}
+	if options.HTTPURL != "" {
+		u, err := config.ParseClickHouseHTTPURL(options.HTTPURL)
+		if err != nil {
+			return nil, err
+		}
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		connectionOptions.Addr = []string{net.JoinHostPort(u.Hostname(), port)}
+		connectionOptions.Protocol = clickhouseDriver.HTTP
+		connectionOptions.MaxIdleConns = limit
+		// HTTP error bodies are plain text; native LZ4 framing cannot decode them.
+		connectionOptions.Compression = &clickhouseDriver.Compression{Method: clickhouseDriver.CompressionGZIP, Level: 1}
+		connectionOptions.DialStrategy = nil
+		if u.Scheme == "https" {
+			connectionOptions.TLS = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()}
+		}
+		return clickhouseDriver.Open(connectionOptions)
 	}
 	if options.Secure {
 		serverName, _, err := net.SplitHostPort(options.Address)
@@ -121,6 +159,67 @@ func openConnection(options Options, database string, limit int) (driver.Conn, e
 		connectionOptions.TLS = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
 	}
 	return clickhouseDriver.Open(connectionOptions)
+}
+
+func dialNativeWithContext(ctx context.Context, connID int, options *clickhouseDriver.Options, dial clickhouseDriver.Dial) (clickhouseDriver.DialResult, error) {
+	return clickhouseDriver.DefaultDialStrategy(ctx, connID, options, func(ctx context.Context, address string, options *clickhouseDriver.Options) (clickhouseDriver.DialResult, error) {
+		started := time.Now()
+		var transportDuration time.Duration
+		var nativeStarted time.Time
+		dialOptions := *options
+		var connection net.Conn
+		var stop func() bool
+		dialOptions.DialContext = func(ctx context.Context, address string) (net.Conn, error) {
+			transportStarted := time.Now()
+			dialer := &net.Dialer{Timeout: options.DialTimeout}
+			var err error
+			if options.TLS != nil {
+				connection, err = (&tls.Dialer{NetDialer: dialer, Config: options.TLS}).DialContext(ctx, "tcp", address)
+			} else {
+				connection, err = dialer.DialContext(ctx, "tcp", address)
+			}
+			transportDuration = time.Since(transportStarted)
+			if err != nil {
+				return nil, err
+			}
+			nativeStarted = time.Now()
+			// The native Hello handshake otherwise ignores cancellation until DialTimeout.
+			stop = context.AfterFunc(ctx, func() { _ = connection.Close() })
+			return connection, nil
+		}
+		result, err := dial(ctx, address, &dialOptions)
+		// Acquisition's context is cancelled on return; never attach it to a pooled connection.
+		if stop != nil {
+			stop()
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if err != nil && connection != nil {
+			_ = connection.Close()
+		}
+		if trace, ok := ctx.Value(nativeDialTraceKey{}).(nativeDialTrace); ok && trace.logger != nil {
+			var nativeDuration time.Duration
+			phase := "tcp_tls"
+			if !nativeStarted.IsZero() {
+				phase = "native_setup"
+				nativeDuration = time.Since(nativeStarted)
+			}
+			level := slog.LevelDebug
+			if err != nil || time.Since(started) >= 250*time.Millisecond {
+				level = slog.LevelInfo
+			}
+			trace.logger.Log(ctx, level, "ClickHouse native dial timing",
+				"operation", trace.operation, "correlationId", ReportCorrelation(ctx), "query_id", trace.queryID,
+				"tcp_tls_ms", float64(transportDuration)/float64(time.Millisecond),
+				// Includes client setup, Hello and Addendum; it is not server query execution.
+				"native_setup_ms", float64(nativeDuration)/float64(time.Millisecond),
+				"dial_ms", float64(time.Since(started))/float64(time.Millisecond),
+				"last_phase", phase, "secure", options.TLS != nil,
+				"success", err == nil, "context_cancelled", ctx.Err() != nil)
+		}
+		return result, err
+	})
 }
 
 func splitStatements(script string) []string {

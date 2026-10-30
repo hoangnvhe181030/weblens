@@ -24,6 +24,7 @@ Tùy chọn:
   --fanout <n>              Số link con mỗi trang (mặc định 32)
   --delay <duration>        Độ trễ mỗi trang, ví dụ 10ms (mặc định 0ms)
   --body-bytes <n>          Kích thước chính xác mỗi HTML response (mặc định 4096)
+  --base-path <path>        Prefix cố định, ví dụ /__weblens-load (mặc định không có)
   --robots <allow|deny>     Chính sách robots.txt (mặc định allow)
   --acknowledge-high-load   Xác nhận cấu hình lớn có thể làm máy local quá tải
   --help                    Hiện trợ giúp
@@ -36,6 +37,7 @@ const ALLOWED_OPTIONS = new Set([
   'fanout',
   'delay',
   'body-bytes',
+  'base-path',
   'robots',
   'acknowledge-high-load',
   'help',
@@ -55,11 +57,15 @@ const config = {
   fanout: integerOption(options, 'fanout', 32, { minimum: 1, maximum: 10_000 }),
   delayMs: durationOption(options, 'delay', '0ms', { minimum: 0, maximum: 60_000 }),
   bodyBytes: integerOption(options, 'body-bytes', 4096, { minimum: 256, maximum: 100 * 1024 * 1024 }),
+  basePath: stringOption(options, 'base-path', ''),
   robots: stringOption(options, 'robots', 'allow'),
 }
 
 if (!isLoopbackHostname(config.host)) {
   throw new Error('--host chỉ được bind vào loopback (127.0.0.0/8, ::1 hoặc localhost).')
+}
+if (config.basePath && !/^\/[A-Za-z0-9_-]{1,64}$/.test(config.basePath)) {
+  throw new Error('--base-path phải là một path segment an toàn, ví dụ /__weblens-load.')
 }
 if (!['allow', 'deny'].includes(config.robots)) throw new Error('--robots chỉ nhận allow hoặc deny.')
 enforceHighLoadAcknowledgement({
@@ -92,7 +98,7 @@ server.listen(config.port, config.host, () => {
   const listeningPort = typeof address === 'object' && address ? address.port : config.port
   process.stdout.write(`${JSON.stringify({
     event: 'fixture_ready',
-    url: `http://${printableHost}:${listeningPort}/`,
+    url: `http://${printableHost}:${listeningPort}${config.basePath}/`,
     pageCount: config.pageCount,
     fanout: config.fanout,
     requiredDepth,
@@ -114,8 +120,14 @@ async function route(request, response) {
   response.sendDate = false
   const method = request.method ?? 'GET'
   const url = new URL(request.url ?? '/', 'http://fixture.invalid')
+  const pathname = scopedPath(url.pathname)
 
-  if (url.pathname === '/__fixture/health' && (method === 'GET' || method === 'HEAD')) {
+  if (pathname === null) {
+    writeText(response, 404, 'not_found\n', 'text/plain; charset=utf-8', method === 'HEAD')
+    return
+  }
+
+  if (pathname === '/__fixture/health' && (method === 'GET' || method === 'HEAD')) {
     writeJson(response, 200, {
       status: 'UP',
       pageCount: config.pageCount,
@@ -128,13 +140,13 @@ async function route(request, response) {
     return
   }
 
-  if (url.pathname === '/robots.txt' && (method === 'GET' || method === 'HEAD')) {
+  if (pathname === '/robots.txt' && (method === 'GET' || method === 'HEAD')) {
     const rule = config.robots === 'allow' ? 'Allow: /' : 'Disallow: /'
     writeText(response, 200, `User-agent: *\n${rule}\n`, 'text/plain; charset=utf-8', method === 'HEAD')
     return
   }
 
-  if (url.pathname === '/favicon.ico') {
+  if (pathname === '/favicon.ico') {
     writeText(response, 404, 'not_found\n', 'text/plain; charset=utf-8', method === 'HEAD')
     return
   }
@@ -145,7 +157,7 @@ async function route(request, response) {
     return
   }
 
-  const pageId = parsePageId(url.pathname)
+  const pageId = parsePageId(pathname)
   if (pageId === null || pageId >= config.pageCount) {
     writeText(response, 404, 'not_found\n', 'text/plain; charset=utf-8', method === 'HEAD')
     return
@@ -153,6 +165,12 @@ async function route(request, response) {
 
   if (config.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, config.delayMs))
   await writePage(response, pageId, method === 'HEAD')
+}
+
+function scopedPath(pathname) {
+  if (!config.basePath) return pathname
+  if (pathname === config.basePath || pathname === `${config.basePath}/`) return '/'
+  return pathname.startsWith(`${config.basePath}/`) ? pathname.slice(config.basePath.length) : null
 }
 
 function parsePageId(pathname) {
@@ -211,13 +229,13 @@ function waitForDrain(response, timeoutMs) {
   })
 }
 
-function pageMarkup({ pageCount, fanout }, pageId) {
+function pageMarkup({ pageCount, fanout, basePath }, pageId) {
   const firstChild = pageId * fanout + 1
   const links = []
   for (let child = firstChild; child < firstChild + fanout && child < pageCount; child += 1) {
-    links.push(`<a href="/page/${child}">page-${child}</a>`)
+    links.push(`<a href="${basePath}/page/${child}">page-${child}</a>`)
   }
-  const canonical = pageId === 0 ? '/' : `/page/${pageId}`
+  const canonical = pageId === 0 ? `${basePath}/` : `${basePath}/page/${pageId}`
   return [
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Fixture page ${pageId}</title><link rel="canonical" href="${canonical}"></head><body><main><h1>Fixture page ${pageId}</h1><nav>${links.join('')}</nav><p>`,
     '</p></main></body></html>',

@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +26,274 @@ func TestSecureConnectionRequiresHostAndPort(t *testing.T) {
 	_, err := openConnection(Options{Address: "clickhouse.example", Database: "analytics", Secure: true}, "analytics", 7)
 	if err == nil {
 		t.Fatal("secure address without a port was accepted")
+	}
+}
+
+func TestOpenRejectsInvalidReadBudgetBeforeConnecting(t *testing.T) {
+	for _, limit := range []int{-1, 65} {
+		if _, err := Open(context.Background(), Options{ReadMaxConnections: limit}); err == nil {
+			t.Fatal("unsafe read budget accepted")
+		}
+	}
+}
+
+func TestHTTPTransportKeepsTLSValidationAndMigrationGate(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("untrusted TLS reached HTTP") }))
+	defer server.Close()
+	connection, err := openConnection(Options{Address: "unused:9000", HTTPURL: server.URL}, "default", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := connection.Ping(ctx); err == nil {
+		t.Fatal("untrusted HTTPS certificate accepted")
+	}
+	if err := Migrate(ctx, Options{HTTPURL: server.URL}); err == nil {
+		t.Fatal("HTTP migration gate bypassed")
+	}
+}
+
+func TestHTTPReportDeadlineReleasesSlot(t *testing.T) {
+	stop := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		select {
+		case <-request.Context().Done():
+		case <-stop:
+		}
+	}))
+	defer server.Close()
+	defer close(stop)
+	connection, err := openConnection(Options{Address: "unused:9000", HTTPURL: server.URL}, "default", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	sink := &Sink{readConnection: connection, readSlots: make(chan struct{}, 1), database: "default", logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, err = sink.ListPages(ctx, uuid.New(), uuid.New(), 20, "", uuid.Nil, model.PageFilters{})
+	if err == nil || time.Since(started) > time.Second || len(sink.readSlots) != 0 {
+		t.Fatal("HTTP deadline failed or retained report capacity")
+	}
+}
+
+// A real native client connects to an owned loopback peer, not a query mock.
+func TestNativeReportHandshakeFaultsReleaseCapacity(t *testing.T) {
+	for _, operation := range []string{"pages", "summary", "page_detail"} {
+		for _, faultCase := range []string{"disconnect", "deadline", "cancel", "tls_disconnect", "tls_deadline", "tls_cancel"} {
+			t.Run(operation+"/"+faultCase, func(t *testing.T) {
+				secure := strings.HasPrefix(faultCase, "tls_")
+				fault := strings.TrimPrefix(faultCase, "tls_")
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = listener.Close() })
+				accepted := make(chan net.Conn, 1)
+				peerDone := make(chan struct{})
+				go func() {
+					defer close(peerDone)
+					peer, acceptErr := listener.Accept()
+					if acceptErr != nil {
+						return
+					}
+					defer peer.Close()
+					var hello [1]byte
+					if _, readErr := io.ReadFull(peer, hello[:]); readErr != nil {
+						return
+					}
+					accepted <- peer
+					if fault != "disconnect" {
+						_, _ = io.Copy(io.Discard, peer)
+					}
+				}()
+				connection, err := openConnection(Options{Address: listener.Addr().String(), Secure: secure}, "analytics", 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = connection.Close() })
+				var traceOutput bytes.Buffer
+				sink := &Sink{readConnection: connection, database: "analytics", readSlots: make(chan struct{}, 1),
+					logger: slog.New(slog.NewJSONHandler(&traceOutput, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+				ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+				ctx = WithReportCorrelation(ctx, "owned-native-fault")
+				defer cancel()
+				result := make(chan error, 1)
+				started := time.Now()
+				go func() {
+					var reportErr error
+					switch operation {
+					case "pages":
+						_, _, reportErr = sink.ListPages(ctx, uuid.New(), uuid.New(), 10, "", uuid.Nil, model.PageFilters{})
+					case "summary":
+						_, reportErr = sink.ScanSummary(ctx, uuid.New(), uuid.New())
+					case "page_detail":
+						_, reportErr = sink.GetPage(ctx, uuid.New(), uuid.New())
+					}
+					result <- reportErr
+				}()
+				var peer net.Conn
+				select {
+				case peer = <-accepted:
+				case <-time.After(time.Second):
+					t.Fatal("native client did not reach the loopback peer")
+				}
+				t.Cleanup(func() {
+					_ = peer.Close()
+					select {
+					case <-peerDone:
+					case <-time.After(time.Second):
+						t.Error("owned peer did not exit")
+					}
+				})
+				if fault == "cancel" {
+					cancel()
+				}
+				select {
+				case reportErr := <-result:
+					if reportErr == nil {
+						t.Fatal("native handshake failure became a successful report")
+					}
+					if fault != "disconnect" && !errors.Is(reportErr, ctx.Err()) {
+						t.Fatalf("request cancellation was not preserved: error type %T", reportErr)
+					}
+					if len(sink.readSlots) != 0 || connection.Stats().Open != 0 {
+						t.Fatal("failed handshake retained report/native capacity")
+					}
+					var phaseTraces int
+					for _, line := range strings.Split(strings.TrimSpace(traceOutput.String()), "\n") {
+						var trace map[string]any
+						if err := json.Unmarshal([]byte(line), &trace); err != nil {
+							t.Fatal(err)
+						}
+						if trace["msg"] != "ClickHouse native dial timing" {
+							continue
+						}
+						phaseTraces++
+						expectedPhase := "native_setup"
+						if secure {
+							expectedPhase = "tcp_tls"
+						}
+						if trace["last_phase"] != expectedPhase || trace["secure"] != secure ||
+							trace["success"] != false || trace["correlationId"] != "owned-native-fault" ||
+							trace["context_cancelled"] != (fault != "disconnect") ||
+							trace["operation"] != operation {
+							t.Fatal("native phase trace lost failure, cancellation or request identity")
+						}
+						for _, field := range []string{"tcp_tls_ms", "native_setup_ms", "dial_ms"} {
+							if value, ok := trace[field].(float64); !ok || value < 0 {
+								t.Fatal("invalid native timing")
+							}
+						}
+						if _, err := uuid.Parse(trace["query_id"].(string)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if phaseTraces != 1 || strings.Contains(traceOutput.String(), listener.Addr().String()) {
+						t.Fatal("native trace was missing, duplicated or leaked endpoint")
+					}
+					t.Logf("fault=%s elapsed=%s report_slots=0 native_open=0", fault, time.Since(started))
+				case <-time.After(time.Second):
+					_ = peer.Close()
+					<-result
+					t.Fatal("native handshake outlived request cancellation by more than one second")
+				}
+			})
+		}
+	}
+}
+
+func TestNativeDialKeepsTLSCertificateValidation(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	connection, err := openConnection(Options{Address: server.Listener.Addr().String(), Secure: true}, "analytics", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = connection.Ping(ctx)
+	var untrusted x509.UnknownAuthorityError
+	if !errors.As(err, &untrusted) {
+		t.Fatalf("expected an untrusted TLS certificate to be rejected, got error type %T", err)
+	}
+	if connection.Stats().Open != 0 {
+		t.Fatal("TLS rejection retained native capacity")
+	}
+}
+
+func TestReportQueryTraceKeepsUniqueIDsAndSafeCorrelation(t *testing.T) {
+	for _, correlation := range []string{"owned-request-1", "unsafe\r\nAuthorization: secret", strings.Repeat("x", 65), ""} {
+		var output bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		sink := &Sink{readConnection: &reportConnectionStub{}, readSlots: make(chan struct{}, 1), logger: logger}
+		ctx := WithReportCorrelation(context.Background(), correlation)
+		seen := map[string]bool{}
+		for _, operation := range []string{"pages", "findings", "summary"} {
+			_, release, err := sink.beginReport(ctx, operation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			release()
+		}
+		for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+			var entry map[string]any
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				t.Fatal(err)
+			}
+			queryID, _ := entry["query_id"].(string)
+			if _, err := uuid.Parse(queryID); err != nil || seen[queryID] {
+				t.Fatal("query IDs are invalid or reused")
+			}
+			seen[queryID] = true
+			if entry["correlationId"] != ReportCorrelation(ctx) || !reportCorrelationPattern.MatchString(ReportCorrelation(ctx)) {
+				t.Fatal("trace lost normalized correlation")
+			}
+		}
+		if len(seen) != 3 || len(sink.readSlots) != 0 || strings.Contains(output.String(), "Authorization") {
+			t.Fatal("trace leaked input, lost a query, or retained a slot")
+		}
+	}
+}
+
+type receiptConnectionStub struct {
+	driver.Conn
+	queries int
+	ids     []uuid.UUID
+}
+
+func (c *receiptConnectionStub) Query(context.Context, string, ...any) (driver.Rows, error) {
+	c.queries++
+	return &receiptRowsStub{ids: c.ids}, nil
+}
+
+type receiptRowsStub struct {
+	driver.Rows
+	ids   []uuid.UUID
+	index int
+}
+
+func (r *receiptRowsStub) Next() bool { return r.index < len(r.ids) }
+func (r *receiptRowsStub) Scan(dest ...any) error {
+	*dest[0].(*uuid.UUID) = r.ids[r.index]
+	r.index++
+	return nil
+}
+func (*receiptRowsStub) Close() error { return nil }
+func (*receiptRowsStub) Err() error   { return nil }
+
+func TestBatchReplayChecksAllReceiptsWithOneQuery(t *testing.T) {
+	first, second := analyticsBatchFixture(t), analyticsBatchFixture(t)
+	connection := &receiptConnectionStub{ids: []uuid.UUID{first.ID, second.ID}}
+	sink := &Sink{connection: connection, database: "analytics"}
+	results := sink.WriteBatch(context.Background(), []model.AnalyticsBatch{first, second})
+	if connection.queries != 1 || len(results) != 2 || results[first.ID] != nil || results[second.ID] != nil {
+		t.Fatalf("receipt replay was not batched: queries=%d results=%v", connection.queries, results)
 	}
 }
 

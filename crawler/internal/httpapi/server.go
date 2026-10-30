@@ -42,12 +42,16 @@ type reportReader interface {
 }
 
 type Server struct {
-	store         commandStore
-	reports       reportReader
-	serviceDigest [32]byte
-	logger        *slog.Logger
-	mux           *http.ServeMux
+	store            commandStore
+	reports          reportReader
+	serviceDigest    [32]byte
+	logger           *slog.Logger
+	mux              *http.ServeMux
+	commandsDisabled bool
 }
+
+// Called before serving requests; prevent accidental dual transport during rollout.
+func (s *Server) DisableHTTPCommands() { s.commandsDisabled = true }
 
 func NewServer(store commandStore, reports reportReader, serviceToken string, logger *slog.Logger) *Server {
 	server := &Server{store: store, reports: reports, serviceDigest: sha256.Sum256([]byte(serviceToken)), logger: logger, mux: http.NewServeMux()}
@@ -60,7 +64,11 @@ func NewServer(store commandStore, reports reportReader, serviceToken string, lo
 }
 
 func (s *Server) listPages(response http.ResponseWriter, request *http.Request) {
+	ctx, cancel := context.WithTimeout(request.Context(), 8*time.Second)
+	defer cancel()
+	request = request.WithContext(ctx)
 	requestStarted := time.Now()
+	correlationID := analytics.ReportCorrelation(ctx)
 	ownerID, err := uuid.Parse(request.URL.Query().Get("ownerId"))
 	if err != nil {
 		writeProblem(response, request, http.StatusBadRequest, "INVALID_OWNER_ID", "ownerId must be a UUID.")
@@ -76,6 +84,7 @@ func (s *Server) listPages(response http.ResponseWriter, request *http.Request) 
 	stateReadDuration := time.Since(stageStarted)
 	if errors.Is(err, postgres.ErrReportNotFound) {
 		s.logger.Info("scan page report not found", "scanId", scanID,
+			"correlationId", correlationID,
 			"state_read_ms", float64(stateReadDuration)/float64(time.Millisecond))
 		writeProblem(response, request, http.StatusNotFound, "REPORT_NOT_FOUND", "The scan report does not exist.")
 		return
@@ -132,6 +141,7 @@ func (s *Server) listPages(response http.ResponseWriter, request *http.Request) 
 	preWriteDuration := time.Since(requestStarted)
 	if preWriteDuration >= 250*time.Millisecond {
 		s.logger.Info("slow scan page report",
+			"correlationId", correlationID,
 			"scanId", scanID,
 			"state_read_ms", float64(stateReadDuration)/float64(time.Millisecond),
 			"page_list_ms", float64(pageListDuration)/float64(time.Millisecond),
@@ -350,6 +360,10 @@ func (s *Server) ready(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) acceptScan(response http.ResponseWriter, request *http.Request) {
+	if s.commandsDisabled {
+		writeProblem(response, request, http.StatusServiceUnavailable, "COMMAND_TRANSPORT_DISABLED", "Scan commands use RabbitMQ on this instance.")
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(request.Body, maxCommandBody+1))
 	var maximumBytesError *http.MaxBytesError
 	if errors.As(err, &maximumBytesError) || len(body) > maxCommandBody {
@@ -432,6 +446,7 @@ func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
 			correlationID = uuid.NewString()
 		}
 		response.Header().Set("X-Correlation-ID", correlationID)
+		request = request.WithContext(analytics.WithReportCorrelation(request.Context(), correlationID))
 		next.ServeHTTP(response, request)
 	})
 }

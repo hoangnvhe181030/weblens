@@ -18,6 +18,8 @@ ClickHouse. Đây là phần AGPL của WebLens; xem `NOTICE.md` và `LICENSE`.
 - `CRAWLER_POSTGRES_URL`
 - `CRAWLER_CLICKHOUSE_ADDR`
 - `CRAWLER_CLICKHOUSE_SECURE`: `true` cho TLS của ClickHouse Cloud; mặc định `false` ở local.
+- `CRAWLER_CLICKHOUSE_HTTP_URL`: tùy chọn origin HTTPS của cùng ClickHouse để dùng HTTP transport qua driver hiện có; không chứa credentials/path/query. HTTP không TLS chỉ được phép ở loopback thử nghiệm.
+- `CRAWLER_CLICKHOUSE_READ_MAX_CONNS`: mặc định `7`, giới hạn `1..64`; pool ghi vẫn riêng biệt với trần `3`. Chỉ tăng sau khi đo chờ slot và tài nguyên, không thay ngân sách PostgreSQL.
 - `CRAWLER_SERVICE_TOKEN`: ít nhất 32 byte, dùng chung với Control Plane local.
 - `CRAWLER_CONTROL_EVENTS_URL`
 
@@ -44,6 +46,8 @@ thời mọi public/private target và không phụ thuộc biến môi trườn
 job với owner role riêng rồi chạy service bằng runtime role không có quyền DDL.
 Binary hỗ trợ `migrate`, `migrate-postgres` và `migrate-clickhouse`; production
 cloud dùng lệnh riêng để runtime role không cần quyền DDL ClickHouse.
+Khi runtime dùng HTTPS, phải bỏ `CRAWLER_CLICKHOUSE_HTTP_URL` khỏi process migration
+và dùng native endpoint; migration không suy đoán mã lỗi DDL từ HTTP error text.
 
 ## Chạy local
 
@@ -79,3 +83,7 @@ PostgreSQL integration test cần một database thử nghiệm riêng qua
 qua `WEBLENS_TEST_CLICKHOUSE_ADDR`, username/password tương ứng. CI khởi động
 PostgreSQL 17.6 và ClickHouse 26.3 để chạy cả hai; không trỏ các biến này vào dữ
 liệu production.
+Để kiểm chứng HTTP transport, giữ native test endpoint cho migration và đặt thêm
+`WEBLENS_TEST_CLICKHOUSE_HTTP_URL` tới HTTP loopback của cùng instance thử nghiệm.
+Test thực tế bao gồm batch replay, owner isolation, report và pool reuse; TLS
+không tin cậy và deadline có kiểm tra riêng.

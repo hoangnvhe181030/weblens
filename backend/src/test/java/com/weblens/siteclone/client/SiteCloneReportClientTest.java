@@ -20,6 +20,32 @@ import org.springframework.web.client.RestClient;
 class SiteCloneReportClientTest {
 
     @Test
+    void readsArchiveBytesFromTheActualWorkerReportContract() throws Exception {
+        UUID cloneId = UUID.randomUUID();
+        byte[] body = ("""
+                {"id":"%s","scanId":"%s","targetUrl":"https://example.com/","status":"PUBLISHED",
+                 "discoveredCount":100,"processedCount":10,"succeededCount":10,"failedCount":0,
+                 "inputBytes":12345,"archiveBytes":6809,"artifactCount":2,"terminalCode":null,
+                 "terminalMessage":null,"createdAt":"2026-10-13T10:43:18Z",
+                 "startedAt":"2026-10-13T10:43:19Z","finishedAt":"2026-10-13T10:44:07Z","artifacts":[]}
+                """).formatted(cloneId, UUID.randomUUID()).getBytes(StandardCharsets.UTF_8);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/internal/v1/reports/site-clones", exchange -> {
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (var response = exchange.getResponseBody()) { response.write(body); }
+        });
+        server.start();
+        try {
+            var client = new SiteCloneReportClient(RestClient.builder(),
+                    properties(URI.create("http://127.0.0.1:" + server.getAddress().getPort())), siteCloneProperties());
+            var report = client.get(UUID.randomUUID(), cloneId);
+            assertThat(report.id()).isEqualTo(cloneId);
+            assertThat(report.archiveBytes()).isEqualTo(6809);
+        } finally { server.stop(0); }
+    }
+
+    @Test
     void preservesArchiveFilenameFromCaptureWorker() throws Exception {
         UUID ownerId = UUID.randomUUID();
         UUID siteCloneId = UUID.randomUUID();

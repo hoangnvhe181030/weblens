@@ -15,6 +15,7 @@ import com.weblens.auth.repository.AuthSessionRepository;
 import com.weblens.auth.repository.UserRepository;
 import com.weblens.auth.security.JwtTokenService;
 import com.weblens.auth.security.RandomTokenService;
+import com.weblens.auth.security.RedisSessionStore;
 import com.weblens.auth.security.TokenHashingService;
 import com.weblens.auth.security.TokenPair;
 import com.weblens.common.exception.UnauthorizedException;
@@ -46,6 +47,7 @@ class AuthenticationServiceTest {
     @Mock JwtTokenService jwtTokens;
     @Mock TokenHashingService hashes;
     @Mock RandomTokenService randomTokens;
+    @Mock RedisSessionStore liveSessions;
 
     private final UUID userId = UUID.randomUUID();
     private final Instant now = Instant.parse("2026-10-01T08:00:00Z");
@@ -58,7 +60,7 @@ class AuthenticationServiceTest {
     void setUp() {
         transactions = new BoundaryTransactionManager();
         metrics = new SimpleMeterRegistry();
-        var target = new AuthenticationService(users, sessions, passwords, jwtTokens, hashes, randomTokens,
+        var target = new AuthenticationService(users, sessions, passwords, jwtTokens, hashes, randomTokens, liveSessions,
                 Clock.fixed(now, java.time.ZoneOffset.UTC), transactions, metrics);
         var proxy = new ProxyFactory(target);
         proxy.addAdvice(new TransactionInterceptor(transactions, new AnnotationTransactionAttributeSource()));
@@ -89,6 +91,12 @@ class AuthenticationServiceTest {
             assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isTrue();
             return invocation.getArgument(0);
         });
+
+        org.mockito.Mockito.doAnswer(invocation -> {
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+            assertThat(transactions.commits).isEqualTo(2);
+            return null;
+        }).when(liveSessions).create(any(), any(), org.mockito.ArgumentMatchers.isNull(), any());
 
         assertThat(service.register(registration).response().user().email()).isEqualTo(request.email());
         assertThat(transactions.commits).isEqualTo(2);
@@ -180,6 +188,7 @@ class AuthenticationServiceTest {
         });
         assertThatThrownBy(() -> service.login(request)).isInstanceOf(TransactionSystemException.class);
         assertThat(transactions.commits).isEqualTo(1);
+        verifyNoInteractions(liveSessions);
         assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
     }
 

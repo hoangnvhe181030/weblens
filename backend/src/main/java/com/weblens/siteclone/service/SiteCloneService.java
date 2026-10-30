@@ -130,8 +130,16 @@ public class SiteCloneService {
         if (local.getStatus() == SiteCloneStatus.WAITING_FOR_SCAN) {
             return toResponse(local);
         }
-        SiteCloneResponse remote = reports.get(ownerId, siteCloneId);
-        return remote == null ? toResponse(local) : remote;
+        SiteCloneReportClient.WorkerReport remote = reports.get(ownerId, siteCloneId);
+        if (remote == null) return toResponse(local);
+        if (!Objects.equals(remote.id(), local.getId()) || !Objects.equals(remote.scanId(), local.getScanId())) {
+            throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "SITE_CLONE_REPORT_UNAVAILABLE",
+                    "Site-clone report unavailable", "The site-clone report does not match the accepted request.");
+        }
+        return new SiteCloneResponse(local.getId(), local.getWebsiteId(), local.getScanId(), local.getTargetUrl(),
+                remote.status(), remote.discoveredCount(), remote.processedCount(), remote.succeededCount(),
+                remote.failedCount(), remote.artifactCount(), remote.archiveBytes(), remote.terminalCode(),
+                remote.terminalMessage(), local.getCreatedAt(), remote.startedAt(), remote.finishedAt(), remote.artifacts());
     }
 
     /**

@@ -3,7 +3,7 @@ import { createReadStream, createWriteStream } from 'node:fs'
 import { stat, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable, Transform } from 'node:stream'
+import { Readable, Transform, addAbortSignal } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import {
   CopyObjectCommand,
@@ -20,25 +20,38 @@ import type { StoredObject } from './types.js'
 
 export class ObjectStorage {
   private readonly client: S3Client
+  private readonly shutdown = new AbortController()
 
   constructor(private readonly config: Config) {
     this.client = new S3Client({
       endpoint: config.s3Endpoint,
       region: config.s3Region,
       forcePathStyle: true,
+      maxAttempts: 2,
       credentials: { accessKeyId: config.s3AccessKey, secretAccessKey: config.s3SecretKey },
     })
   }
 
+  private deadline(signal?: AbortSignal): AbortSignal {
+    const timeout = AbortSignal.timeout(this.config.storageRequestTimeoutMillis ?? 120_000)
+    return AbortSignal.any([timeout, this.shutdown.signal, ...(signal ? [signal] : [])])
+  }
+
+  close(): void {
+    this.shutdown.abort(new Error('WORKER_SHUTDOWN'))
+    this.client.destroy()
+  }
+
   async ensureBucket(): Promise<void> {
     try {
-      await this.client.send(new HeadBucketCommand({ Bucket: this.config.s3Bucket }))
-    } catch {
-      await this.client.send(new CreateBucketCommand({ Bucket: this.config.s3Bucket }))
+      await this.client.send(new HeadBucketCommand({ Bucket: this.config.s3Bucket }), { abortSignal: this.deadline() })
+    } catch (error) {
+      if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode !== 404) throw error
+      await this.client.send(new CreateBucketCommand({ Bucket: this.config.s3Bucket }), { abortSignal: this.deadline() })
     }
   }
 
-  async put(key: string, body: Buffer, contentType: string): Promise<StoredObject> {
+  async put(key: string, body: Buffer, contentType: string, signal?: AbortSignal): Promise<StoredObject> {
     const sha256 = createHash('sha256').update(body).digest()
     await this.client.send(new PutObjectCommand({
       Bucket: this.config.s3Bucket,
@@ -46,33 +59,39 @@ export class ObjectStorage {
       Body: body,
       ContentType: contentType,
       Metadata: { sha256: sha256.toString('hex') },
-    }))
+    }), { abortSignal: this.deadline(signal) })
     return { bucket: this.config.s3Bucket, key, bytes: body.length, sha256, contentType }
   }
 
-  async putFile(key: string, path: string, contentType: string, maxBytes: number): Promise<StoredObject> {
+  async putFile(key: string, path: string, contentType: string, maxBytes: number, signal?: AbortSignal): Promise<StoredObject> {
+    const deadline = this.deadline(signal)
     const size = (await stat(path)).size
     if (size <= 0 || size > maxBytes) throw new Error('ARTIFACT_SIZE_OUT_OF_BOUNDS')
     const hash = createHash('sha256')
-    for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer)
+    for await (const chunk of addAbortSignal(deadline, createReadStream(path))) hash.update(chunk as Buffer)
     const sha256 = hash.digest()
-    await this.client.send(new PutObjectCommand({
+    const body = addAbortSignal(deadline, createReadStream(path))
+    try {
+      await this.client.send(new PutObjectCommand({
       Bucket: this.config.s3Bucket,
       Key: key,
-      Body: createReadStream(path),
+      Body: body,
       ContentLength: size,
       ContentType: contentType,
       Metadata: { sha256: sha256.toString('hex') },
-    }))
+      }), { abortSignal: deadline })
+    } finally {
+      body.destroy()
+    }
     return { bucket: this.config.s3Bucket, key, bytes: size, sha256, contentType }
   }
 
-  async delete(object: StoredObject): Promise<void> {
+  async delete(object: StoredObject, signal?: AbortSignal): Promise<void> {
     if (object.bucket !== this.config.s3Bucket) throw new Error('INVALID_STORAGE_BUCKET')
-    await this.client.send(new DeleteObjectCommand({ Bucket: object.bucket, Key: object.key }))
+    await this.client.send(new DeleteObjectCommand({ Bucket: object.bucket, Key: object.key }), { abortSignal: this.deadline(signal) })
   }
 
-  async copy(object: StoredObject, key: string): Promise<StoredObject> {
+  async copy(object: StoredObject, key: string, signal?: AbortSignal): Promise<StoredObject> {
     if (object.bucket !== this.config.s3Bucket) throw new Error('INVALID_STORAGE_BUCKET')
     const source = `${object.bucket}/${object.key.split('/').map(encodeURIComponent).join('/')}`
     await this.client.send(new CopyObjectCommand({
@@ -80,13 +99,13 @@ export class ObjectStorage {
       Key: key,
       CopySource: source,
       MetadataDirective: 'COPY',
-    }))
+    }), { abortSignal: this.deadline(signal) })
     return { ...object, key }
   }
 
-  async verify(object: StoredObject): Promise<void> {
+  async verify(object: StoredObject, signal?: AbortSignal): Promise<void> {
     if (object.bucket !== this.config.s3Bucket) throw new Error('INVALID_STORAGE_BUCKET')
-    const head = await this.client.send(new HeadObjectCommand({ Bucket: object.bucket, Key: object.key }))
+    const head = await this.client.send(new HeadObjectCommand({ Bucket: object.bucket, Key: object.key }), { abortSignal: this.deadline(signal) })
     if (head.ContentLength !== object.bytes
         || head.Metadata?.['sha256'] !== object.sha256.toString('hex')) {
       throw new Error('ARTIFACT_OBJECT_INTEGRITY_FAILED')
@@ -104,7 +123,7 @@ export class ObjectStorage {
     const path = join(directory, 'artifact')
     const cleanup = () => rm(directory, { recursive: true, force: true })
     try {
-      const deadline = AbortSignal.timeout(120_000)
+      const deadline = this.deadline()
       const result = await this.client.send(new GetObjectCommand({ Bucket: bucket, Key: key }),
         { abortSignal: deadline })
       if (!result.Body) throw new Error('ARTIFACT_OBJECT_MISSING')
@@ -132,12 +151,13 @@ export class ObjectStorage {
     }
   }
 
-  async get(bucket: string, key: string, maximumBytes = 64 * 1024 * 1024): Promise<Buffer> {
+  async get(bucket: string, key: string, maximumBytes = 64 * 1024 * 1024, signal?: AbortSignal): Promise<Buffer> {
     if (bucket !== this.config.s3Bucket) throw new Error('INVALID_STORAGE_BUCKET')
     try {
-      const result = await this.client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+      const deadline = this.deadline(signal)
+      const result = await this.client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal: deadline })
       if (!result.Body) throw new Error('ARTIFACT_OBJECT_MISSING')
-      const input = result.Body as Readable
+      const input = addAbortSignal(deadline, result.Body as Readable)
       if (result.ContentLength !== undefined && result.ContentLength > maximumBytes) {
         input.destroy()
         throw new Error('ARTIFACT_SIZE_MISMATCH')

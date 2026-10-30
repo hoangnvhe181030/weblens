@@ -52,6 +52,33 @@ class FoundationPersistenceIT {
     private CaptureRequestRepository captures;
 
     @Test
+    void scanAuthorizationUsesOneStatementWithoutHydratingAnEntity() {
+        Instant now = Instant.parse("2026-10-11T10:00:00Z");
+        UserEntity owner = owner(now);
+        WebsiteEntity website = website(owner.getId(), "Authorization target", now);
+        ScanEntity scan = completedScan(owner.getId(), website.getId(), now);
+        entityManager.persist(owner);
+        entityManager.persist(website);
+        entityManager.persist(scan);
+        entityManager.flush();
+        entityManager.clear();
+        var statistics = entityManager.getEntityManager().getEntityManagerFactory()
+                .unwrap(org.hibernate.SessionFactory.class).getStatistics();
+        boolean previous = statistics.isStatisticsEnabled();
+        statistics.setStatisticsEnabled(true);
+        try {
+            statistics.clear();
+            assertThat(scans.existsByIdAndRequestedByUserId(scan.getId(), owner.getId())).isTrue();
+            assertThat(statistics.getPrepareStatementCount()).isEqualTo(1);
+            assertThat(statistics.getEntityLoadCount()).isZero();
+            assertThat(scans.existsByIdAndRequestedByUserId(scan.getId(), UUID.randomUUID())).isFalse();
+            assertThat(scans.existsByIdAndRequestedByUserId(UUID.randomUUID(), owner.getId())).isFalse();
+        } finally {
+            statistics.setStatisticsEnabled(previous);
+        }
+    }
+
+    @Test
     void flywaySchemaSupportsArchiveThenRegisterSameCanonicalUrl() {
         Instant now = Instant.parse("2026-09-09T10:00:00Z");
         UserEntity owner = owner(now);

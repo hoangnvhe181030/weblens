@@ -7,6 +7,7 @@ import (
 )
 
 func TestLoadUsesProductionCapacityDefaults(t *testing.T) {
+	t.Setenv("WEBLENS_SCAN_COMMAND_TRANSPORT", "http")
 	t.Setenv("CRAWLER_POSTGRES_URL", "postgres://crawler:password@localhost/crawler")
 	t.Setenv("CRAWLER_SERVICE_TOKEN", strings.Repeat("x", 32))
 	t.Setenv("CRAWLER_WORKER_CONCURRENCY", "")
@@ -23,6 +24,31 @@ func TestLoadUsesProductionCapacityDefaults(t *testing.T) {
 	}
 	if cfg.LocalTargetsOnly {
 		t.Fatal("local-only network policy was enabled by default")
+	}
+}
+
+func TestRabbitConfig(t *testing.T) {
+	t.Setenv("CRAWLER_POSTGRES_URL", "postgres://crawler:password@localhost/crawler")
+	t.Setenv("CRAWLER_SERVICE_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("WEBLENS_SCAN_COMMAND_TRANSPORT", "rabbitmq")
+	t.Setenv("WEBLENS_RABBITMQ_HOST", "127.0.0.1")
+	t.Setenv("WEBLENS_RABBITMQ_TLS", "false")
+	t.Setenv("CRAWLER_RABBITMQ_PASSWORD", "local-only")
+	cfg, err := Load()
+	if err != nil || cfg.CommandTransport != "rabbitmq" || cfg.RabbitConcurrency != 4 {
+		t.Fatal("valid RabbitMQ config rejected")
+	}
+	t.Setenv("WEBLENS_RABBITMQ_HOST", "broker.example")
+	if _, err := Load(); err == nil {
+		t.Fatal("plaintext remote broker accepted")
+	}
+	t.Setenv("WEBLENS_RABBITMQ_TLS", "true")
+	if _, err := Load(); err != nil {
+		t.Fatal("TLS remote broker rejected")
+	}
+	t.Setenv("WEBLENS_SCAN_COMMAND_TRANSPORT", "typo")
+	if _, err := Load(); err == nil {
+		t.Fatal("unknown transport accepted")
 	}
 }
 
@@ -93,14 +119,52 @@ func TestLoadEnablesSecureClickHouse(t *testing.T) {
 
 func validConfig() Config {
 	return Config{
-		PostgresURL:         "postgres://crawler:password@localhost/crawler",
-		ClickHouseDatabase:  "weblens_crawl_analytics",
-		ServiceToken:        strings.Repeat("x", 32),
-		ControlEventsURL:    "http://localhost:8080/internal/v1/events/scans",
-		WorkerConcurrency:   3,
-		HostConcurrency:     2,
-		LeaseDuration:       30 * time.Second,
-		HostDelay:           time.Second,
-		AnalyticsBacklogAge: 15 * time.Minute,
+		ClickHouseReadMaxConns: 7,
+		PostgresURL:            "postgres://crawler:password@localhost/crawler",
+		ClickHouseDatabase:     "weblens_crawl_analytics",
+		ServiceToken:           strings.Repeat("x", 32),
+		ControlEventsURL:       "http://localhost:8080/internal/v1/events/scans",
+		WorkerConcurrency:      3,
+		HostConcurrency:        2,
+		LeaseDuration:          30 * time.Second,
+		HostDelay:              time.Second,
+		AnalyticsBacklogAge:    15 * time.Minute,
+	}
+}
+
+func TestClickHouseReadBudgetBounds(t *testing.T) {
+	for _, limit := range []int{1, 7, 24, 32, 64} {
+		cfg := validConfig()
+		cfg.ClickHouseReadMaxConns = limit
+		if err := cfg.Validate(); err != nil {
+			t.Fatal("valid ClickHouse read budget rejected")
+		}
+	}
+	for _, limit := range []int{0, -1, 65} {
+		cfg := validConfig()
+		cfg.ClickHouseReadMaxConns = limit
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("invalid ClickHouse read budget accepted")
+		}
+	}
+}
+
+func TestClickHouseHTTPURLPolicy(t *testing.T) {
+	for _, raw := range []string{"https://clickhouse.example", "https://clickhouse.example:8443/", "http://127.0.0.1:8123", "http://[::1]:8123"} {
+		if _, err := ParseClickHouseHTTPURL(raw); err != nil {
+			t.Fatalf("valid endpoint rejected: %v", err)
+		}
+	}
+	for _, raw := range []string{"http://clickhouse.example", "https://user:secret@clickhouse.example", "https://clickhouse.example/path", "https://clickhouse.example?query=SELECT", "https://clickhouse.example#fragment", "file:///tmp", "https://clickhouse.example:bad"} {
+		if _, err := ParseClickHouseHTTPURL(raw); err == nil {
+			t.Fatal("unsafe endpoint accepted")
+		}
+	}
+	t.Setenv("CRAWLER_POSTGRES_URL", "postgres://crawler:password@localhost/crawler")
+	t.Setenv("CRAWLER_SERVICE_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("CRAWLER_CLICKHOUSE_HTTP_URL", "https://clickhouse.example")
+	cfg, err := Load()
+	if err != nil || cfg.ClickHouseHTTPURL != "https://clickhouse.example" {
+		t.Fatal("HTTP override was not loaded")
 	}
 }

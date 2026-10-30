@@ -2,15 +2,18 @@ package com.weblens.auth.security;
 
 import com.weblens.common.config.CorsProperties;
 import java.util.List;
+import java.util.Set;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
+import org.springframework.security.config.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
+import org.springframework.security.oauth2.server.resource.web.DefaultBearerTokenResolver;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
@@ -28,12 +31,16 @@ public class SecurityConfig {
             ProblemAuthenticationEntryPoint authenticationEntryPoint,
             ProblemAccessDeniedHandler accessDeniedHandler
     ) throws Exception {
+        var bearerTokens = new DefaultBearerTokenResolver();
+        var credentialEndpoints = Set.of("/api/v1/auth/registrations", "/api/v1/auth/sessions",
+                "/api/v1/auth/token-refreshes", "/api/v1/auth/session");
         http
                 .csrf(csrf -> csrf.disable())
                 .cors(Customizer.withDefaults())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/billing/vnpay/*/ipn").permitAll()
                         .requestMatchers(
                                 "/api/v1/auth/registrations",
                                 "/api/v1/auth/sessions",
@@ -45,14 +52,26 @@ public class SecurityConfig {
                                 "/swagger-ui.html",
                                 "/swagger-ui/**"
                         ).permitAll()
-                        .requestMatchers(
-                                "/internal/v1/**",
-                                "/actuator/metrics",
-                                "/actuator/metrics/**"
-                        ).permitAll()
+						.requestMatchers("/internal/v1/**").permitAll()
+                        // The service-token filter protects metrics; user JWTs grant no access.
+                        .requestMatchers("/actuator/metrics", "/actuator/metrics/**").permitAll()
                         .anyRequest().authenticated()
                 )
                 .oauth2ResourceServer(oauth2 -> oauth2
+                        .withObjectPostProcessor(new ObjectPostProcessor<BearerTokenAuthenticationFilter>() {
+                            @Override
+                            public <O extends BearerTokenAuthenticationFilter> O postProcess(O filter) {
+                                filter.setAuthenticationFailureHandler(authenticationEntryPoint::commence);
+                                return filter;
+                            }
+                        })
+                        // Cookie/password endpoints must still work with an expired or revoked access JWT.
+                        .bearerTokenResolver(request -> {
+                            String path = request.getRequestURI().substring(request.getContextPath().length());
+                            boolean providerIpn = "GET".equals(request.getMethod())
+                                    && path.matches("/api/v1/billing/vnpay/[^/]+/ipn");
+                            return credentialEndpoints.contains(path) || providerIpn ? null : bearerTokens.resolve(request);
+                        })
                         .jwt(Customizer.withDefaults())
                         .authenticationEntryPoint(authenticationEntryPoint)
                         .accessDeniedHandler(accessDeniedHandler)

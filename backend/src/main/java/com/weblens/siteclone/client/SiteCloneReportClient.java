@@ -6,12 +6,15 @@ import com.weblens.common.config.CaptureProperties;
 import com.weblens.common.config.SiteCloneProperties;
 import com.weblens.common.exception.ApiException;
 import com.weblens.common.exception.NotFoundException;
-import com.weblens.siteclone.dto.SiteCloneResponse;
+import com.weblens.siteclone.dto.SiteCloneArtifactResponse;
+import com.weblens.siteclone.model.SiteCloneStatus;
 import com.weblens.siteclone.dto.SiteCloneProgressResponse;
 import com.weblens.siteclone.dto.SiteCloneBrowserSessionResponse;
 import com.weblens.common.exception.ConflictException;
 import java.util.Map;
+import java.util.List;
 import java.util.UUID;
+import java.time.Instant;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -52,7 +55,7 @@ public class SiteCloneReportClient {
                 .build();
     }
 
-    public SiteCloneResponse get(UUID ownerId, UUID siteCloneId) {
+    public WorkerReport get(UUID ownerId, UUID siteCloneId) {
         try {
             return client.get()
                     .uri(uri -> uri.path("/internal/v1/reports/site-clones/{siteCloneId}")
@@ -60,7 +63,7 @@ public class SiteCloneReportClient {
                             .build(siteCloneId))
                     .header("X-WebLens-Service-Token", properties.serviceToken())
                     .retrieve()
-                    .body(SiteCloneResponse.class);
+                    .body(WorkerReport.class);
         } catch (RestClientResponseException exception) {
             if (exception.getStatusCode().value() == HttpStatus.NOT_FOUND.value()) {
                 return null;
@@ -70,6 +73,13 @@ public class SiteCloneReportClient {
             throw unavailable(exception);
         }
     }
+
+    public record WorkerReport(
+            UUID id, UUID scanId, String targetUrl, SiteCloneStatus status,
+            int discoveredCount, int processedCount, int succeededCount, int failedCount,
+            int artifactCount, long archiveBytes, String terminalCode, String terminalMessage,
+            Instant createdAt, Instant startedAt, Instant finishedAt, List<SiteCloneArtifactResponse> artifacts
+    ) {}
 
     public SiteCloneProgressResponse getProgress(UUID ownerId, UUID siteCloneId, int after, int limit, String status, String q) {
         try {

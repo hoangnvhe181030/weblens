@@ -7,6 +7,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.authentication.AuthenticationServiceException;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.stereotype.Component;
 
@@ -27,6 +28,16 @@ public class ProblemAuthenticationEntryPoint implements AuthenticationEntryPoint
             HttpServletResponse response,
             AuthenticationException authenticationException
     ) throws IOException {
+        if (authenticationException instanceof AuthenticationServiceException) {
+            writer.write(response, problems.create(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "AUTH_SESSION_STORE_UNAVAILABLE",
+                    "Authentication temporarily unavailable",
+                    "The authentication session store is unavailable.",
+                    request
+            ));
+            return;
+        }
         writer.write(response, problems.create(
                 HttpStatus.UNAUTHORIZED,
                 "AUTHENTICATION_REQUIRED",

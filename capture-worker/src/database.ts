@@ -63,7 +63,8 @@ export class CaptureDatabase {
   readonly pool: Pool
 
   constructor(databaseUrl: string) {
-    this.pool = new Pool({ connectionString: databaseUrl, max: 10, idleTimeoutMillis: 30_000 })
+    this.pool = new Pool({ connectionString: databaseUrl, max: 10, idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000, statement_timeout: 10_000, query_timeout: 12_000 })
   }
 
   async migrate(directory = resolve('migrations/postgresql')): Promise<void> {
@@ -218,9 +219,13 @@ export class CaptureDatabase {
   }
 
   async extendLease(job: ClaimedJob): Promise<boolean> {
-    const result = await this.pool.query(`update capture_jobs
-      set lease_expires_at=now()+interval '45 seconds', updated_at=now()
-      where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3`,
+    // Materialize the locked row before evaluating expiry; unchanged lock waits do not recheck UPDATE predicates.
+    const result = await this.pool.query(`with locked as materialized (
+        select id,lease_expires_at from capture_jobs
+        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3 for update
+      ) update capture_jobs job
+      set lease_expires_at=clock_timestamp()+interval '45 seconds', updated_at=clock_timestamp()
+      from locked where job.id=locked.id and locked.lease_expires_at>clock_timestamp()`,
     [job.id, job.leaseOwner, job.leaseGeneration])
     return result.rowCount === 1
   }
@@ -230,7 +235,8 @@ export class CaptureDatabase {
     try {
       await client.query('begin')
       const capture = await client.query(`select id from capture_jobs
-        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3 for update`,
+        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3
+          and lease_expires_at>clock_timestamp() for update`,
       [job.id, job.leaseOwner, job.leaseGeneration])
       if (!capture.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       const reconstruction = await client.query<{ id: string }>(`select id from reconstruction_jobs
@@ -246,6 +252,9 @@ export class CaptureDatabase {
         client, reconstructionId, job.ownerId, job.leaseGeneration, 'MANIFEST',
         'manifest.json', objects.manifest,
       )
+      const valid = await client.query(`select id from capture_jobs
+        where id=$1 and lease_expires_at>clock_timestamp()`, [job.id])
+      if (!valid.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       await client.query('commit')
     } catch (error) {
       await client.query('rollback')
@@ -301,7 +310,8 @@ export class CaptureDatabase {
     try {
       await client.query('begin')
       const locked = await client.query(`select id from capture_jobs
-        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3 for update`,
+        where id=$1 and status='RENDERING' and lease_owner=$2 and lease_generation=$3
+          and lease_expires_at>clock_timestamp() for update`,
       [job.id, job.leaseOwner, job.leaseGeneration])
       if (!locked.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       const snapshotId = randomUUID()
@@ -394,9 +404,10 @@ export class CaptureDatabase {
         analyticsPayload.batchId, job.id, job.ownerId, job.leaseGeneration,
         encoded.toString('utf8'), hash,
       ])
-      await client.query(`update capture_jobs set status='PERSISTING',lease_owner=null,lease_expires_at=null,
+      const staged = await client.query(`update capture_jobs set status='PERSISTING',lease_owner=null,lease_expires_at=null,
           analytics_expected_count=$2,analytics_published_count=0,object_count=$3,total_object_bytes=$4,updated_at=now()
-        where id=$1`, [job.id, expected, objectCount, objectBytes])
+        where id=$1 and status='RENDERING' and lease_expires_at>clock_timestamp()`, [job.id, expected, objectCount, objectBytes])
+      if (!staged.rowCount) throw new Error('STALE_CAPTURE_LEASE')
       await this.enqueueEvent(client, job.id, job.ownerId, job.correlationId, 'INDEXING', expected, 0, objectCount, objectBytes, null, null)
       await client.query('commit')
     } catch (error) {

@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$ReleaseZip,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{7,40}$')][string]$Commit,
-    [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ReleaseSha256
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ReleaseSha256,
+    [switch]$ActivateRabbitMq
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,46 @@ $current = Join-Path $root 'current'
 $release = Join-Path $releases $Commit
 $serviceNames = 'WebLensCrawler', 'WebLensCapture', 'WebLensBackend', 'WebLensCaddy'
 $mutex = [Threading.Mutex]::new($false, 'Global\WebLensDeployment')
+$environmentFile = 'C:\ProgramData\WebLens\weblens.env'
+$environmentBackup = $null
+$previousDependencies = @{}
+
+function Enable-RabbitTransport {
+    $credentials = Get-Content -LiteralPath 'C:\ProgramData\WebLens\rabbitmq\credentials.json' -Raw | ConvertFrom-Json
+    $settings = @{
+        WEBLENS_SCAN_COMMAND_TRANSPORT='rabbitmq'; WEBLENS_RABBITMQ_HOST='127.0.0.1'
+        WEBLENS_RABBITMQ_PORT='5672'; WEBLENS_RABBITMQ_VHOST='weblens'; WEBLENS_RABBITMQ_TLS='false'
+        WEBLENS_RABBITMQ_USERNAME='weblens_control'; WEBLENS_RABBITMQ_PASSWORD=$credentials.weblens_control
+        CRAWLER_RABBITMQ_USERNAME='weblens_crawler'; CRAWLER_RABBITMQ_PASSWORD=$credentials.weblens_crawler
+        CRAWLER_RABBITMQ_CONCURRENCY='4'; WEBLENS_BILLING_ENABLED='false'
+    }
+    foreach ($key in @('WEBLENS_RABBITMQ_PASSWORD','CRAWLER_RABBITMQ_PASSWORD')) {
+        if ($settings[$key] -notmatch '^[0-9a-f]{64}$') { throw 'Invalid production RabbitMQ credentials' }
+    }
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($line in [IO.File]::ReadAllLines($environmentFile)) {
+        if ($line -match '^([^#=]+)=' -and $settings.ContainsKey($Matches[1])) { continue }
+        $lines.Add($line)
+    }
+    foreach ($key in ($settings.Keys | Sort-Object)) { $lines.Add($key + '=' + $settings[$key]) }
+    # Writing in place preserves the protected environment file's existing service ACLs.
+    [IO.File]::WriteAllLines($environmentFile, $lines, [Text.UTF8Encoding]::new($false))
+    foreach ($name in @('WebLensBackend','WebLensCrawler')) {
+        $dependencies = @($previousDependencies[$name]) + 'WebLensRabbitMQ' | Select-Object -Unique
+        & sc.exe config $name depend= ($dependencies -join '/') | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not configure RabbitMQ dependency: $name" }
+    }
+}
+
+function Restore-TransportConfiguration {
+    if (-not $environmentBackup) { return }
+    [IO.File]::WriteAllBytes($environmentFile, [IO.File]::ReadAllBytes($environmentBackup))
+    foreach ($name in $previousDependencies.Keys) {
+        $dependencies = @($previousDependencies[$name]) -join '/'
+        & sc.exe config $name depend= $dependencies | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not restore service dependencies: $name" }
+    }
+}
 
 function Set-CurrentRelease([string]$Target) {
     $resolvedRoot = [IO.Path]::GetFullPath($releases) + [IO.Path]::DirectorySeparatorChar
@@ -48,16 +89,20 @@ function Wait-Health([string]$Url, [int]$Attempts = 30) {
 function Stop-BackendProcesses {
     # WinSW stops the PowerShell wrapper, but its Java child can survive a deployment.
     $javaPath = Join-Path $root 'runtime\jre21\bin\java.exe'
-    Get-CimInstance Win32_Process -Filter "Name='java.exe'" |
-        Where-Object {
-            $_.ExecutablePath -eq $javaPath -and
-            $_.CommandLine -match '(?i)(^|\s)-jar\s+weblens-backend\.jar(\s|$)'
-        } |
-        ForEach-Object {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
-            Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
-        }
-    if (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue) {
+    # Native netstat avoids the VPS's stalled WMI network/process providers.
+    $connections = & netstat.exe -ano -p tcp
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Backend listener' }
+    $owners = @($connections | ForEach-Object {
+        if ($_ -match '^\s*TCP\s+\S+:8080\s+\S+\s+LISTENING\s+(\d+)\s*$') { [int]$Matches[1] }
+    } | Select-Object -Unique)
+    foreach ($owner in $owners) {
+        $process = Get-Process -Id $owner -ErrorAction Stop
+        if ($process.Path -ne $javaPath) { throw 'Port 8080 belongs to an unexpected process' }
+        Stop-Process -Id $owner -Force -ErrorAction Stop
+        Wait-Process -Id $owner -Timeout 10 -ErrorAction SilentlyContinue
+    }
+    $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    if (@($listeners | Where-Object Port -eq 8080).Count -gt 0) {
         throw 'Port 8080 is still occupied after stopping WebLens Backend'
     }
 }
@@ -69,14 +114,16 @@ try {
     $previous = $null
     if (Test-Path -LiteralPath $current) { $previous = (Get-Item -LiteralPath $current).Target }
     if (-not (Test-Path -LiteralPath $release)) {
-        $unpacked = Join-Path $releases "$Commit-$([guid]::NewGuid().ToString('N')).extracting"
+        $unpacked = Join-Path $releases ('stage-' + [guid]::NewGuid().ToString('N').Substring(0,16))
         $resolvedReleases = [IO.Path]::GetFullPath($releases) + [IO.Path]::DirectorySeparatorChar
         if (-not ([IO.Path]::GetFullPath($unpacked)).StartsWith($resolvedReleases, [StringComparison]::OrdinalIgnoreCase)) {
             throw 'Release staging path is outside the releases directory'
         }
         New-Item -ItemType Directory -Path $unpacked | Out-Null
         try {
-            Expand-Archive -LiteralPath $ReleaseZip -DestinationPath $unpacked
+            # Keep staging paths short for Windows tooling; Server 2019 includes bsdtar.
+            & tar.exe -xf $ReleaseZip -C $unpacked
+            if ($LASTEXITCODE -ne 0) { throw 'Release archive extraction failed' }
             $metadata = Get-Content -LiteralPath (Join-Path $unpacked 'release.json') -Raw | ConvertFrom-Json
             if ($metadata.commit -ne $Commit -or -not (Test-Path -LiteralPath (Join-Path $unpacked 'frontend\release.json') -PathType Leaf)) {
                 throw 'Release archive content is incomplete'
@@ -127,13 +174,26 @@ try {
             throw
         }
     }
+    if ($ActivateRabbitMq) {
+        & (Join-Path $release 'infra\production-windows\install-local-rabbitmq.ps1') -Action verify
+        $backupDirectory = 'C:\ProgramData\WebLens\backups\transport-' + [guid]::NewGuid().ToString('N')
+        New-Item -ItemType Directory -Path $backupDirectory | Out-Null
+        & icacls.exe $backupDirectory /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Transport backup ACL failed' }
+        $environmentBackup = Join-Path $backupDirectory 'weblens.env'
+        Copy-Item -LiteralPath $environmentFile -Destination $environmentBackup
+        foreach ($name in @('WebLensBackend','WebLensCrawler')) {
+            $previousDependencies[$name] = @((Get-Service $name).ServicesDependedOn | Select-Object -ExpandProperty Name)
+        }
+        $previousDependencies | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupDirectory 'dependencies.json') -Encoding ascii
+    }
     $stopOrder = @($serviceNames)
     [array]::Reverse($stopOrder)
     foreach ($name in $stopOrder) { Stop-Service -Name $name -Force -ErrorAction SilentlyContinue }
     Stop-BackendProcesses
-    Set-CurrentRelease $release
-
     try {
+        if ($ActivateRabbitMq) { Enable-RabbitTransport }
+        Set-CurrentRelease $release
         & (Join-Path $current 'infra\production-windows\run-service.ps1') 'crawler-migrate-postgres'
         if ($LASTEXITCODE -ne 0) { throw 'Crawler PostgreSQL migration failed' }
         foreach ($name in $serviceNames) { Start-Service -Name $name }
@@ -144,6 +204,7 @@ try {
     } catch {
         foreach ($name in $stopOrder) { Stop-Service -Name $name -Force -ErrorAction SilentlyContinue }
         Stop-BackendProcesses
+        Restore-TransportConfiguration
         if ($previous -and (Test-Path -LiteralPath $previous)) {
             Set-CurrentRelease $previous
             foreach ($name in $serviceNames) { Start-Service -Name $name -ErrorAction SilentlyContinue }

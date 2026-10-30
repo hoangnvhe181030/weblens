@@ -92,12 +92,14 @@ export class SafeProxy {
   private async forwardHttp(request: IncomingMessage, response: import('node:http').ServerResponse): Promise<void> {
     const parsed = await assertPublicHttpUrl(request.url ?? '')
     const addresses = await resolvePublicAddresses(parsed.hostname)
+    const headers: import('node:http').OutgoingHttpHeaders = { ...request.headers, host: parsed.host }
+    delete headers['proxy-connection']
     const upstream = httpRequest({
       hostname: addresses[0],
       port: parsed.port ? Number(parsed.port) : 80,
       method: request.method,
       path: `${parsed.pathname}${parsed.search}`,
-      headers: { ...request.headers, host: parsed.host, 'proxy-connection': undefined },
+      headers,
     }, (upstreamResponse) => {
       response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers)
       upstreamResponse.pipe(response)

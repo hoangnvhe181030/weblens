@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { test } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { Pool } from 'pg'
 import { CaptureDatabase } from './database.js'
 import { SiteCloneDatabase } from './site-database.js'
@@ -54,6 +55,14 @@ test('duplicate command, lease fencing và analytical completion giữ đúng in
       "update capture_jobs set lease_expires_at=now()-interval '1 second' where id=$1",
       [command.aggregateId],
     )
+    assert.equal(await database.extendLease(firstLease), false)
+    await assert.rejects(database.stageResult(firstLease, captureResult(),
+      storedObject('html', Buffer.from('html')), storedObject('screenshot', Buffer.from('image')), [], null),
+    /STALE_CAPTURE_LEASE/u)
+    await assert.rejects(database.stageReconstructionArtifacts(firstLease, {
+      archive: storedObject('expired-archive', Buffer.from('zip')),
+      manifest: storedObject('expired-manifest', Buffer.from('{}')),
+    }), /STALE_CAPTURE_LEASE/u)
     const secondLease = await database.claimJob(randomUUID())
     assert.ok(secondLease)
     assert.ok(secondLease.leaseGeneration > firstLease.leaseGeneration)
@@ -309,6 +318,9 @@ test('site clone migration, phase retry, page fencing, cancellation partial và 
     )
     const expiredProgress = await sites.getProgress(command.payload.ownerId, command.aggregateId, -1, 50, 'RENDERING', '')
     assert.equal(expiredProgress?.activePages[0]?.leaseExpired, true)
+    assert.equal(await sites.extendPageLease(stalePage), false)
+    await assert.rejects(sites.completePage(stalePage, storedObject('expired-bundle', Buffer.from('{}')), 2),
+      /STALE_SITE_PAGE_LEASE/u)
     const winningPage = await sites.claimPage(randomUUID())
     assert.ok(winningPage)
     assert.equal(winningPage.pageId, stalePage.pageId)
@@ -488,6 +500,89 @@ test('site clone migration, phase retry, page fencing, cancellation partial và 
     await database.close()
     await admin.query(`drop schema "${schemaName}" cascade`)
     await admin.end()
+  }
+})
+
+test('heartbeat rechecks expiry after an unchanged row lock is released', {
+  skip: databaseUrl ? false : 'CAPTURE_TEST_DATABASE_URL is required',
+  timeout: 30_000,
+}, async () => {
+  const admin = new Pool({ connectionString: databaseUrl! })
+  const schema = `weblens_heartbeat_${randomUUID().replaceAll('-', '')}`
+  await admin.query(`create schema "${schema}"`)
+  const isolated = new URL(databaseUrl!)
+  isolated.searchParams.set('options', `-csearch_path=${schema}`)
+  isolated.searchParams.set('application_name', schema)
+  const database = new CaptureDatabase(isolated.toString())
+  const sites = new SiteCloneDatabase(database.pool)
+  try {
+    await database.migrate()
+    await database.acceptCommand(commandEnvelope())
+    const capture = await database.claimJob(randomUUID())
+    assert.ok(capture)
+    assert.equal(await database.extendLease(capture), true)
+    await lockedExpiry('capture_jobs', 'lease_expires_at', 'id=$1', [capture.id], () => database.extendLease(capture))
+
+    const command = siteCloneCommand()
+    await sites.acceptCommand(command)
+    const ingestion = await sites.claimIngestion(randomUUID())
+    assert.ok(ingestion)
+    assert.equal(await sites.extendPhaseLease(ingestion), true)
+    await lockedExpiry('site_reconstruction_jobs', 'phase_lease_expires_at', 'id=$1', [ingestion.id],
+      () => sites.extendPhaseLease(ingestion))
+    const reclaimed = await sites.claimIngestion(randomUUID())
+    assert.ok(reclaimed)
+    await sites.addTargets(reclaimed, [target(randomUUID(), 1, 'https://example.com/', 'index.html')])
+    await sites.finishIngestion(reclaimed)
+    const page = await sites.claimPage(randomUUID())
+    assert.ok(page)
+    assert.equal(await sites.extendPageLease(page), true)
+    await lockedExpiry('site_reconstruction_pages', 'lease_expires_at',
+      'site_reconstruction_job_id=$1 and page_id=$2', [page.jobId, page.pageId], () => sites.extendPageLease(page))
+    const retry = await sites.claimPage(randomUUID())
+    assert.ok(retry)
+    assert.equal(await sites.completePage(retry, storedObject('bundle', Buffer.from('{}')), 2), true)
+    const assembly = await sites.claimAssembly(randomUUID())
+    assert.ok(assembly)
+    assert.equal(await sites.extendPhaseLease(assembly), true)
+    await lockedExpiry('site_reconstruction_jobs', 'phase_lease_expires_at', 'id=$1', [assembly.id],
+      () => sites.extendPhaseLease(assembly))
+  } finally {
+    await database.close()
+    await admin.query(`drop schema "${schema}" cascade`)
+    await admin.end()
+  }
+
+  async function lockedExpiry(table: string, expiry: string, scope: string, ids: string[], renew: () => Promise<boolean>) {
+    await database.pool.query(`update ${table} set ${expiry}=clock_timestamp()+interval '2 seconds' where ${scope}`, ids)
+    const blocker = await database.pool.connect()
+    let pending: Promise<boolean> | undefined
+    try {
+      await blocker.query('begin')
+      await blocker.query(`select 1 from ${table} where ${scope} for update`, ids)
+      pending = renew()
+      const waitingDeadline = Date.now() + 1500
+      let blocked = false
+      while (Date.now() < waitingDeadline) {
+        const waiting = await database.pool.query<{ blocked: boolean }>(`select exists(
+          select 1 from pg_stat_activity where application_name=$1 and wait_event_type='Lock'
+            and query like $2) as blocked`, [schema, `%${table}%`])
+        if (waiting.rows[0]!.blocked) { blocked = true; break }
+        await delay(10)
+      }
+      assert.ok(blocked, 'renewal must enter the database lock wait while the lease is live')
+      while (!(await database.pool.query<{ expired: boolean }>(
+        `select ${expiry}<=clock_timestamp() as expired from ${table} where ${scope}`, ids)).rows[0]!.expired) {
+        await delay(20)
+      }
+      // Rollback without changing the tuple: UPDATE must not rely on tuple re-evaluation.
+      await blocker.query('rollback')
+      assert.equal(await pending, false, `${table} must not resurrect an expired lease`)
+    } finally {
+      await blocker.query('rollback')
+      blocker.release()
+      await pending?.catch(() => undefined)
+    }
   }
 })
 

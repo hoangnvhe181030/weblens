@@ -32,6 +32,7 @@ tmp/
 # Test and tooling output
 .testcontainers.properties
 *.pid
+tools/load/dispatch-evaluation/target/
 
 # Local design references captured from public websites
 .reference/

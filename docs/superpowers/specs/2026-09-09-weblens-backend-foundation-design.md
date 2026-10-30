@@ -227,7 +227,9 @@ QUEUED ──→ RUNNING ──→ COMPLETED
 ```
 
 - Terminal state không quay lại non-terminal state.
-- Foundation cho phép tạo scan ở `QUEUED` và hủy `QUEUED → CANCELLED`.
+- Foundation ban đầu cho phép hủy `QUEUED → CANCELLED`. Quy tắc này được thay
+  thế ngày 03/10/2026: Control Plane chuyển `QUEUED → CANCEL_REQUESTED` và chờ
+  kết quả terminal từ Crawler; xem lifecycle hiện hành trong `docs/ARCHITECTURE.md`.
 - Các transition worker dùng sau này được cài đặt/test ở domain nhưng chưa có public endpoint để caller tùy ý chuyển trạng thái.
 - Yêu cầu hủy `RUNNING` chuyển sang `CANCEL_REQUESTED`; worker sau này chịu trách nhiệm dừng an toàn và xác nhận `CANCELLED`.
 - Repeated cancellation của `CANCEL_REQUESTED/CANCELLED` trả trạng thái hiện tại.

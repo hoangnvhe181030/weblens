@@ -27,7 +27,15 @@ class JwtTokenServiceTest {
         JwtProperties properties = properties();
         JwtConfig config = new JwtConfig();
         SecretKey key = config.jwtSecretKey(properties);
-        JwtDecoder accessDecoder = config.jwtDecoder(key, properties);
+        RedisSessionStore sessions = org.mockito.Mockito.mock(RedisSessionStore.class);
+        org.mockito.Mockito.when(sessions.isActive(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenReturn(true);
+        var ledger = org.mockito.Mockito.mock(com.weblens.auth.repository.AuthSessionRepository.class);
+        org.mockito.Mockito.when(ledger.existsByIdAndUserIdAndRevokedAtIsNullAndExpiresAtAfter(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenReturn(true);
+        Clock clock = Clock.fixed(now, ZoneOffset.UTC);
+        JwtDecoder accessDecoder = config.jwtDecoder(key, properties, sessions, ledger, clock);
         JwtDecoder refreshDecoder = config.refreshJwtDecoder(key, properties);
         JwtTokenService service = new JwtTokenService(
                 config.jwtEncoder(key),
@@ -58,7 +66,7 @@ class JwtTokenServiceTest {
                 properties.accessTtl(),
                 properties.refreshTtl()
         );
-        assertThatThrownBy(() -> config.jwtDecoder(key, wrongAudience).decode(pair.accessToken()))
+        assertThatThrownBy(() -> config.jwtDecoder(key, wrongAudience, sessions, ledger, clock).decode(pair.accessToken()))
                 .isInstanceOf(JwtException.class);
 
         String anotherSecret = Base64.getEncoder().encodeToString(
@@ -72,8 +80,30 @@ class JwtTokenServiceTest {
                 properties.refreshTtl()
         );
         SecretKey anotherKey = config.jwtSecretKey(wrongSignature);
-        assertThatThrownBy(() -> config.jwtDecoder(anotherKey, wrongSignature).decode(pair.accessToken()))
+        assertThatThrownBy(() -> config.jwtDecoder(anotherKey, wrongSignature, sessions, ledger, clock).decode(pair.accessToken()))
                 .isInstanceOf(JwtException.class);
+
+        org.mockito.Mockito.clearInvocations(sessions, ledger);
+        assertThatThrownBy(() -> accessDecoder.decode(pair.refreshToken())).isInstanceOf(JwtException.class);
+        org.mockito.Mockito.verifyNoInteractions(sessions, ledger);
+
+        org.mockito.Mockito.when(ledger.existsByIdAndUserIdAndRevokedAtIsNullAndExpiresAtAfter(sessionId, userId, now))
+                .thenReturn(false);
+        assertThatThrownBy(() -> accessDecoder.decode(pair.accessToken()))
+                .isInstanceOf(org.springframework.security.oauth2.jwt.BadJwtException.class);
+        org.mockito.Mockito.when(ledger.existsByIdAndUserIdAndRevokedAtIsNullAndExpiresAtAfter(sessionId, userId, now))
+                .thenThrow(new org.springframework.dao.DataAccessResourceFailureException("Ledger unavailable"));
+        assertThatThrownBy(() -> accessDecoder.decode(pair.accessToken()))
+                .isInstanceOf(JwtException.class).hasCauseInstanceOf(com.weblens.common.exception.ApiException.class);
+
+        org.mockito.Mockito.when(sessions.isActive(sessionId, userId)).thenReturn(false);
+        assertThatThrownBy(() -> accessDecoder.decode(pair.accessToken()))
+                .isInstanceOf(org.springframework.security.oauth2.jwt.BadJwtException.class);
+        org.mockito.Mockito.when(sessions.isActive(sessionId, userId)).thenThrow(
+                new com.weblens.common.exception.ApiException(org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE,
+                        "AUTH_SESSION_STORE_UNAVAILABLE", "Unavailable", "Unavailable"));
+        assertThatThrownBy(() -> accessDecoder.decode(pair.accessToken()))
+                .isInstanceOf(JwtException.class).hasCauseInstanceOf(com.weblens.common.exception.ApiException.class);
     }
 
     private JwtProperties properties() {

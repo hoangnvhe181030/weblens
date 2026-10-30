@@ -56,6 +56,17 @@ func TestStoreWorkflowIntegration(t *testing.T) {
 		if err != nil || duplicate {
 			t.Fatalf("accept first command: duplicate=%v err=%v", duplicate, err)
 		}
+		// An earlier message for another aggregate must not supply scan correlation.
+		if _, err := store.pool.Exec(ctx, `INSERT INTO inbox_messages (
+			message_id, source_service, aggregate_type, aggregate_id, aggregate_version,
+			message_type, contract_version, correlation_id, payload_sha256, outcome,
+			received_at, processed_at)
+			SELECT $1, source_service, 'OTHER', aggregate_id, aggregate_version,
+			message_type, contract_version, $2, payload_sha256, outcome,
+			received_at - interval '1 minute', processed_at
+			FROM inbox_messages WHERE message_id = $3`, uuid.New(), uuid.New(), command.MessageID); err != nil {
+			t.Fatal(err)
+		}
 		duplicate, err = store.AcceptCommand(ctx, command)
 		if err != nil || !duplicate {
 			t.Fatalf("accept duplicate command: duplicate=%v err=%v", duplicate, err)
@@ -69,7 +80,7 @@ func TestStoreWorkflowIntegration(t *testing.T) {
 
 		workerID := uuid.New()
 		lease, err := store.ClaimPage(ctx, workerID, time.Minute, 0)
-		if err != nil || lease == nil || lease.ScanID != command.Payload.ScanID {
+		if err != nil || lease == nil || lease.ScanID != command.Payload.ScanID || lease.CorrelationID != command.CorrelationID {
 			t.Fatalf("claim seed page: lease=%+v err=%v", lease, err)
 		}
 		result := successfulPageResult(command.Payload.TargetURL)
@@ -113,6 +124,12 @@ func TestStoreWorkflowIntegration(t *testing.T) {
 		}
 		if state.Status != "COMPLETED" || state.AnalyticsExpectedCount != 1 || state.AnalyticsPublishedCount != 1 {
 			t.Fatalf("unexpected completed report state: %+v", state)
+		}
+		var incorrectCorrelations int
+		if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events
+			WHERE aggregate_type = 'SCAN' AND aggregate_id = $1 AND correlation_id <> $2`,
+			command.Payload.ScanID, command.CorrelationID).Scan(&incorrectCorrelations); err != nil || incorrectCorrelations != 0 {
+			t.Fatalf("scan events used another aggregate correlation: count=%d err=%v", incorrectCorrelations, err)
 		}
 
 		// A cancellation can arrive after completion while the Control Plane is
@@ -196,9 +213,32 @@ func TestStoreWorkflowIntegration(t *testing.T) {
 		if err != nil || oldLease == nil || oldLease.ScanID != command.Payload.ScanID {
 			t.Fatalf("claim expiring page: lease=%+v err=%v", oldLease, err)
 		}
+		// Exercise recovery correlation separately from page claim and analytics ack.
+		if _, err := store.pool.Exec(ctx, `INSERT INTO inbox_messages (
+			message_id, source_service, aggregate_type, aggregate_id, aggregate_version,
+			message_type, contract_version, correlation_id, payload_sha256, outcome,
+			received_at, processed_at)
+			SELECT $1, source_service, 'OTHER', aggregate_id, aggregate_version,
+			message_type, contract_version, $2, payload_sha256, outcome,
+			received_at - interval '1 minute', processed_at
+			FROM inbox_messages WHERE message_id = $3`, uuid.New(), uuid.New(), command.MessageID); err != nil {
+			t.Fatal(err)
+		}
 		time.Sleep(20 * time.Millisecond)
+		if err := store.ExtendPageLease(ctx, *oldLease, time.Minute); !errors.Is(err, ErrStaleLease) {
+			t.Fatalf("expired unreclaimed worker renewed its lease: %v", err)
+		}
+		if err := store.CommitPageResult(ctx, *oldLease, successfulPageResult(command.Payload.TargetURL)); !errors.Is(err, ErrStaleLease) {
+			t.Fatalf("expired unreclaimed worker committed a result: %v", err)
+		}
 		if err := store.ReclaimExpired(ctx); err != nil {
 			t.Fatalf("reclaim expired lease: %v", err)
+		}
+		var incorrectCorrelations int
+		if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events
+			WHERE aggregate_type = 'SCAN' AND aggregate_id = $1 AND correlation_id <> $2`,
+			command.Payload.ScanID, command.CorrelationID).Scan(&incorrectCorrelations); err != nil || incorrectCorrelations != 0 {
+			t.Fatalf("recovery used another aggregate correlation: count=%d err=%v", incorrectCorrelations, err)
 		}
 		newLease, err := store.ClaimPage(ctx, uuid.New(), time.Minute, 0)
 		if err != nil || newLease == nil || newLease.PageID != oldLease.PageID {
@@ -212,6 +252,90 @@ func TestStoreWorkflowIntegration(t *testing.T) {
 		}
 		if err := store.CommitPageResult(ctx, *newLease, successfulPageResult(command.Payload.TargetURL)); err != nil {
 			t.Fatalf("commit reclaimed page result: %v", err)
+		}
+	})
+
+	t.Run("heartbeat rejects expiry after unchanged page or host lock waits", func(t *testing.T) {
+		for _, blockedTable := range []string{"scan_pages", "host_leases"} {
+			t.Run(blockedTable, func(t *testing.T) {
+				command := newTestScanCommand("https://locked-heartbeat-" + uuid.NewString() + ".example.com/")
+				if _, err := store.AcceptCommand(ctx, command); err != nil {
+					t.Fatal(err)
+				}
+				lease, err := store.ClaimPage(ctx, uuid.New(), time.Minute, 0)
+				if err != nil || lease == nil || lease.ScanID != command.Payload.ScanID {
+					t.Fatalf("claim heartbeat: lease=%+v err=%v", lease, err)
+				}
+				if err := store.ExtendPageLease(ctx, *lease, time.Minute); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.pool.Exec(ctx, `UPDATE scan_pages SET lease_expires_at=clock_timestamp()+interval '2 seconds' WHERE id=$1`, lease.PageID); err != nil {
+					t.Fatal(err)
+				}
+				hash := crawl.URLHash(lease.Hostname)
+				if blockedTable == "host_leases" {
+					if _, err := store.pool.Exec(ctx, `UPDATE host_leases SET lease_expires_at=clock_timestamp()+interval '2 seconds' WHERE hostname_sha256=$1 AND hostname=$2 AND slot_no=$3`, hash[:], lease.Hostname, lease.HostSlotNo); err != nil {
+						t.Fatal(err)
+					}
+				}
+				blocker, err := store.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer blocker.Rollback(ctx)
+				if blockedTable == "scan_pages" {
+					_, err = blocker.Exec(ctx, `SELECT id FROM scan_pages WHERE id=$1 FOR UPDATE`, lease.PageID)
+				} else {
+					_, err = blocker.Exec(ctx, `SELECT slot_no FROM host_leases WHERE hostname_sha256=$1 AND hostname=$2 AND slot_no=$3 FOR UPDATE`, hash[:], lease.Hostname, lease.HostSlotNo)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				result := make(chan error, 1)
+				go func() { result <- store.ExtendPageLease(ctx, *lease, time.Minute) }()
+				waiting := false
+				for deadline := time.Now().Add(1500 * time.Millisecond); time.Now().Before(deadline); {
+					err := store.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE $1)`, "%"+blockedTable+"%").Scan(&waiting)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if waiting {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if !waiting {
+					t.Fatal("heartbeat did not block while the lease was live")
+				}
+				// The expiry is a real clock crossing, not a concurrent tuple update.
+				for {
+					var expired bool
+					if err := store.pool.QueryRow(ctx, `SELECT clock_timestamp()>lease_expires_at FROM scan_pages WHERE id=$1`, lease.PageID).Scan(&expired); err != nil {
+						t.Fatal(err)
+					}
+					if expired {
+						break
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+				if err := blocker.Rollback(ctx); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err := <-result:
+					if !errors.Is(err, ErrStaleLease) {
+						t.Fatalf("expired heartbeat was accepted: %v", err)
+					}
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				if err := store.CommitPageResult(ctx, *lease, successfulPageResult(command.Payload.TargetURL)); !errors.Is(err, ErrStaleLease) {
+					t.Fatalf("late publication: %v", err)
+				}
+				if _, err := store.AcceptCancellation(ctx, newTestCancelCommand(command, 2)); err != nil {
+					t.Fatal(err)
+				}
+			})
 		}
 	})
 

@@ -48,6 +48,7 @@ const API_OPTIONS = new Set([
 
 const CRAWL_OPTIONS = new Set([
   ...COMMON_OPTIONS,
+  'control-health-url',
   'crawler-health-url',
   'fixture-url',
   'pages',
@@ -80,6 +81,7 @@ Scenario api:
   --email <email>           Login một tài khoản rồi dùng chung bearer token
 
 Scenario crawl:
+  --control-health-url <url> Control Plane health; mặc định dùng --base-url và --health-path
   --fixture-url <url>       Fixture local (mặc định http://127.0.0.1:9090/)
   --crawler-health-url <url> Readiness crawler (mặc định http://127.0.0.1:8081/health/ready)
   --pages <n>               Số trang kỳ vọng trong một scan, tối đa 100000
@@ -223,13 +225,17 @@ async function runApiScenario(rawOptions) {
 async function runCrawlScenario(rawOptions) {
   const common = commonConfig(rawOptions)
   const baseUrl = validatedHttpUrl(stringOption(rawOptions, 'base-url', 'http://127.0.0.1:8080'), '--base-url')
-  const healthUrl = resolveSameOriginPath(baseUrl, stringOption(rawOptions, 'health-path', '/actuator/health'), '--health-path')
+  const healthUrl = rawOptions.has('control-health-url')
+    ? validatedHttpUrl(stringOption(rawOptions, 'control-health-url', undefined), '--control-health-url')
+    : resolveSameOriginPath(baseUrl, stringOption(rawOptions, 'health-path', '/actuator/health'), '--health-path')
   const crawlerHealthUrl = validatedHttpUrl(
     stringOption(rawOptions, 'crawler-health-url', 'http://127.0.0.1:8081/health/ready'),
     '--crawler-health-url',
   )
   const fixtureUrl = validatedHttpUrl(stringOption(rawOptions, 'fixture-url', 'http://127.0.0.1:9090/'), '--fixture-url')
-  const fixtureHealthUrl = resolveSameOriginPath(fixtureUrl, '/__fixture/health', 'fixture health path')
+  const fixtureHealthUrl = resolveSameOriginPath(
+    fixtureUrl, `${fixtureUrl.pathname.replace(/\/$/, '')}/__fixture/health`, 'fixture health path',
+  )
   const pages = integerOption(rawOptions, 'pages', 100, { minimum: 1, maximum: 100_000 })
   const planOnly = flag(rawOptions, 'plan-only')
   const timeoutMs = durationOption(rawOptions, 'timeout', undefined, { minimum: 1_000, maximum: 24 * 60 * 60_000 })
@@ -262,6 +268,7 @@ async function runCrawlScenario(rawOptions) {
     },
     configuration: {
       controlPlane: sanitizedUrl(baseUrl),
+      controlPlaneHealthEndpoint: sanitizedUrl(healthUrl),
       crawlerHealthEndpoint: sanitizedUrl(crawlerHealthUrl),
       fixture: sanitizedUrl(fixtureUrl),
       requestedPages: pages,
@@ -291,6 +298,9 @@ async function runCrawlScenario(rawOptions) {
 
   const token = await requiredAuthentication(baseUrl, rawOptions, common.requestTimeoutMs)
   const authHeaders = { Accept: 'application/json', Authorization: `Bearer ${token}` }
+  const credentialEmail = stringOption(rawOptions, 'email', undefined)
+  let accessExpiresAt = jwtExpiryMs(token)
+  let authRenewals = 0
   const metrics = new Metrics(common.requestTimeoutMs)
   const runStarted = performance.now()
   let scanId = null
@@ -331,6 +341,12 @@ async function runCrawlScenario(rawOptions) {
       break
     }
     await delay(Math.min(pollIntervalMs, Math.max(1, deadline - performance.now())))
+    if (credentialEmail && accessExpiresAt !== null && Date.now() >= accessExpiresAt - 60_000) {
+      const renewed = await login(baseUrl, credentialEmail, common.requestTimeoutMs)
+      authHeaders.Authorization = `Bearer ${renewed}`
+      accessExpiresAt = jwtExpiryMs(renewed)
+      authRenewals += 1
+    }
     const polled = await trackedJson(scanUrl, { method: 'GET', headers: authHeaders }, common, metrics)
     requireSuccess(polled, 'Đọc tiến độ scan')
     finalScan = polled.json
@@ -361,6 +377,7 @@ async function runCrawlScenario(rawOptions) {
     outcome: timedOut ? 'FAILED' : terminalOutcome(finalScan?.status),
     finishedAt: new Date().toISOString(),
     elapsedMs,
+    authRenewals,
     scan: {
       id: scanId,
       websiteId,
@@ -422,6 +439,15 @@ async function login(baseUrl, email, timeoutMs) {
   const token = result.json?.accessToken
   if (typeof token !== 'string' || token.length === 0) throw new Error('Phản hồi đăng nhập thiếu access token.')
   return token
+}
+
+function jwtExpiryMs(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'))
+    return Number.isSafeInteger(payload.exp) ? payload.exp * 1000 : null
+  } catch {
+    return null
+  }
 }
 
 async function readFixturePreflight(url, timeoutMs) {

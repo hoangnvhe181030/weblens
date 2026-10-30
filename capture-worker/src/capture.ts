@@ -50,6 +50,7 @@ export async function capturePage(
   command: CaptureCommandPayload,
   options: CapturePageOptions = {},
 ): Promise<CaptureResult> {
+  options.signal?.throwIfAborted()
   const started = Date.now()
   const deadline = started + command.timeoutSeconds * 1000
   await withinDeadline(assertPublicHttpUrl(command.targetUrl), deadline)
@@ -58,6 +59,11 @@ export async function capturePage(
   let browser: Browser | null = null
   let context: BrowserContext | null = options.browserContext ?? null
   let page: import('playwright').Page | null = null
+  const abort = () => {
+    void page?.close().catch(() => undefined)
+    if (browser) void closeCaptureBrowser(browser).catch(() => undefined)
+  }
+  options.signal?.addEventListener('abort', abort, { once: true })
   try {
     if (!context) {
       const browserSettings = readBrowserSettings()
@@ -65,7 +71,7 @@ export async function capturePage(
       const launchedBrowser = await withinDeadline<Browser>(launchCaptureBrowser(proxy!.url(), {
         ...browserSettings, viewport, timeoutMillis: operationTimeoutMillis(deadline),
       }).then(async (launched) => {
-        if (Date.now() >= deadline) {
+        if (Date.now() >= deadline || options.signal?.aborted) {
           await closeCaptureBrowser(launched)
           throw new Error('CAPTURE_TIMEOUT')
         }
@@ -80,6 +86,7 @@ export async function capturePage(
       }), deadline)
     }
     page = await withinDeadline(context.newPage(), deadline)
+    options.signal?.throwIfAborted()
     observeTurnstileErrors(page, command.captureRequestId)
   const requestStarted = new Map<Request, { started: number; sequence: number }>()
   const network: NetworkRecord[] = []
@@ -292,6 +299,7 @@ export async function capturePage(
       deadline,
     )
     if (!options.includeSiteBundle) reconstruction.siteBundle = null
+    options.signal?.throwIfAborted()
     return {
       finalUrl: sanitizeUrl(sourceFinalUrl),
       html,
@@ -307,6 +315,7 @@ export async function capturePage(
       reconstruction,
     }
   } finally {
+    options.signal?.removeEventListener('abort', abort)
     const cleanupDeadline = Date.now() + 5000
     if (page) await withinDeadline(page.close(), cleanupDeadline).catch(() => undefined)
     if (!options.browserContext && context) await withinDeadline(context.close(), cleanupDeadline).catch(() => undefined)

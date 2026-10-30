@@ -25,6 +25,8 @@ public interface ScanRepository extends JpaRepository<ScanEntity, UUID>, JpaSpec
 
     Optional<ScanEntity> findByIdAndRequestedByUserId(UUID id, UUID requestedByUserId);
 
+    boolean existsByIdAndRequestedByUserId(UUID id, UUID requestedByUserId);
+
     Optional<ScanEntity> findByRequestedByUserIdAndIdempotencyKeyHash(
             UUID requestedByUserId,
             String idempotencyKeyHash

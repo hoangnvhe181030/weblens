@@ -5,12 +5,40 @@ ngày 2026-09-14.
 
 ## Trạng thái hiện tại
 
+Ngày 2026-10-15, [ADR-017 revision 3](adr/ADR-017-rabbitmq-command-transport-evaluation.md)
+thêm RabbitMQ tùy chọn cho lệnh tạo/hủy scan từ Control Plane tới Crawler.
+Hai service chọn `WEBLENS_SCAN_COMMAND_TRANSPORT=rabbitmq`; mặc định vẫn là HTTP.
+Outbox/inbox PostgreSQL, contract JSON, dedup và lease/fencing được giữ nguyên.
+Broker confirm chỉ chứng minh bàn giao cho broker; consumer ACK sau khi inbox và
+execution commit. Event, report, Capture và Clone vẫn dùng REST. Kiểm thử local
+không thay thế benchmark production; người dùng đã cho phép rollout VPS một node
+có kiểm soát, với backup/restore và smoke gate. Xem [runbook](../infra/rabbitmq/README.md).
+
+VPS đã bật RabbitMQ ngày 2026-10-15 cho command tạo/hủy scan; 4 consumer, inbox
+reconciliation và owned-fixture scan/report/Capture/auth smoke đạt. Xem
+[báo cáo triển khai](testing/VPS_RABBITMQ_DEPLOYMENT_2026-10-15.md) để biết commit,
+backup/migration, cấu hình broker một node và auto deploy poll đang tắt tránh
+downgrade. Chưa có capacity/HA benchmark cho runtime này.
+
+Ngày 2026-10-05, [ADR-019](adr/ADR-019-redis-jwt-session-lifecycle.md) bổ sung Redis
+cho vòng đời JWT của Control Plane theo yêu cầu người dùng. Access token cần
+session còn hiệu lực trong Redis và kiểm tra thu hồi bền vững trong `auth_sessions`;
+refresh cần cả Redis và PostgreSQL. Theo yêu cầu ngày 2026-10-12, registry chuyển
+sang Redis local loopback trên VPS với AOF/RDB; Redis Layerbase dùng chung không
+bị thay đổi. Bản Windows community chỉ là triển khai dự án cá nhân, không có
+cam kết hỗ trợ production. Snapshot cũ không làm sống lại session đã logout. Logout thu hồi access và
+refresh của cùng session. Redis hoặc session ledger lỗi trả 503;
+mất session yêu cầu đăng nhập lại. Phạm vi này không mở rộng Redis sang workflow.
+
 Repository hiện có React frontend, Java 21/Spring Boot Control Plane, Go Crawler
 Service và Playwright Capture Worker. Scan command/progress đi qua outbox/inbox;
 crawler lưu workflow trong PostgreSQL và analytical fact trong ClickHouse. Capture
 Worker lưu workflow trong PostgreSQL, rendered/network fact trong ClickHouse và
 artifact lớn trong MinIO. E2E đăng ký → website → scan → page evidence → capture →
 snapshot đã đạt; capacity production vẫn cần benchmark trên phần cứng triển khai.
+Đó là kiểm chứng chức năng trước đây. Đợt VPS ngày 2026-10-12 chưa đạt full-workload:
+scan mới trễ projection và E2E timeout; chỉ read load 100 RPS/10 phút cùng capture
+trang đã có đạt. Xem [kết quả VPS](testing/VPS_LOCAL_REDIS_PERFORMANCE_2026-10-12.md).
 Clone tĩnh một trang của TASK-013 cũng đã đạt E2E với staged publish, SHA-256,
 download owner-scoped và retention GC. Clone website theo ADR-007 revision 3 mặc
 định là Design Clone: Control Plane vẫn orchestrate, Capture PostgreSQL vẫn giữ
@@ -36,7 +64,10 @@ VPS nhận Windows release qua HTTPS và Scheduled Task theo
 flowchart TB
     UI[React + TypeScript] -->|HTTPS / JSON| CP[Spring Boot Control Plane]
     CP -->|JDBC / local transaction| CPDB[(Control Plane PostgreSQL)]
-    CP -->|Versioned REST, idempotency| CR[Go Crawler Service]
+    CP -->|JWT session validation| AUTHREDIS[(Redis auth sessions)]
+    CP -->|Scan command HTTP mặc định, report REST| CR[Go Crawler Service]
+    CP -.->|Scan command RabbitMQ tùy chọn| MQ[(RabbitMQ quorum queue)]
+    MQ -.->|ACK sau inbox commit| CR
     CR -->|Crawler-owned transaction| CRDB[(Crawler PostgreSQL)]
     CR -->|Batched analytical facts| CHC[(ClickHouse Crawl Analytics)]
     CR -->|Bounded HTTP(S)| TARGET[Website được phép scan]
@@ -92,6 +123,8 @@ TLS impersonation không được nhập.
 - Nhận capture command idempotently cho page đủ điều kiện.
 - Chạy Camoufox mặc định trong isolation boundary có timeout và resource limits;
   giữ Chromium như engine tùy chọn qua `CAPTURE_BROWSER_ENGINE=playwright`.
+  Ngày 2026-10-12, VPS chọn engine Chromium có sẵn để xử lý `CAPTURE_TIMEOUT`;
+  đây là cấu hình runtime, không thay mặc định nguồn hoặc network-safety policy.
 - Thu rendered HTML, screenshot, bounded network metadata và eligible resource.
 - Redact secret/cookie/header, hash và upload artifact lớn vào S3/MinIO.
 - Persist capture metadata/outbox, batch network/resource facts sang ClickHouse;
@@ -150,8 +183,10 @@ watermark và reconciliation.
 1. React gửi request có idempotency key tới Control Plane.
 2. Control Plane authorize website, enforce quota và persist public scan ở
    `QUEUED` cùng dispatch outbox trong một local transaction.
-3. Dispatcher gửi command có version và `scan_id` tới Crawler Service. Timeout
-   không chứng minh command thất bại; dispatcher retry cùng idempotency key.
+3. Dispatcher gửi command có version và `scan_id` qua HTTP hoặc RabbitMQ theo
+   cấu hình. Timeout không chứng minh command thất bại; dispatcher retry cùng
+   message ID. Với RabbitMQ, outbox `DELIVERED` ghi nhận broker confirm/routing;
+   inbox Crawler mới chứng minh acceptance commit.
 4. Crawler inbox/dedup tạo execution đúng một lần về mặt logic, dù command được
    nhận at-least-once.
 5. Crawler claim page work bằng lease/fencing, fetch ngoài transaction rồi commit
@@ -194,7 +229,8 @@ watermark và reconciliation.
 
 ## Giao tiếp và consistency contract
 
-- V1/V1.5 dùng REST nội bộ + PostgreSQL outbox/inbox; chưa cần Kafka/Redis.
+- V1/V1.5 dùng REST nội bộ + PostgreSQL outbox/inbox; scan command có adapter
+  RabbitMQ tùy chọn theo ADR-017. Redis chỉ phục vụ auth theo ADR-019.
 - Command/event có `message_id`, contract version, aggregate ID, sequence/version,
   correlation ID và timestamp; payload có giới hạn kích thước.
 - Delivery là at-least-once. Consumer phải dedup và xử lý transactionally với
@@ -248,12 +284,17 @@ Dispatcher có tối đa bốn page claim song song, dùng chung trần fetch; �
 execution có ít lease và hoạt động ít gần đây. Đây là phân phối theo hoạt động,
 không phải cam kết round-robin hay tăng throughput đã đo.
 
-Report dùng pool ClickHouse riêng: bảy connection đọc và ba connection ghi,
-giữ tổng trần mười. Admission đọc có deadline và timing riêng; trả slot đọc trước
+Report dùng pool ClickHouse riêng: mặc định bảy connection đọc và ba connection ghi.
+Trần đọc có cấu hình giới hạn 1–64, chỉ điều chỉnh theo đo tải; pool ghi vẫn riêng
+biệt và PostgreSQL không tăng theo. Runtime có thể chọn HTTPS của cùng provider
+bằng `CRAWLER_CLICKHOUSE_HTTP_URL`, giữ TLS validation, owner scope, schema và
+watermark. Migration dùng native endpoint, không dùng HTTP error text để xác nhận
+DDL thành công. Admission đọc có deadline và timing riêng; trả slot đọc trước
 khi truy vấn findings. Scan có analytics expected/published đều bằng không từ
 workflow Crawler được trả report rỗng sau kiểm tra owner/filter/cursor. Không dùng
 projection Control Plane để suy ra dữ liệu rỗng. Chi tiết kiểm thử và trạng thái
-chưa triển khai production: [báo cáo tối ưu](testing/PERFORMANCE_RUNTIME_FIX_2026-10-03.md).
+triển khai được ghi riêng trong [báo cáo tối ưu](testing/PERFORMANCE_RUNTIME_FIX_2026-10-03.md)
+và báo cáo đo tải của từng release; cấu hình không phải bằng chứng capacity.
 
 Projection có thể trễ trong SLO đã duyệt, nhưng không được vượt giới hạn, double
 count hoặc báo complete khi Crawler chưa commit terminal state. Trạng thái stale
@@ -287,8 +328,8 @@ phải hiển thị rõ thay vì suy đoán failure chỉ vì một request nộ
 
 ## Thành phần chưa được phê duyệt
 
-- Kafka, Redis, Kubernetes, service mesh hoặc multi-region orchestration.
-- OpenSearch hoặc datastore bổ sung ngoài PostgreSQL, ClickHouse và S3/MinIO.
+- Kafka, Redis ngoài phạm vi auth của ADR-019, Kubernetes, service mesh hoặc multi-region orchestration.
+- OpenSearch hoặc datastore bổ sung ngoài PostgreSQL, ClickHouse, Redis auth và S3/MinIO.
 - Tách Identity, Website, Analysis hoặc Report thành service riêng.
 - CAPTCHA solver, TLS impersonation và browser cloud; Camoufox theo ADR-015
   không bảo đảm vượt Cloudflare.

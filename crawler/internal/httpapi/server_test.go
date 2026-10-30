@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,14 +12,34 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/weblens-project/weblens-crawler/internal/analytics"
 	"github.com/weblens-project/weblens-crawler/internal/contracts"
 	"github.com/weblens-project/weblens-crawler/internal/model"
 	"github.com/weblens-project/weblens-crawler/internal/postgres"
 )
 
 const testServiceToken = "test-service-token-that-is-at-least-32-bytes"
+
+func TestRabbitModeDisablesHTTPCommandAcceptance(t *testing.T) {
+	store := &fakeCommandStore{}
+	server := NewServer(store, store, testServiceToken, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server.DisableHTTPCommands()
+	req := httptest.NewRequest(http.MethodPost, "/internal/v1/commands/scans", strings.NewReader("{}"))
+	req.Header.Set("X-WebLens-Service-Token", testServiceToken)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, req)
+	if response.Code != http.StatusServiceUnavailable || store.called {
+		t.Fatal("HTTP command reached persistence in RabbitMQ mode")
+	}
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health/live", nil))
+	if response.Code != http.StatusOK {
+		t.Fatal("RabbitMQ mode disabled HTTP health")
+	}
+}
 
 type fakeCommandStore struct {
 	called bool
@@ -52,6 +73,144 @@ func (*fakeCommandStore) GetPage(context.Context, uuid.UUID, uuid.UUID) (model.R
 	return model.ReportPage{}, nil
 }
 
+type correlationReportStore struct {
+	fakeCommandStore
+	correlation string
+}
+
+func (s *correlationReportStore) GetReportState(ctx context.Context, ownerID, scanID uuid.UUID) (model.ReportState, error) {
+	s.correlation = analytics.ReportCorrelation(ctx)
+	return model.ReportState{OwnerID: ownerID, ScanID: scanID}, nil
+}
+
+func TestReportContextMatchesResponseCorrelation(t *testing.T) {
+	for _, correlation := range []string{"valid-trace-1", "  valid-trace-2  ", "invalid\r\nsecret", ""} {
+		store := &correlationReportStore{}
+		server := NewServer(store, store, testServiceToken, testLogger())
+		request := httptest.NewRequest(http.MethodGet, "/internal/v1/reports/scans/"+uuid.NewString()+"/pages?ownerId="+uuid.NewString(), nil)
+		request.Header.Set("X-WebLens-Service-Token", testServiceToken)
+		request.Header.Set("X-Correlation-ID", correlation)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK || store.correlation != response.Header().Get("X-Correlation-ID") || !correlationIDPattern.MatchString(store.correlation) {
+			t.Fatal("response and downstream context correlation differ")
+		}
+	}
+}
+
+type blockingHTTPReports struct {
+	fakeCommandStore
+	entered chan context.Context
+	stop    chan struct{}
+}
+
+func (s *blockingHTTPReports) wait(ctx context.Context) error {
+	s.entered <- ctx
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.stop:
+		return context.Canceled
+	}
+}
+
+func (s *blockingHTTPReports) ListPages(ctx context.Context, _ uuid.UUID, _ uuid.UUID, _ int, _ string, _ uuid.UUID, _ model.PageFilters) ([]model.ReportPage, bool, error) {
+	return nil, false, s.wait(ctx)
+}
+
+func (s *blockingHTTPReports) GetPage(ctx context.Context, _ uuid.UUID, _ uuid.UUID) (model.ReportPage, error) {
+	return model.ReportPage{}, s.wait(ctx)
+}
+
+func TestHTTPTransportCancellationReachesReportContext(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		for _, pages := range []bool{false, true} {
+			for _, timeout := range []bool{false, true} {
+				name := fmt.Sprintf("tls=%t/pages=%t/timeout=%t", secure, pages, timeout)
+				t.Run(name, func(t *testing.T) {
+					store := &reportTestStore{state: model.ReportState{AnalyticsExpectedCount: 1, AnalyticsPublishedCount: 1}}
+					reports := &blockingHTTPReports{entered: make(chan context.Context, 1), stop: make(chan struct{})}
+					finished := make(chan struct{})
+					handler := NewServer(store, reports, testServiceToken, testLogger()).Handler()
+					wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						defer close(finished)
+						handler.ServeHTTP(w, r)
+					})
+					var server *httptest.Server
+					if secure {
+						server = httptest.NewTLSServer(wrapped)
+					} else {
+						server = httptest.NewServer(wrapped)
+					}
+					client := server.Client()
+					client.Timeout = 2 * time.Second
+					if timeout {
+						client.Timeout = 300 * time.Millisecond
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					defer func() {
+						cancel()
+						close(reports.stop)
+						client.CloseIdleConnections()
+						server.Close()
+					}()
+					path := "/internal/v1/reports/pages/" + uuid.NewString() + "?ownerId=" + uuid.NewString()
+					if pages {
+						path = "/internal/v1/reports/scans/" + uuid.NewString() + "/pages?ownerId=" + uuid.NewString()
+					}
+					request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+path, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					request.Header.Set("X-WebLens-Service-Token", testServiceToken)
+					request.Header.Set("X-Correlation-ID", "owned-transport-cancel")
+					result := make(chan error, 1)
+					go func() {
+						response, err := client.Do(request)
+						if response != nil {
+							_ = response.Body.Close()
+						}
+						result <- err
+					}()
+					var reportCtx context.Context
+					select {
+					case reportCtx = <-reports.entered:
+					case <-time.After(time.Second):
+						t.Fatal("HTTP fixture did not reach report reader")
+					}
+					if analytics.ReportCorrelation(reportCtx) != "owned-transport-cancel" {
+						t.Fatal("HTTP boundary lost report correlation")
+					}
+					started := time.Now()
+					if !timeout {
+						cancel()
+					}
+					select {
+					case err := <-result:
+						want := context.Canceled
+						if timeout {
+							want = context.DeadlineExceeded
+						}
+						if !errors.Is(err, want) {
+							t.Fatalf("unexpected HTTP cancellation result: %v", err)
+						}
+					case <-time.After(time.Second):
+						t.Fatal("HTTP client did not finish within fixture bound")
+					}
+					select {
+					case <-finished:
+						if reportCtx.Err() != context.Canceled {
+							t.Fatal("HTTP disconnect did not cancel the downstream report context")
+						}
+					case <-time.After(time.Second):
+						t.Fatal("report handler remained running after HTTP disconnect")
+					}
+					t.Logf("client_cancel_to_handler_finish=%s", time.Since(started))
+				})
+			}
+		}
+	}
+}
 func TestCommandEndpointRequiresServiceToken(t *testing.T) {
 	t.Parallel()
 	store := &fakeCommandStore{}

@@ -54,6 +54,15 @@ batch, version đến sai thứ tự, `too many parts`, disk pressure, retention
 
 **Important edge cases:** Repeated failures, disabled users, expired sessions, credential enumeration, concurrent sessions.
 
+**JWT lifecycle (ADR-019, 2026-10-05):** Every access token requires a live Redis
+session matching its owner and an unrevoked, unexpired PostgreSQL session.
+Restoring stale Redis data cannot revive a logged-out session.
+Refresh requires the current refresh credential in
+both Redis and PostgreSQL, with one winner for concurrent rotation. Successful
+logout rejects subsequent access and refresh for that session while preserving
+other sessions. Redis outage returns 503; missing session returns 401 and requires
+login. Do not store raw JWTs or recover deleted Redis sessions from PostgreSQL.
+
 ## SITE-001 — Register a website
 
 **Description:** An authenticated user can register a normalized HTTP(S) website target that they are authorized to scan.
